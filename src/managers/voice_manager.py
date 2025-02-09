@@ -106,42 +106,55 @@ class VoiceManager:
         uri = f"wss://api.elevenlabs.io/v1/text-to-speech/{self.voice_id}/stream-input?model_id=eleven_flash_v2_5"
 
         async with websockets.connect(uri) as websocket:
-            # Initialize stream with voice settings
-            await websocket.send(json.dumps({
-                "text": " ",
-                "voice_settings": {
-                    "stability": 0.5,
-                    "similarity_boost": 0.8
-                },
-                "xi_api_key": self.api_key,
-            }))
+            try:
+                # Initialize stream with voice settings and generation config
+                await websocket.send(json.dumps({
+                    "text": " ",  # First message must be a space
+                    "voice_settings": {
+                        "stability": 0.5,
+                        "similarity_boost": 0.8
+                    },
+                    "generation_config": {
+                        "chunk_length_schedule": [120, 160, 250, 290]  # Default schedule
+                    },
+                    "xi_api_key": self.api_key,
+                }))
 
-            async def listen():
-                """Listen to websocket for audio data"""
-                while True:
-                    try:
-                        message = await websocket.recv()
-                        data = json.loads(message)
-                        if data.get("audio"):
-                            yield base64.b64decode(data["audio"])
-                        elif data.get('isFinal'):
+                async def listen():
+                    """Listen to websocket for audio data"""
+                    while True:
+                        try:
+                            message = await websocket.recv()
+                            data = json.loads(message)
+                            if data.get("audio"):
+                                yield base64.b64decode(data["audio"])
+                            elif data.get('isFinal'):
+                                break
+                        except websockets.exceptions.ConnectionClosed:
+                            logger.warning("Connection closed")
                             break
-                    except websockets.exceptions.ConnectionClosed:
-                        logger.info("ElevenLabs connection closed")
-                        break
 
-            # Start streaming audio
-            listen_task = asyncio.create_task(self._stream_audio(listen()))
+                # Start streaming audio
+                listen_task = asyncio.create_task(self._stream_audio(listen()))
 
-            # Send text chunks
-            async for text in self._text_chunker(text_iterator):
-                await websocket.send(json.dumps({"text": text}))
+                # Send text chunks
+                async for text in self._text_chunker(text_iterator):
+                    if not text.strip():
+                        continue
+                    await websocket.send(json.dumps({"text": text}))
 
-            # Send end of stream
-            await websocket.send(json.dumps({"text": ""}))
+                # Send final message with flush to ensure all text is processed
+                await websocket.send(json.dumps({"text": " ", "flush": True}))
+                
+                # Send end of stream
+                await websocket.send(json.dumps({"text": ""}))
 
-            # Wait for audio to finish
-            await listen_task
+                # Wait for audio to finish
+                await listen_task
+
+            except Exception as e:
+                logger.error(f"Error in TTS stream: {e}")
+                raise
 
     def _chunk_text(self, text: str, chunk_size: int = 500) -> list[str]:
         """Split text into manageable chunks at sentence boundaries"""
@@ -175,7 +188,7 @@ class VoiceManager:
         return chunks
 
     async def say(self, text: str):
-        """Convert text to speech and stream it"""
+        """Convert text to speech and stream it continuously"""
         try:
             if not text:
                 logger.warning("Empty text received, skipping TTS")
@@ -184,16 +197,14 @@ class VoiceManager:
             # Split into chunks
             chunks = self._chunk_text(text)
             
-            # Process each chunk
-            for chunk in chunks:
-                logger.info(f"Converting to speech: {chunk[:50]}...")
-                
-                # Create text iterator for this chunk
-                async def text_iterator():
+            # Create a single text iterator for all chunks
+            async def text_iterator():
+                for chunk in chunks:
+                    logger.info(f"Streaming chunk: {chunk[:50]}...")
                     yield chunk
 
-                # Stream the chunk
-                await self._stream_tts(text_iterator())
+            # Stream all chunks in one connection
+            await self._stream_tts(text_iterator())
             
         except Exception as e:
             logger.error(f"Error in TTS pipeline: {e}")

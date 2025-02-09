@@ -31,6 +31,8 @@ from src.agents.rin.prompts import SYSTEM_PROMPT
 from src.graphrag.rin_engine import RinResponseEnricher
 from src.tools.orchestrator import Orchestrator
 from src.utils.trigger_detector import TriggerDetector
+from src.agents.rin.tool_state_manager import ToolStateManager, ToolOperationState
+from src.agents.rin.agent_dependencies import AgentDependencies
 
 class RinAgent:
     def __init__(self, mongo_uri: str):
@@ -65,6 +67,9 @@ class RinAgent:
         self.chat_model = ModelType.SAO_10K_L31_70B_EURYALE_V2_2  # For role-playing
         self.decision_model = ModelType.GPT4_TURBO  # For analysis/decisions
         self.response_model = ModelType.CLAUDE_3_5_SONNET # For tool-based responses
+        
+        # Initialize tool state manager
+        self.tool_state_manager = ToolStateManager()
         
     async def initialize(self):
         """Initialize async components."""
@@ -101,10 +106,49 @@ class RinAgent:
         
     # Message entry point
     async def get_response(self, session_id: str, message: str, role: str = "user", interaction_type: str = "local_agent") -> str:
-        """Generate response for given message in session context."""
+        """Main entry point for message processing"""
         try:
             logger.info(f"[CHECKPOINT 1] Starting response generation for session {session_id}")
             
+            # Check for active tool operation
+            operation = await self.tool_state_manager.get_operation(session_id)
+            
+            if operation and operation.get('state') != ToolOperationState.INACTIVE.value:
+                # Let orchestrator handle the operation step
+                result = await self.orchestrator.process_command(
+                    command=message,
+                    deps=AgentDependencies(
+                        conversation_id=session_id,
+                        context={
+                            "operation": operation,
+                            "interaction_type": interaction_type
+                        }
+                    )
+                )
+                
+                # Update operation state based on result
+                if result.data.get("operation_update"):
+                    await self.tool_state_manager.update_operation(
+                        session_id,
+                        **result.data["operation_update"]
+                    )
+                
+                # Store the tool interaction in context
+                await self.context_manager.store_interaction(
+                    session_id=session_id,
+                    user_message=message,
+                    assistant_response=result.response,
+                    interaction_type=interaction_type,
+                    metadata={
+                        'formatted_for_tts': True,
+                        'role': role,
+                        'tool_operation': operation.get('operation_type'),
+                        'tool_step': operation.get('step')
+                    }
+                )
+                
+                return result.response
+
             # Initialize session if needed
             if session_id not in self.sessions:
                 logger.info("[CHECKPOINT 2] Loading/creating session")
@@ -128,6 +172,18 @@ class RinAgent:
             # Get tool results if needed
             tool_results = None
             if use_tools:
+                # Check if we need to start a new tool operation
+                operation_type = self.trigger_detector.get_tool_operation_type(message)
+                if operation_type:
+                    await self.tool_state_manager.start_operation(
+                        session_id,
+                        operation_type,
+                        initial_data={"message": message}
+                    )
+                    # Redirect to tool operation flow
+                    return await self.get_response(session_id, message, role, interaction_type)
+                
+                # Otherwise get immediate tool results
                 tool_results = await self._get_tool_results(message)
                 logger.info(f"Tool results obtained: {bool(tool_results)}")
 

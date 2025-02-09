@@ -11,6 +11,7 @@ import time
 import os
 from src.services.websocket_server import ChatWebSocketServer
 from src.agents.rin.agent import RinAgent
+from src.services.schedule_service import ScheduleService
 
 logger = logging.getLogger(__name__)
 
@@ -60,6 +61,9 @@ class StreamOrchestrator:
             if 'mongo_uri' not in config:
                 raise ValueError("MongoDB URI not found in config")
             self.agent = RinAgent(mongo_uri=config['mongo_uri'])
+            
+            # Initialize schedule service
+            self.schedule_service = ScheduleService(config['mongo_uri'])
             
             logger.info("StreamOrchestrator initialization complete")
             
@@ -191,6 +195,9 @@ class StreamOrchestrator:
                 await self.speech_manager.initialize()
                 # Don't auto-start recording, wait for Alt+S
             
+            # Start schedule service
+            await self.schedule_service.start()
+            
             logger.info("All services started successfully")
             
             # Keep the service running
@@ -227,7 +234,12 @@ class StreamOrchestrator:
                         await task
                     except asyncio.CancelledError:
                         pass
-                
+            
+            # Stop schedule service
+            if hasattr(self, 'schedule_service'):
+                await self.schedule_service.stop()
+                logger.info("Schedule service shutdown complete")
+            
             logger.info("All services shutdown complete")
             
         except Exception as e:

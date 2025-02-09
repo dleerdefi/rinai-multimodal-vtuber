@@ -3,7 +3,23 @@ from typing import Dict, List, Optional
 
 class TriggerDetector:
     def __init__(self):
-        # Tool triggers
+        # Define Twitter patterns once
+        self.twitter_patterns = {
+            'general': {
+                'keywords': ['tweet', 'twitter', '@'],
+                'phrases': ['post on twitter', 'send a tweet']
+            },
+            'schedule': {
+                'keywords': ['schedule', 'plan', 'series', 'multiple'],
+                'phrases': ['schedule tweets', 'plan tweets', 'tweet series']
+            },
+            'immediate': {
+                'keywords': ['tweet now', 'post now', 'send tweet'],
+                'phrases': ['tweet this', 'post this', 'send this tweet']
+            }
+        }
+        
+        # Other tool triggers
         self.tool_triggers = {
             'crypto': {
                 'keywords': ['bitcoin', 'btc', 'eth', 'ethereum', 'price', 'market', 'crypto', '$'],
@@ -48,4 +64,26 @@ class TriggerDetector:
         if any(phrase in message for phrase in self.memory_triggers['phrases']):
             return True
             
-        return False 
+        return False
+
+    def should_use_twitter(self, message: str) -> bool:
+        """Check if message is Twitter-related"""
+        message = message.lower()
+        patterns = self.twitter_patterns['general']
+        return any(keyword in message for keyword in patterns['keywords']) or \
+               any(phrase in message for phrase in patterns['phrases'])
+
+    def get_tool_operation_type(self, message: str) -> Optional[str]:
+        """Determine if message requires a multi-step tool operation"""
+        message = message.lower()
+        
+        if not self.should_use_twitter(message):
+            return None
+            
+        # Check for scheduling patterns
+        if any(keyword in message for keyword in self.twitter_patterns['schedule']['keywords']) or \
+           any(phrase in message for phrase in self.twitter_patterns['schedule']['phrases']):
+            return "schedule_tweets"
+            
+        # Default to immediate tweet
+        return "send_tweet" 

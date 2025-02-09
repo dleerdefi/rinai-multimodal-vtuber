@@ -129,7 +129,7 @@ class LLMService:
                     "presence_penalty": 0.3,
                     "frequency_penalty": 0.3,
                     "repetition_penalty": 1.1,
-                    "max_tokens": 900,
+                    "max_tokens": 800,
                     "stream": False,
                     "response_format": {"type": "text"}
                 }
