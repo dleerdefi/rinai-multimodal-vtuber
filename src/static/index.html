@@ -1,0 +1,136 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>AI Chat Interface</title>
+    <style>
+        body {
+            background-color: #000;
+            color: #33ff33;
+            font-family: 'Courier New', monospace;
+            margin: 0;
+            padding: 20px;
+            overflow: hidden;
+        }
+
+        #chat-container {
+            height: 100vh;
+            overflow-y: auto;
+            padding-right: 20px;
+        }
+
+        .message {
+            margin: 10px 0;
+            opacity: 0;
+            animation: fadeIn 0.5s forwards;
+        }
+
+        .timestamp {
+            color: #666;
+            margin-right: 10px;
+        }
+
+        .author {
+            color: #ffff33;
+            margin-right: 10px;
+        }
+
+        .content {
+            color: #33ff33;
+        }
+
+        .system-message {
+            color: #ff3333;
+        }
+
+        @keyframes fadeIn {
+            from { opacity: 0; transform: translateY(20px); }
+            to { opacity: 1; transform: translateY(0); }
+        }
+
+        /* Scanline effect */
+        .scanline {
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 2px;
+            background: rgba(51, 255, 51, 0.1);
+            animation: scan 2s linear infinite;
+            pointer-events: none;
+        }
+
+        @keyframes scan {
+            from { top: 0; }
+            to { top: 100vh; }
+        }
+
+        /* CRT screen effect */
+        .crt-overlay {
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background: linear-gradient(rgba(0,0,0,0.1) 50%, rgba(0,0,0,0.2) 50%);
+            background-size: 100% 4px;
+            pointer-events: none;
+            z-index: 10;
+        }
+    </style>
+</head>
+<body>
+    <div class="scanline"></div>
+    <div class="crt-overlay"></div>
+    <div id="chat-container"></div>
+
+    <script>
+        const chatContainer = document.getElementById('chat-container');
+        let ws;
+
+        function connect() {
+            const wsUrl = `ws://${window.location.host}/ws`;
+            ws = new WebSocket(wsUrl);
+
+            ws.onmessage = function(event) {
+                const message = JSON.parse(event.data);
+                addMessage(message);
+            };
+
+            ws.onclose = function() {
+                addSystemMessage('Connection lost. Reconnecting...');
+                setTimeout(connect, 1000);
+            };
+
+            ws.onerror = function(error) {
+                addSystemMessage('WebSocket error: ' + error);
+            };
+        }
+
+        function addMessage(message) {
+            const messageDiv = document.createElement('div');
+            messageDiv.className = 'message';
+
+            const timestamp = new Date().toLocaleTimeString();
+            messageDiv.innerHTML = `
+                <span class="timestamp">[${timestamp}]</span>
+                <span class="author">${message.author}:</span>
+                <span class="content">${message.content}</span>
+            `;
+
+            chatContainer.appendChild(messageDiv);
+            chatContainer.scrollTop = chatContainer.scrollHeight;
+        }
+
+        function addSystemMessage(text) {
+            const messageDiv = document.createElement('div');
+            messageDiv.className = 'message system-message';
+            messageDiv.textContent = text;
+            chatContainer.appendChild(messageDiv);
+            chatContainer.scrollTop = chatContainer.scrollHeight;
+        }
+
+        // Start connection
+        connect();
+    </script>
+</body>
+</html> 

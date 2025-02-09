@@ -1,0 +1,31 @@
+{
+    "API_data": [
+        {
+            "endpoint": "${API_BASE_URL}"
+        }
+    ],
+    "keys": [
+        {
+            "EL_key": "${ELEVEN_LABS_API_KEY}",
+            "RIN_API_KEY": "${RIN_STREAM_API_KEY}",
+            "OPENAI_API_KEY": "${OPENAI_API_KEY}",
+            "ANTHROPIC_API_KEY": "${ANTHROPIC_API_KEY}",
+            "COINGECKO_API_KEY": "${COINGECKO_API_KEY}",
+            "JINA_API_KEY": "${JINA_API_KEY}",
+            "GROQ_API_KEY": "${GROQ_API_KEY}",
+            "NOVITA_API_KEY": "${NOVITA_API_KEY}"
+        }
+    ],
+    "mongodb": {
+        "db_name": "rin_db",
+        "uri": "${MONGO_URI}"
+    },
+    "EL_data": [
+        {
+            "rin_voice": "${ELEVEN_LABS_VOICE_ID}"
+        }
+    ],
+    "enable_speech_input": true,
+    "enable_youtube_chat": true,
+    "youtube_stream_id": "${YOUTUBE_STREAM_ID}"
+} 
