@@ -56,4 +56,9 @@ class MongoManager:
             cls._instance.close()
             cls._instance = None
             cls._db = None
-            logger.info("MongoDB connection closed") 
+            logger.info("MongoDB connection closed")
+
+    @classmethod
+    def is_initialized(cls) -> bool:
+        """Check if MongoDB is initialized"""
+        return cls._instance is not None and cls._db is not None 

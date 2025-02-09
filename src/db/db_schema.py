@@ -4,6 +4,7 @@ import logging
 import uuid
 from bson.objectid import ObjectId
 from motor.motor_asyncio import AsyncIOMotorClient
+from enum import Enum
 
 logger = logging.getLogger(__name__)
 
@@ -27,7 +28,7 @@ class ContextConfiguration(TypedDict):
     active_message_ids: List[str]   # IDs of messages in current context
     last_updated: datetime
 
-class TweetStatus(Literal):
+class TweetStatus(str, Enum):
     """Tweet status types"""
     PENDING = "pending"
     APPROVED = "approved"
@@ -38,11 +39,11 @@ class TweetStatus(Literal):
 
 class Tweet(TypedDict):
     content: str
-    status: TweetStatus
+    status: str  # Will contain TweetStatus values
     created_at: datetime
     scheduled_time: Optional[datetime]  # When this specific tweet should be posted
     posted_time: Optional[datetime]
-    metadata: Dict[str, any]  # estimated_engagement, etc
+    metadata: Dict[str, any]  # estimated_engagement, schedule_time, etc
     twitter_api_params: Dict[str, any]  # API parameters
     twitter_response: Optional[Dict]  # Response from Twitter API after posting
     retry_count: int
@@ -71,6 +72,22 @@ class ToolOperation(TypedDict):
     data: Dict[str, any]
     created_at: datetime
     last_updated: datetime
+
+class TwitterAPIParams(TypedDict):
+    message: str
+    account_id: str
+    media_files: Optional[List[str]]
+    poll_options: Optional[List[str]]
+    poll_duration: Optional[int]
+
+class TweetMetadata(TypedDict):
+    estimated_engagement: str
+    generated_at: str
+
+class ValidatedTweet(TypedDict):
+    content: str
+    metadata: TweetMetadata
+    twitter_api_params: TwitterAPIParams
 
 class RinDB:
     def __init__(self, client: AsyncIOMotorClient):
@@ -264,8 +281,9 @@ class RinDB:
     async def update_tweet_schedule(self, schedule_id: str, 
                                   approved_tweet_ids: Optional[List[str]] = None,
                                   pending_tweet_ids: Optional[List[str]] = None,
-                                  status: Optional[str] = None) -> bool:
-        """Update a tweet schedule with new tweet IDs or status"""
+                                  status: Optional[str] = None,
+                                  schedule_info: Optional[Dict] = None) -> bool:
+        """Update a tweet schedule with new tweet IDs, status, or schedule info"""
         try:
             update_data = {"last_updated": datetime.utcnow()}
             if approved_tweet_ids is not None:
@@ -274,6 +292,8 @@ class RinDB:
                 update_data["pending_tweets"] = pending_tweet_ids
             if status:
                 update_data["status"] = status
+            if schedule_info:
+                update_data["schedule_info"] = schedule_info
 
             result = await self.tweet_schedules.update_one(
                 {"_id": ObjectId(schedule_id)},
@@ -341,7 +361,8 @@ class RinDB:
 
     async def update_tweet_status(self, tweet_id: str, status: TweetStatus,
                                 twitter_response: Optional[Dict] = None,
-                                error: Optional[str] = None) -> bool:
+                                error: Optional[str] = None,
+                                metadata: Optional[Dict] = None) -> bool:
         """Update tweet status and related fields"""
         try:
             update_data = {
@@ -355,6 +376,9 @@ class RinDB:
             
             if error:
                 update_data["last_error"] = error
+            
+            if metadata:
+                update_data["metadata"] = metadata
             
             result = await self.tweets.update_one(
                 {"_id": ObjectId(tweet_id)},
@@ -395,8 +419,11 @@ class RinDB:
         try:
             current_time = datetime.utcnow()
             cursor = self.tweets.find({
-                "status": TweetStatus.SCHEDULED,
-                "scheduled_time": {"$lte": current_time},
+                "status": TweetStatus.SCHEDULED.value,
+                "$or": [
+                    {"scheduled_time": {"$lte": current_time}},
+                    {"metadata.scheduled_time": {"$lte": current_time.isoformat()}}
+                ],
                 "retry_count": {"$lt": 3}
             })
             return await cursor.to_list(length=None)

@@ -31,8 +31,10 @@ from src.agents.rin.prompts import SYSTEM_PROMPT
 from src.graphrag.rin_engine import RinResponseEnricher
 from src.tools.orchestrator import Orchestrator
 from src.utils.trigger_detector import TriggerDetector
-from src.agents.rin.tool_state_manager import ToolStateManager, ToolOperationState
-from src.agents.rin.agent_dependencies import AgentDependencies
+from src.managers.tool_state_manager import ToolStateManager, ToolOperationState
+from src.tools.base import AgentDependencies
+from src.db.mongo_manager import MongoManager
+from src.services.schedule_service import ScheduleService
 
 class RinAgent:
     def __init__(self, mongo_uri: str):
@@ -68,19 +70,28 @@ class RinAgent:
         self.decision_model = ModelType.GPT4_TURBO  # For analysis/decisions
         self.response_model = ModelType.CLAUDE_3_5_SONNET # For tool-based responses
         
-        # Initialize tool state manager
-        self.tool_state_manager = ToolStateManager()
+        # Add ScheduleService initialization
+        self.schedule_service = ScheduleService(mongo_uri)
+        
+        # Initialize tool_state_manager with schedule service
+        self.tool_state_manager = None  # Will be initialized in initialize()
         
     async def initialize(self):
         """Initialize async components."""
         try:
             logger.info("Initializing RinAgent...")
-            logger.info(f"Attempting to connect to MongoDB with URI: {'***' + self.mongo_uri.split('@')[-1] if '@' in self.mongo_uri else '***'}")
             
             # Initialize context manager
             await self.context_manager.initialize()
             if not await self.context_manager.is_initialized():
                 raise Exception("Failed to initialize context manager")
+            
+            # Initialize tool state manager with DB
+            logger.info("Creating ToolStateManager in RinAgent...")
+            self.tool_state_manager = ToolStateManager(
+                db=self.context_manager.db,
+                schedule_service=self.schedule_service
+            )
             
             # Initialize GraphRAG with error handling
             try:
@@ -99,15 +110,55 @@ class RinAgent:
                 logger.error(f"Failed to initialize orchestrator: {e}")
                 raise  # Orchestrator is critical, so we raise the error
             
+            # Start schedule service
+            await self.schedule_service.start()
+            
             logger.info("Successfully initialized RinAgent and connected to all services")
         except Exception as e:
-            logger.error(f"Failed to initialize RinAgent: {str(e)}")
+            logger.error(f"Error initializing RinAgent: {e}")
             raise
         
     # Message entry point
     async def get_response(self, session_id: str, message: str, role: str = "user", interaction_type: str = "local_agent") -> str:
         """Main entry point for message processing"""
         try:
+            # Check for scheduling triggers using existing patterns
+            if (self.trigger_detector.should_use_twitter(message) and 
+                self.trigger_detector.get_tool_operation_type(message) == "schedule_tweets"):
+                
+                logger.info(f"Detected tweet scheduling request: {message}")
+                
+                # Start scheduling operation
+                await self.tool_state_manager.start_operation(
+                    session_id=session_id,
+                    operation_type="schedule_tweets",
+                    initial_data={
+                        "message": message,
+                        "interaction_type": interaction_type,
+                        "detected_patterns": {
+                            "is_twitter": True,
+                            "is_schedule": True
+                        }
+                    }
+                )
+                
+                # Process through orchestrator with user_id
+                result = await self.orchestrator.process_command(
+                    command=message,
+                    deps=AgentDependencies(
+                        conversation_id=session_id,
+                        user_id=role,  # Add user_id from role parameter
+                        context={
+                            "interaction_type": interaction_type,
+                            "tool_type": "twitter_scheduler"
+                        }
+                    )
+                )
+                
+                if result and result.response:
+                    return result.response
+                return "I'll help you schedule those tweets! What would you like to tweet about?"
+
             logger.info(f"[CHECKPOINT 1] Starting response generation for session {session_id}")
             
             # Check for active tool operation
@@ -119,6 +170,7 @@ class RinAgent:
                     command=message,
                     deps=AgentDependencies(
                         conversation_id=session_id,
+                        user_id=role,  # Add user_id here
                         context={
                             "operation": operation,
                             "interaction_type": interaction_type
@@ -445,14 +497,18 @@ RESPONSE GUIDELINES:
             if hasattr(self.orchestrator, 'cleanup'):
                 await self.orchestrator.cleanup()
             
-            # Add MongoDB cleanup
-            if self.context_manager and self.context_manager.mongo_client:
-                self.context_manager.mongo_client.close()
+            # MongoDB cleanup through context manager
+            if self.context_manager:
+                await MongoManager.close()
             
             # Cleanup any remaining sessions
             for session in getattr(self, '_sessions', {}).values():
                 if hasattr(session, 'close'):
                     await session.close()
+            
+            # Stop schedule service
+            if hasattr(self, 'schedule_service'):
+                await self.schedule_service.stop()
             
             logger.info("Successfully cleaned up all resources")
         except Exception as e:

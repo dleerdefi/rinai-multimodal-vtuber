@@ -22,6 +22,7 @@ from src.utils.logging_config import setup_logging
 from src.services.stream_orchestrator import StreamOrchestrator
 from src.utils.keyboard_handler import KeyboardHandler
 from rich.prompt import Confirm, IntPrompt
+from src.db.mongo_manager import MongoManager
 
 # Set up logging
 console = setup_logging()
@@ -77,6 +78,11 @@ async def main():
         load_dotenv()
         config = load_config()
         
+        # Initialize MongoDB first
+        if 'mongo_uri' not in config:
+            raise ValueError("MongoDB URI not found in config")
+        await MongoManager.initialize(config['mongo_uri'])
+        
         console.print("[bold cyan]Starting VTuber Stream Services[/]")
         
         # Setup input sources
@@ -86,11 +92,12 @@ async def main():
             console.print("[yellow]No input sources enabled. Exiting...")
             return
         
-        # Initialize orchestrator with config
+        # Now create orchestrator with initialized MongoDB
         orchestrator = StreamOrchestrator(config)
         
         # Initialize and start keyboard handler
         keyboard_handler = KeyboardHandler(orchestrator)
+        orchestrator.set_keyboard_handler(keyboard_handler)
         keyboard_handler.start()
         
         console.print("\n[bold green]Services Started![/]")

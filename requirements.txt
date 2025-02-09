@@ -17,13 +17,7 @@ sounddevice>=0.4.6
 numpy>=1.24.0
 wave>=0.0.2
 rich>=13.0.0
-web3==6.4.0 # for future crypto integrations
-eth-account==0.13.4
-eth-typing==5.0.1
-eth-utils==5.1.0
 async-timeout==5.0.1
-cytoolz>=0.12.2
-eth-hash[pycryptodome]>=0.5.2
 keyboard>=0.13.5
 
 # VTube Studio Integration

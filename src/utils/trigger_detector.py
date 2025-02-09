@@ -6,16 +6,16 @@ class TriggerDetector:
         # Define Twitter patterns once
         self.twitter_patterns = {
             'general': {
-                'keywords': ['tweet', 'twitter', '@'],
-                'phrases': ['post on twitter', 'send a tweet']
+                'keywords': ['tweet', 'twitter', '@', 'post'],
+                'phrases': ['post on twitter', 'send a tweet', 'create a tweet', 'make a tweet']
             },
             'schedule': {
                 'keywords': ['schedule', 'plan', 'series', 'multiple'],
                 'phrases': ['schedule tweets', 'plan tweets', 'tweet series']
             },
             'immediate': {
-                'keywords': ['tweet now', 'post now', 'send tweet'],
-                'phrases': ['tweet this', 'post this', 'send this tweet']
+                'keywords': ['tweet now', 'post now', 'send tweet', 'create tweet'],
+                'phrases': ['tweet this', 'post this', 'send this tweet', 'create a tweet', 'make a tweet']
             }
         }
         
@@ -69,9 +69,14 @@ class TriggerDetector:
     def should_use_twitter(self, message: str) -> bool:
         """Check if message is Twitter-related"""
         message = message.lower()
-        patterns = self.twitter_patterns['general']
-        return any(keyword in message for keyword in patterns['keywords']) or \
-               any(phrase in message for phrase in patterns['phrases'])
+        
+        # Check all Twitter pattern categories
+        for category in self.twitter_patterns.values():
+            if any(keyword in message for keyword in category['keywords']) or \
+               any(phrase in message for phrase in category['phrases']):
+                return True
+                
+        return False
 
     def get_tool_operation_type(self, message: str) -> Optional[str]:
         """Determine if message requires a multi-step tool operation"""
@@ -85,5 +90,10 @@ class TriggerDetector:
            any(phrase in message for phrase in self.twitter_patterns['schedule']['phrases']):
             return "schedule_tweets"
             
-        # Default to immediate tweet
+        # Check for immediate tweet patterns
+        if any(keyword in message for keyword in self.twitter_patterns['immediate']['keywords']) or \
+           any(phrase in message for phrase in self.twitter_patterns['immediate']['phrases']):
+            return "send_tweet"
+            
+        # If it's Twitter-related but not explicitly scheduled or immediate, default to send_tweet
         return "send_tweet" 

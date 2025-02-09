@@ -82,6 +82,11 @@ class LLMService:
             # OpenAI configs
             ModelType.GPT4o: {
                 "default": {"temperature": 0.7, "max_tokens": 1000},
+                "json": {
+                    "temperature": 0.2,
+                    "max_tokens": 500,
+                    "response_format": {"type": "json_object"}
+                },
                 "decision": {"temperature": 0.2, "max_tokens": 100}
             },
             ModelType.GPT4_TURBO: {

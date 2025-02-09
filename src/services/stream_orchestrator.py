@@ -12,6 +12,9 @@ import os
 from src.services.websocket_server import ChatWebSocketServer
 from src.agents.rin.agent import RinAgent
 from src.services.schedule_service import ScheduleService
+from src.db.mongo_manager import MongoManager
+from src.managers.tool_state_manager import ToolStateManager
+from src.utils.keyboard_handler import KeyboardHandler
 
 logger = logging.getLogger(__name__)
 
@@ -25,6 +28,17 @@ class StreamOrchestrator:
             
             # Add session management
             self.current_session_id = None
+            self.keyboard_handler = None  # Will be set from run_stream.py
+            
+            # Verify MongoDB is initialized
+            if not MongoManager.is_initialized():
+                raise RuntimeError("MongoDB must be initialized before creating StreamOrchestrator")
+            
+            # Get database instance
+            self.db = MongoManager.get_db()
+            
+            # Initialize tool state manager with db
+            self.tool_state_manager = ToolStateManager(db=self.db)
             
             # Initialize voice manager for streaming TTS
             self.voice_manager = VoiceManager(
@@ -70,6 +84,10 @@ class StreamOrchestrator:
         except Exception as e:
             logger.error(f"Error initializing StreamOrchestrator: {e}")
             raise
+
+    def set_keyboard_handler(self, handler):
+        """Set the keyboard handler instance"""
+        self.keyboard_handler = handler
 
     async def handle_chat_message(self, message: str, author: str = "YouTube Chat"):
         """Handle incoming chat messages from YouTube"""
@@ -117,10 +135,14 @@ class StreamOrchestrator:
             logger.error(f"Error handling chat message: {e}", exc_info=True)
             return None
 
-    async def handle_host_message(self, message: str):
+    async def handle_host_message(self, message: str, author: str = "Host"):
         """Handle messages from speech-to-text for host responses"""
         try:
             logger.info(f"Received host message from STT: {message}")
+            
+            # Set tool processing flag but don't stop speech
+            if hasattr(self.keyboard_handler, 'set_tool_processing'):
+                self.keyboard_handler.set_tool_processing(True)
             
             if not self.current_session_id:
                 self.current_session_id = f"session_{int(time.time())}"
@@ -136,6 +158,26 @@ class StreamOrchestrator:
                 'content': message,
                 'timestamp': datetime.now().isoformat()
             })
+            
+            # Check for tool commands before agent processing
+            try:
+                if self.tool_state_manager.should_use_tools(message):
+                    logger.info(f"Detected tool command: {message}")
+                    tool_type = self.tool_state_manager.get_tool_operation_type(message)
+                    logger.info(f"Tool type detected: {tool_type}")
+                    
+                    if tool_type:
+                        try:
+                            result = await self.tool_state_manager.execute_tool(tool_type, message)
+                            logger.info(f"Tool execution result: {result}")
+                            if not result:
+                                logger.warning("Tool execution returned no result")
+                        except Exception as tool_error:
+                            logger.error(f"Tool execution failed: {tool_error}", exc_info=True)
+                            # Continue with agent processing even if tool fails
+            except Exception as e:
+                logger.error(f"Error in tool processing: {e}", exc_info=True)
+                # Continue with agent processing
             
             # Route through RinAgent
             response = await self.agent.get_response(
@@ -162,8 +204,13 @@ class StreamOrchestrator:
             return response
                 
         except Exception as e:
-            logger.error(f"Error handling host message: {e}")
+            logger.error(f"Error handling host message: {e}", exc_info=True)
             return None
+            
+        finally:
+            # Always reset tool processing flag
+            if hasattr(self.keyboard_handler, 'set_tool_processing'):
+                self.keyboard_handler.set_tool_processing(False)
 
     async def start(self):
         """Start all services"""
