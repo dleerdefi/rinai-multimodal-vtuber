@@ -38,16 +38,23 @@ class ChatManager:
                 if chat_data:
                     for c in chat_data.sync_items():
                         try:
-                            # Add message to buffer
-                            self.message_buffer.append(c.message)
+                            # Add message to buffer with metadata
+                            self.message_buffer.append({
+                                'message': c.message,
+                                'author': c.author.name,
+                                'interaction_type': 'livestream'
+                            })
                             
                             # Process buffer if enough time has passed
                             if current_time - self.last_process_time >= self.PROCESS_INTERVAL:
                                 if self.message_buffer:
                                     # Process all messages in buffer
-                                    for msg in self.message_buffer:
-                                        logger.info(f"Processing chat message: {msg}")
-                                        await message_handler(msg)
+                                    for msg_data in self.message_buffer:
+                                        logger.info(f"Processing chat message from {msg_data['author']}")
+                                        await message_handler(
+                                            msg_data['message'],
+                                            msg_data['author']
+                                        )
                                     self.message_buffer.clear()
                                     self.last_process_time = current_time
                             

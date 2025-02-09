@@ -1,9 +1,5 @@
 from pydantic import BaseModel, Field
 from typing import List, Dict, Optional
-from core.tools.base import AgentResult, AgentDependencies
-from core.llm.llm_service import LLMService, ModelType
-from core.tools.clients.perplexity_client import PerplexityClient
-from core.tools.clients.coingecko_client import CoinGeckoClient
 import logging
 import asyncio
 import os
@@ -11,6 +7,10 @@ from dotenv import load_dotenv
 from datetime import datetime
 import json
 from pydantic import ValidationError
+from src.tools.base import AgentResult, AgentDependencies
+from src.services.llm_service import LLMService, ModelType
+from src.clients.perplexity_client import PerplexityClient
+from src.clients.coingecko_client import CoinGeckoClient
 
 load_dotenv()
 logger = logging.getLogger(__name__)

@@ -3,13 +3,16 @@ from datetime import datetime
 import logging
 import uuid
 from bson.objectid import ObjectId
+from motor.motor_asyncio import AsyncIOMotorClient
 
 logger = logging.getLogger(__name__)
 
 class Message(TypedDict):
-    role: str  # "user" or "assistant"
+    role: str  # "host" or username from livestream
     content: str
     timestamp: datetime
+    interaction_type: str  # "local_agent" or "livestream"
+    session_id: str
 
 class Session(TypedDict):
     session_id: str
@@ -25,19 +28,20 @@ class ContextConfiguration(TypedDict):
     last_updated: datetime
 
 class RinDB:
-    def __init__(self, client):
+    def __init__(self, client: AsyncIOMotorClient):
         self.client = client
-        self.db = client['rin_dev_db']  # Use same database as Node.js
+        self.db = client['rin_multimodal']
         self.messages = self.db['rin.messages']
         self.context_configs = self.db['rin.context_configs']
+        self._initialized = False
         logger.info(f"Connected to database: {self.db.name}")
 
     async def initialize(self):
-        """Initialize database and collections if they don't exist"""
+        """Initialize database and collections"""
         try:
-            # Create collections if they don't exist
             collections = await self.db.list_collection_names()
             
+            # Create collections if they don't exist
             if 'rin.messages' not in collections:
                 await self.db.create_collection('rin.messages')
                 logger.info("Created rin.messages collection")
@@ -48,8 +52,8 @@ class RinDB:
             
             # Setup indexes
             await self._setup_indexes()
+            self._initialized = True
             
-            logger.info("Database initialization complete")
             return True
             
         except Exception as e:
@@ -89,8 +93,16 @@ class RinDB:
             raise
 
     async def add_message(self, session_id: str, role: str, content: str, 
-                         interaction_type: str = 'chat', metadata: Optional[dict] = None):
-        """Add a message to the database with optional metadata"""
+                         interaction_type: str = 'local_agent', metadata: Optional[dict] = None):
+        """Add a message to the database
+        
+        Args:
+            session_id: Unique session identifier
+            role: Either "host" for local input or username for livestream
+            content: Message content
+            interaction_type: Either "local_agent" or "livestream"
+            metadata: Optional additional metadata
+        """
         message = {
             "session_id": session_id,
             "role": role,

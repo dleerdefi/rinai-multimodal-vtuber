@@ -8,10 +8,12 @@ from motor.motor_asyncio import AsyncIOMotorClient
 import logging
 from datetime import datetime
 from tenacity import retry, stop_after_attempt, wait_exponential
-from core.db.db_schema import RinDB
-from core.llm.llm_service import LLMService, ModelType
+from src.db.db_schema import RinDB
+from src.services.llm_service import LLMService, ModelType
 import asyncio
 import tiktoken
+from src.db.mongo_manager import MongoManager
+
 
 logger = logging.getLogger(__name__)
 
@@ -25,8 +27,8 @@ class RinContext:
     SUMMARY_COOLDOWN = 300      # 5 minutes between summarizations
     
     def __init__(self, mongo_uri: str):
-        self.mongo_client = AsyncIOMotorClient(mongo_uri)
-        self.db = RinDB(self.mongo_client)
+        self.mongo_uri = mongo_uri
+        self.db = None
         self._initialized = False
         self._active_stream_id = None
         self.battle_contexts = {}
@@ -36,16 +38,14 @@ class RinContext:
         # Initialize tokenizer
         self.enc = tiktoken.get_encoding("cl100k_base")
         
-    @retry(wait=wait_exponential(multiplier=1, min=4, max=10), stop=stop_after_attempt(3))
     async def initialize(self):
         """Initialize database and setup indexes with retry"""
         try:
-            if await self.db.is_initialized():
-                await self.db._setup_indexes()
-                self._initialized = True
-                logger.info("Successfully initialized RinContext")
-            else:
-                raise Exception("Failed to initialize database connection")
+            # Use MongoManager instead of direct client creation
+            await MongoManager.initialize(self.mongo_uri)
+            self.db = MongoManager.get_db()
+            self._initialized = True
+            logger.info("Successfully initialized RinContext")
         except Exception as e:
             logger.error(f"Failed to initialize RinContext: {e}")
             raise

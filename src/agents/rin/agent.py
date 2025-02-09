@@ -25,11 +25,12 @@ project_root = Path(__file__).parent.parent.parent.resolve()
 sys.path.insert(0, str(project_root))
 
 # Now import our modules
-from core.llm.llm_service import LLMService, ModelType
-from core.agent.context_manager import RinContext
-from core.agent.prompts import SYSTEM_PROMPT
-from core.graphrag.engine import RinResponseEnricher
-from core.tools.orchestrator import Orchestrator
+from src.services.llm_service import LLMService, ModelType
+from src.agents.rin.context_manager import RinContext
+from src.agents.rin.prompts import SYSTEM_PROMPT
+from src.graphrag.rin_engine import RinResponseEnricher
+from src.tools.orchestrator import Orchestrator
+from src.utils.trigger_detector import TriggerDetector
 
 class RinAgent:
     def __init__(self, mongo_uri: str):
@@ -38,6 +39,9 @@ class RinAgent:
         self.context_manager = RinContext(mongo_uri)
         self.mongo_uri = mongo_uri
         self.sessions = {}
+        
+        # Initialize trigger detector
+        self.trigger_detector = TriggerDetector()
         
         # Load environment variables
         self.neo4j_uri = os.getenv("NEO4J_URI")
@@ -61,23 +65,6 @@ class RinAgent:
         self.chat_model = ModelType.SAO_10K_L31_70B_EURYALE_V2_2  # For role-playing
         self.decision_model = ModelType.GPT4_TURBO  # For analysis/decisions
         self.response_model = ModelType.CLAUDE_3_5_SONNET # For tool-based responses
-        
-        # Define triggers for tools and GraphRAG
-        self.tool_triggers = {
-            'crypto': {
-                'keywords': ['bitcoin', 'btc', 'eth', 'ethereum', 'price', 'market', 'crypto', '$'],
-                'phrases': ['how much is', "what's the price", 'show me the market']
-            },
-            'search': {
-                'keywords': ['news', 'latest', 'current', 'today', 'happened', 'recent'],
-                'phrases': ['what is happening', 'tell me about', 'what happened', 'search for']
-            }
-        }
-
-        self.memory_triggers = {
-            'keywords': ['remember', 'you said', 'earlier', 'before', 'last time', 'previously'],
-            'phrases': ['do you recall', 'as we discussed', 'like you mentioned']
-        }
         
     async def initialize(self):
         """Initialize async components."""
@@ -112,11 +99,13 @@ class RinAgent:
             logger.error(f"Failed to initialize RinAgent: {str(e)}")
             raise
         
-    async def get_response(self, session_id: str, message: str) -> str:
+    # Message entry point
+    async def get_response(self, session_id: str, message: str, role: str = "user", interaction_type: str = "local_agent") -> str:
         """Generate response for given message in session context."""
         try:
             logger.info(f"[CHECKPOINT 1] Starting response generation for session {session_id}")
             
+            # Initialize session if needed
             if session_id not in self.sessions:
                 logger.info("[CHECKPOINT 2] Loading/creating session")
                 history = await self.context_manager.get_combined_context(session_id, message)
@@ -131,34 +120,59 @@ class RinAgent:
                     await self.start_new_session(session_id)
 
             logger.info("[CHECKPOINT 4] Preparing to generate response")
+
+            # Check for special triggers using TriggerDetector
+            use_tools = self.trigger_detector.should_use_tools(message)
+            use_memory = self.trigger_detector.should_use_memory(message)
             
-            # Get RAG guidance if available
-            rag_guidance = ""
-            if self.response_enricher:
+            # Get tool results if needed
+            tool_results = None
+            if use_tools:
+                tool_results = await self._get_tool_results(message)
+                logger.info(f"Tool results obtained: {bool(tool_results)}")
+
+            # Get memory/RAG guidance if needed
+            rag_guidance = None
+            if use_memory and self.response_enricher:
                 try:
                     rag_guidance = await self.response_enricher.enrich_response(message)
-                    logger.info(f"GraphRAG guidance received: {rag_guidance[:100]}...")
+                    logger.info(f"Memory guidance received: {rag_guidance[:100]}...")
                 except Exception as e:
-                    logger.warning(f"GraphRAG enrichment failed: {e}")
+                    logger.warning(f"Memory lookup failed: {e}")
                     rag_guidance = "Consider this a fresh conversation."
-            
-            # Generate response with RAG guidance
-            response = await self._generate_response(message, self.sessions[session_id], session_id)
+
+            # Generate response with all available context
+            response = await self._generate_response(
+                message, 
+                self.sessions[session_id], 
+                session_id,
+                tool_results=tool_results,
+                rag_guidance=rag_guidance,
+                role=role,
+                interaction_type=interaction_type
+            )
             logger.info("[CHECKPOINT 5] Response generated")
-            
+
             # Store messages in session and database
             message_pair = [
-                {'role': 'user', 'content': message, 'timestamp': datetime.utcnow()},
+                {'role': role, 'content': message, 'timestamp': datetime.utcnow()},
                 {'role': 'assistant', 'content': response, 'timestamp': datetime.utcnow()}
             ]
             
             self.sessions[session_id]['messages'].extend(message_pair)
             
-            # Store in database
+            # Store in database with proper metadata
             await self.context_manager.store_interaction(
                 session_id=session_id,
                 user_message=message,
-                assistant_response=response
+                assistant_response=response,
+                interaction_type=interaction_type,
+                metadata={
+                    'formatted_for_tts': True,
+                    'role': role,
+                    'tool_results': bool(tool_results),
+                    'memory_used': bool(rag_guidance)
+                }
             )
             logger.info("[CHECKPOINT 6] Interaction stored")
 
@@ -207,32 +221,11 @@ class RinAgent:
             
         return cleaned.strip()
 
-    async def _generate_response(self, message: str, session: Dict[str, Any], session_id: str) -> str:
+    # Response formatting and generation
+    async def _generate_response(self, message: str, session: Dict[str, Any], session_id: str, 
+                               tool_results: Optional[str] = None, rag_guidance: Optional[str] = None,
+                               role: str = "user", interaction_type: str = "local_agent") -> str:
         try:
-            # Determine if tools or GraphRAG should be used
-            use_tools = self._should_use_tool(message)
-            use_graphrag = self._should_use_graphrag(message)
-
-            # Initialize variables
-            tool_results = None
-            rag_guidance = None
-
-            # If tools are needed, get tool results
-            if use_tools:
-                tool_results = await self._get_tool_results(message)
-
-            # If GraphRAG is needed, get RAG guidance
-            if use_graphrag:
-                if self.response_enricher:
-                    try:
-                        rag_guidance = await self.response_enricher.enrich_response(message)
-                        logger.info(f"GraphRAG guidance received: {rag_guidance[:100]}...")
-                    except Exception as e:
-                        logger.warning(f"GraphRAG enrichment failed: {e}")
-                        rag_guidance = "Consider this a fresh conversation."
-                else:
-                    rag_guidance = "Consider this a fresh conversation."
-
             # Get conversation context
             context = await self.context_manager.get_combined_context(session_id, message)
             formatted_context = self._format_conversation_context(context or [])
@@ -287,14 +280,17 @@ RESPONSE GUIDELINES:
             # Clean up any remaining format tokens
             response = response.replace("[/INST]", "").replace("[INST]", "").strip()
 
+            # Format for TTS readability
+            tts_response = self._format_for_tts(response)
+
             logger.info("=== RESPONSE DEBUG ===")
-            logger.info(f"Response length: {len(response)}")
-            logger.info(f"Response preview: {response[:100]}...")
+            logger.info(f"Response length: {len(tts_response)}")
+            logger.info(f"Response preview: {tts_response[:100]}...")
 
             # Store interaction in context manager
             await self.context_manager.store_interaction(session_id, message, response)
 
-            return response
+            return tts_response
 
         except Exception as e:
             logger.error(f"Error generating response: {e}", exc_info=True)
@@ -334,27 +330,6 @@ RESPONSE GUIDELINES:
                 formatted_msgs.append(msg['content'])
             
         return "\n".join(formatted_msgs)
-
-    def _should_use_graphrag(self, message: str) -> bool:
-        """Determine if GraphRAG should be used for this query based on triggers"""
-        message_lower = message.lower()
-        # Check for memory triggers
-        if any(kw in message_lower for kw in self.memory_triggers['keywords']) or \
-           any(phrase in message_lower for phrase in self.memory_triggers['phrases']):
-            logger.info("Memory triggers detected; using GraphRAG.")
-            return True  # Use GraphRAG for memory-related queries
-        return False  # Default to not using GraphRAG
-
-    def _should_use_tool(self, message: str) -> bool:
-        """Determine if a tool should be used based on triggers"""
-        message_lower = message.lower()
-        # Check for tool triggers
-        for tool, patterns in self.tool_triggers.items():
-            if any(kw in message_lower for kw in patterns['keywords']) or \
-               any(phrase in message_lower for phrase in patterns['phrases']):
-                logger.info(f"Tool triggers detected for tool '{tool}'; will use tools.")
-                return True  # Use tools if any triggers are matched
-        return False  # Default to not using tools
 
     async def _get_tool_results(self, message: str) -> Optional[str]:
         """Get results from tools based on message content"""
@@ -426,3 +401,20 @@ RESPONSE GUIDELINES:
             logger.info("Successfully cleaned up all resources")
         except Exception as e:
             logger.error(f"Error during cleanup: {e}")
+
+    def _format_for_tts(self, text: str) -> str:
+        """Format text for better TTS output"""
+        # Remove markdown formatting
+        text = text.replace('*', '').replace('_', '').replace('`', '')
+        
+        # Remove emojis and special characters that might affect TTS
+        text = text.replace('~', '')  # Remove tildes
+        text = text.replace('(', '').replace(')', '')  # Remove parentheses
+        text = text.replace('>', '').replace('<', '')  # Remove angle brackets
+        text = text.replace('[]', '')  # Remove empty brackets
+        text = text.replace('{}', '')  # Remove empty braces
+        
+        # Clean up multiple spaces and newlines
+        text = ' '.join(text.split())
+        
+        return text

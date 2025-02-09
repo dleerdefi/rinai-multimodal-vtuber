@@ -1,6 +1,6 @@
 import logging
 from typing import Dict, Any
-from core.agent.agent import RinAgent
+from src.agents.rin.agent import RinAgent
 from bson import json_util
 import json
 from datetime import datetime

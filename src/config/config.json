@@ -7,7 +7,6 @@
     "keys": [
         {
             "EL_key": "${ELEVEN_LABS_API_KEY}",
-            "RIN_API_KEY": "${RIN_STREAM_API_KEY}",
             "OPENAI_API_KEY": "${OPENAI_API_KEY}",
             "ANTHROPIC_API_KEY": "${ANTHROPIC_API_KEY}",
             "COINGECKO_API_KEY": "${COINGECKO_API_KEY}",
@@ -17,7 +16,7 @@
         }
     ],
     "mongodb": {
-        "db_name": "rin_db",
+        "db_name": "rin_multimodal",
         "uri": "${MONGO_URI}"
     },
     "EL_data": [

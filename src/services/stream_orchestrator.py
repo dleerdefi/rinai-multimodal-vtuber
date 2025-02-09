@@ -10,6 +10,7 @@ from datetime import datetime
 import time
 import os
 from src.services.websocket_server import ChatWebSocketServer
+from src.agents.rin.agent import RinAgent
 
 logger = logging.getLogger(__name__)
 
@@ -20,6 +21,9 @@ class StreamOrchestrator:
             self.config = config
             self.running = True  # Set to True by default
             self.tts_queue = asyncio.Queue()
+            
+            # Add session management
+            self.current_session_id = None
             
             # Initialize voice manager for streaming TTS
             self.voice_manager = VoiceManager(
@@ -52,48 +56,44 @@ class StreamOrchestrator:
 
                 self.speech_manager.set_message_callback(self.handle_host_message)
             
+            # Initialize RinAgent with mongo_uri
+            if 'mongo_uri' not in config:
+                raise ValueError("MongoDB URI not found in config")
+            self.agent = RinAgent(mongo_uri=config['mongo_uri'])
+            
             logger.info("StreamOrchestrator initialization complete")
             
         except Exception as e:
             logger.error(f"Error initializing StreamOrchestrator: {e}")
             raise
 
-    async def handle_chat_message(self, message: str):
-        """Handle incoming chat messages with direct LLM call"""
+    async def handle_chat_message(self, message: str, author: str = "YouTube Chat"):
+        """Handle incoming chat messages from YouTube"""
         try:
-            logger.info(f"Received chat message: {message}")
+            if not self.current_session_id:
+                self.current_session_id = f"session_{int(time.time())}"
+                await self.agent.start_new_session(self.current_session_id)
+                logger.info(f"Created new session: {self.current_session_id}")
             
-            # Broadcast YouTube chat message to WebSocket clients
+            # Always use livestream type for YouTube chat
+            interaction_type = "livestream"
+            
+            # Broadcast user's message to WebSocket clients
             await self.ws_server.broadcast_message({
-                'author': 'YouTube Chat',
+                'author': author,
                 'content': message,
                 'timestamp': datetime.now().isoformat()
             })
             
-            # Format message for LLM
-            formatted_message = [
-                {
-                    "role": "system",
-                    "content": "You are a VTuber livestream host. Keep responses engaging and natural."
-                },
-                {
-                    "role": "user",
-                    "content": message
-                }
-            ]
-            
-            # Get LLM response with streaming
-            response = await self.llm_service._get_novita_response(
-                formatted_message,
-                self.model_type,
-                {
-                    'temperature': 0.88,
-                    'max_tokens': 1200,
-                    'stream': True
-                }
+            # Route through RinAgent
+            response = await self.agent.get_response(
+                session_id=self.current_session_id,
+                message=message,
+                role=author,
+                interaction_type="livestream"
             )
             
-            logger.info(f"Got LLM response: {response}")
+            logger.info(f"Got response from RinAgent: {response}")
             
             # Broadcast Rin's response to WebSocket clients
             if response:
@@ -118,37 +118,30 @@ class StreamOrchestrator:
         try:
             logger.info(f"Received host message from STT: {message}")
             
+            if not self.current_session_id:
+                self.current_session_id = f"session_{int(time.time())}"
+                await self.agent.start_new_session(self.current_session_id)
+                logger.info(f"Created new session: {self.current_session_id}")
+            
+            # Use session type from config
+            interaction_type = "livestream" if self.config.get('session_type') == 'stream' else "local_agent"
+            
             # Broadcast user's message to WebSocket clients
             await self.ws_server.broadcast_message({
-                'author': 'Voice Input',
+                'author': 'Admin',
                 'content': message,
                 'timestamp': datetime.now().isoformat()
             })
             
-            # Format message for LLM with host context
-            formatted_message = [
-                {
-                    "role": "system",
-                    "content": "You are a VTuber livestream host responding to viewer speech. Keep responses natural and engaging, as if in a real conversation."
-                },
-                {
-                    "role": "user",
-                    "content": f"A viewer said: {message}"
-                }
-            ]
-            
-            # Get LLM response with streaming
-            response = await self.llm_service._get_novita_response(
-                formatted_message,
-                self.model_type,
-                {
-                    'temperature': 0.88,
-                    'max_tokens': 1200,
-                    'stream': True
-                }
+            # Route through RinAgent
+            response = await self.agent.get_response(
+                session_id=self.current_session_id,
+                message=message,
+                role="host",
+                interaction_type=interaction_type  # Use config-based type
             )
             
-            logger.info(f"Got LLM response to speech: {response}")
+            logger.info(f"Got response from RinAgent: {response}")
             
             # Broadcast Rin's response to WebSocket clients
             if response:
@@ -174,6 +167,13 @@ class StreamOrchestrator:
             # Initialize WebSocket server
             self.ws_server = ChatWebSocketServer()
             await self.ws_server.start()
+            
+            # Initialize RinAgent and create a session
+            await self.agent.initialize()
+            self.current_session_id = f"session_{int(time.time())}"
+            await self.agent.start_new_session(self.current_session_id)
+            
+            logger.info(f"Created new session: {self.current_session_id}")
             
             logger.info("Starting services...")
             

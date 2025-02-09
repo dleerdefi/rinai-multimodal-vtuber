@@ -143,6 +143,37 @@ class VoiceManager:
             # Wait for audio to finish
             await listen_task
 
+    def _chunk_text(self, text: str, chunk_size: int = 500) -> list[str]:
+        """Split text into manageable chunks at sentence boundaries"""
+        # Clean the text first
+        text = self._clean_text(text)
+        
+        # Split into chunks at sentence boundaries
+        chunks = []
+        sentences = text.split('. ')
+        current_chunk = ''
+        
+        for sentence in sentences:
+            # Add period back if it was removed by split
+            if not sentence.endswith('.'):
+                sentence += '.'
+                
+            # If adding this sentence would exceed chunk size, start new chunk
+            if len(current_chunk) + len(sentence) > chunk_size and current_chunk:
+                chunks.append(current_chunk.strip())
+                current_chunk = sentence
+            else:
+                if current_chunk:
+                    current_chunk += ' ' + sentence
+                else:
+                    current_chunk = sentence
+        
+        # Add the last chunk if there is one
+        if current_chunk:
+            chunks.append(current_chunk.strip())
+            
+        return chunks
+
     async def say(self, text: str):
         """Convert text to speech and stream it"""
         try:
@@ -150,14 +181,19 @@ class VoiceManager:
                 logger.warning("Empty text received, skipping TTS")
                 return
 
-            logger.info(f"Converting to speech: {text[:50]}...")
+            # Split into chunks
+            chunks = self._chunk_text(text)
             
-            # Create text iterator
-            async def text_iterator():
-                yield text
+            # Process each chunk
+            for chunk in chunks:
+                logger.info(f"Converting to speech: {chunk[:50]}...")
+                
+                # Create text iterator for this chunk
+                async def text_iterator():
+                    yield chunk
 
-            # Stream the text to speech
-            await self._stream_tts(text_iterator())
+                # Stream the chunk
+                await self._stream_tts(text_iterator())
             
         except Exception as e:
             logger.error(f"Error in TTS pipeline: {e}")

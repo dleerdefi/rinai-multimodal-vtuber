@@ -10,6 +10,7 @@ import time
 import signal
 import sys
 import os
+from datetime import datetime
 
 # Update the path resolution
 current_dir = os.path.dirname(os.path.abspath(__file__))
@@ -55,6 +56,7 @@ def load_config():
             'voice_id': config['EL_data'][0]['rin_voice'],
             'groq_key': config['keys'][0]['GROQ_API_KEY'],
             'novita_key': config['keys'][0]['NOVITA_API_KEY'],
+            'mongo_uri': config['mongodb']['uri'],
             'enable_speech_input': config.get('enable_speech_input', False),
             'enable_youtube_chat': config.get('enable_youtube_chat', False),
             'youtube_stream_id': config.get('youtube_stream_id')
@@ -127,23 +129,50 @@ def setup_input_sources(config):
     """Setup input sources based on user selection"""
     console.print("\n[bold cyan]Input Source Selection[/]")
     
-    # YouTube Chat Selection
-    config['enable_youtube_chat'] = Confirm.ask(
-        "[cyan]Enable YouTube chat monitoring?[/]"
+    # Session Type Selection
+    session_type = "local"  # Default to local
+    
+    is_stream = Confirm.ask(
+        "[cyan]Is this a streaming session?[/]"
     )
     
-    if config['enable_youtube_chat']:
-        if not config.get('youtube_stream_id'):
-            stream_id = input("\nEnter YouTube Stream ID: ").strip()
-            config['youtube_stream_id'] = stream_id
-            console.print("[green]YouTube chat monitoring will start automatically[/]")
-    
-    # Speech Input Selection
-    config['enable_speech_input'] = Confirm.ask(
-        "[cyan]Enable host speech input?[/]"
-    )
-    
-    if config['enable_speech_input']:
+    if is_stream:
+        session_type = "stream"
+        # YouTube Chat Selection
+        config['enable_youtube_chat'] = Confirm.ask(
+            "[cyan]Enable YouTube chat monitoring?[/]"
+        )
+        
+        if config['enable_youtube_chat']:
+            if not config.get('youtube_stream_id'):
+                stream_id = input("\nEnter YouTube Stream ID: ").strip()
+                config['youtube_stream_id'] = stream_id
+                console.print("[green]YouTube chat monitoring will start automatically[/]")
+        
+        # Speech Input Selection
+        config['enable_speech_input'] = Confirm.ask(
+            "[cyan]Enable host speech input?[/]"
+        )
+        
+        if config['enable_speech_input']:
+            console.print("\n[cyan]Available Audio Input Devices:[/]")
+            devices = sd.query_devices()
+            for i, device in enumerate(devices):
+                if device['max_input_channels'] > 0:
+                    console.print(f"[green]{i}: {device['name']}[/]")
+            
+            device_index = IntPrompt.ask(
+                "\nEnter the number of your microphone device",
+                default=1
+            )
+            config['audio_device_index'] = device_index
+    else:
+        # Local agent mode
+        console.print("[green]Running in local agent mode[/]")
+        config['enable_speech_input'] = True  # Always enable speech for local mode
+        config['enable_youtube_chat'] = False
+        
+        # Setup microphone for local mode
         console.print("\n[cyan]Available Audio Input Devices:[/]")
         devices = sd.query_devices()
         for i, device in enumerate(devices):
@@ -155,6 +184,16 @@ def setup_input_sources(config):
             default=1
         )
         config['audio_device_index'] = device_index
+    
+    # Add session metadata to config
+    config['session_type'] = session_type
+    config['session_metadata'] = {
+        'type': session_type,
+        'youtube_enabled': config.get('enable_youtube_chat', False),
+        'speech_enabled': config.get('enable_speech_input', False),
+        'stream_id': config.get('youtube_stream_id'),
+        'created_at': datetime.utcnow().isoformat()
+    }
     
     return config
 

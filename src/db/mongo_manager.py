@@ -1,44 +1,50 @@
 from motor.motor_asyncio import AsyncIOMotorClient
 from typing import Optional
 import logging
-from .db_schema import RinDB
+import asyncio
 
 logger = logging.getLogger(__name__)
 
 class MongoManager:
     _instance: Optional[AsyncIOMotorClient] = None
-    _db: Optional[RinDB] = None
+    _db = None
 
     @classmethod
-    async def initialize(cls, mongo_uri: str, db_name: str = 'rin_dev_db'):
-        """Initialize MongoDB connection"""
-        try:
-            if cls._instance is None:
-                logger.info(f"Initializing MongoDB connection to database: {db_name}")
+    async def initialize(cls, mongo_uri: str, max_retries: int = 3):
+        """Initialize MongoDB connection with retries"""
+        if cls._instance is not None:
+            return cls._instance
+
+        retry_count = 0
+        while retry_count < max_retries:
+            try:
+                logger.info(f"Initializing MongoDB connection (attempt {retry_count + 1})")
                 cls._instance = AsyncIOMotorClient(mongo_uri)
+                
+                # Test connection
+                await cls._instance.admin.command('ping')
+                
+                # Import here to avoid circular import
+                from src.db.db_schema import RinDB
+                
                 # Initialize RinDB with the client
                 cls._db = RinDB(cls._instance)
-                # Initialize database and collections
                 await cls._db.initialize()
-                logger.info("MongoDB connection and collections verified successfully")
-            return cls._instance
-        except Exception as e:
-            logger.error(f"Failed to initialize MongoDB: {e}")
-            raise
+                
+                logger.info("MongoDB connection and collections verified")
+                return cls._instance
+                
+            except Exception as e:
+                retry_count += 1
+                if retry_count >= max_retries:
+                    logger.error(f"Failed to initialize MongoDB after {max_retries} attempts: {e}")
+                    raise
+                logger.warning(f"MongoDB connection attempt {retry_count} failed: {e}. Retrying...")
+                await asyncio.sleep(1)
 
     @classmethod
-    async def is_connected(cls) -> bool:
-        """Check if MongoDB is connected"""
-        try:
-            if cls._db:
-                return await cls._db.is_initialized()
-            return False
-        except Exception:
-            return False
-
-    @classmethod
-    def get_db(cls) -> RinDB:
-        """Get RinDB instance"""
+    def get_db(cls):
+        """Get database instance"""
         if cls._db is None:
             raise RuntimeError("MongoDB not initialized. Call initialize() first")
         return cls._db
