@@ -69,7 +69,7 @@ This project uses a custom fork of the [ElizaOS Twitter Client](https://github.c
 4. **Installation:**
    ```bash
    # Clone main repository
-   git clone [Your Main RinAI Multimodal Vtuber Repo URL] rinai-multimodal-vtuber
+   git clone [https://github.com/dleerdefi/rinai-multimodal-vtuber] rinai-multimodal-vtuber
    cd rinai-multimodal-vtuber
 
    # Setup Python environment
