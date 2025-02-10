@@ -88,3 +88,8 @@ class TweetContent(BaseModel):
 class TweetGenerationResponse(BaseModel):
     """Model for LLM tweet generation response"""
     tweets: List[TweetContent] = Field(description="List of generated tweets")
+
+# TODO: Add weather tool parameters
+# class WeatherToolParameters(BaseModel):
+#     """Parameters for the weather tool function call."""
+#     location: str = Field(..., description="City or place name. E.g., 'Berlin' or 'New York'.")

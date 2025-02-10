@@ -30,7 +30,7 @@ load_dotenv()
 logger = logging.getLogger(__name__)
 
 class Orchestrator:
-    """Core tool orchestrator powered by Groq"""
+    """Core tool orchestrator"""
     
     def __init__(self, deps: Optional[AgentDependencies] = None):
         """Initialize orchestrator with optional dependencies"""
@@ -87,13 +87,13 @@ class Orchestrator:
             if deps:
                 self.deps = deps
             
-            # First check if this is a new Twitter command
             trigger_detector = TriggerDetector()
-            if trigger_detector.should_use_twitter(command):
-                # Regular command processing for Twitter
+            
+            # First check if this is a direct tool request (crypto/perplexity)
+            tool_type = trigger_detector.get_specific_tool_type(command)
+            if tool_type in ["crypto_data", "perplexity_search"]:
+                logger.info(f"Processing direct tool request: {tool_type}")
                 analysis = await self._analyze_command(command)
-                logger.info(f"Command analysis result: {analysis}")
-
                 if analysis and analysis.tools_needed:
                     results = await self._execute_tools(analysis.tools_needed)
                     return AgentResult(
@@ -101,39 +101,53 @@ class Orchestrator:
                         data=results
                     )
             
-            # If not a new Twitter command, check if we're in an approval flow
-            elif self.deps and self.deps.conversation_id:
+            # For Twitter operations, check the operation type first
+            operation_type = trigger_detector.get_tool_operation_type(command)
+            
+            # If we have an active operation state, prioritize approval flow
+            if self.deps and self.deps.conversation_id:
                 operation_state = await self.tool_state_manager.get_operation_state(self.deps.conversation_id)
-                if operation_state and operation_state.get("state") == ToolOperationState.COLLECTING.value:
-                    # Handle approval response
-                    approval_result = await self._process_tweet_approval_response(
-                        message=command,
-                        session_id=self.deps.conversation_id
-                    )
+                
+                if operation_state and operation_state.get("state") == "collecting":
+                    # Only process as approval if it's NOT a new tweet request
+                    if operation_type != "schedule_tweets":
+                        logger.info("Processing as approval response")
+                        approval_result = await self._process_tweet_approval_response(
+                            message=command,
+                            session_id=self.deps.conversation_id
+                        )
+                        return AgentResult(
+                            response=approval_result.get("response", ""),
+                            data={
+                                "status": approval_result.get("status"),
+                                "requires_tts": approval_result.get("requires_tts", True),
+                                "tweet_data": approval_result.get("data", {})
+                            }
+                        )
+            
+            # Handle new Twitter commands
+            if operation_type == "schedule_tweets":
+                logger.info("Processing new tweet scheduling request")
+                analysis = await self._analyze_command(command)
+                if analysis and analysis.tools_needed:
+                    results = await self._execute_tools(analysis.tools_needed)
                     return AgentResult(
-                        response=approval_result.get("response"),
-                        data=approval_result
+                        response=self._format_response(results),
+                        data=results
                     )
             
-            # Regular command processing for non-Twitter commands
-            analysis = await self._analyze_command(command)
-            logger.info(f"Command analysis result: {analysis}")
-
-            if analysis and analysis.tools_needed:
-                results = await self._execute_tools(analysis.tools_needed)
-                return AgentResult(
-                    response=self._format_response(results),
-                    data=results
-                )
-            
+            # If no tool matches
             return AgentResult(
-                response="I processed your request but didn't get a clear response. Could you try rephrasing?",
-                data={}
+                response="I'm not sure how to handle that command.",
+                data={"status": "error"}
             )
-
+            
         except Exception as e:
             logger.error(f"Error in process_command: {e}", exc_info=True)
-            raise
+            return AgentResult(
+                response="I encountered an error processing your command.",
+                data={"error": str(e)}
+            )
         
     async def _analyze_command(self, command: str) -> Optional[CommandAnalysis]:
         """Analyze command to determine required tools"""
@@ -964,7 +978,8 @@ Requirements:
             )
             logger.info(f"Analysis result: {analysis}")
 
-            if analysis["action"] == "full_approval":
+            # Access Pydantic model attributes with dot notation
+            if analysis.action == "full_approval":
                 # Update all pending tweets to approved
                 for tweet in pending_tweets:
                     await db.update_tweet_status(
@@ -987,11 +1002,11 @@ Requirements:
                 if schedule_activated:
                     return {
                         "status": "completed",
-                        "response": analysis["feedback"],
+                        "response": analysis.feedback,
                         "requires_tts": True
                     }
 
-            elif analysis["action"] in ["partial_approval", "partial_regenerate"]:
+            elif analysis.action in ["partial_approval", "partial_regenerate"]:
                 # Update operation state to track partial approval
                 await self.tool_state_manager.update_operation(
                     session_id=session_id,
@@ -999,14 +1014,14 @@ Requirements:
                     step="partial_approval_in_progress",
                     data={
                         "schedule_id": str(schedule["_id"]),
-                        "approved_indices": analysis["approved_indices"],
-                        "pending_indices": analysis.get("regenerate_indices", []),
+                        "approved_indices": analysis.approved_indices,
+                        "pending_indices": analysis.regenerate_indices,
                         "total_needed": schedule["total_tweets_requested"]
                     }
                 )
 
                 # Process approved tweets first
-                for idx in analysis["approved_indices"]:
+                for idx in analysis.approved_indices:
                     if 0 <= idx - 1 < len(pending_tweets):
                         await db.update_tweet_status(
                             tweet_id=str(pending_tweets[idx - 1]["_id"]),
@@ -1014,10 +1029,10 @@ Requirements:
                         )
                 
                 # Mark and regenerate rejected tweets immediately
-                rejected_count = len(analysis.get("regenerate_indices", []))
+                rejected_count = len(analysis.regenerate_indices)
                 if rejected_count > 0:
                     # Mark tweets as rejected
-                    for idx in analysis["regenerate_indices"]:
+                    for idx in analysis.regenerate_indices:
                         if 0 <= idx - 1 < len(pending_tweets):
                             await db.update_tweet_status(
                                 tweet_id=str(pending_tweets[idx - 1]["_id"]),
@@ -1044,7 +1059,7 @@ Requirements:
                     
                     return {
                         "status": "partial_regenerated",
-                        "response": f"{analysis['feedback']}\nI've kept the approved tweets and generated new ones to replace the others. Here are the new tweets:\n{self._format_tweets_for_presentation(new_tweets)}",
+                        "response": f"{analysis.feedback}\nI've kept the approved tweets and generated new ones to replace the others. Here are the new tweets:\n{self._format_tweets_for_presentation(new_tweets)}",
                         "requires_tts": True,
                         "data": {
                             "new_tweets": new_tweets,
@@ -1053,7 +1068,7 @@ Requirements:
                         }
                     }
 
-            elif analysis["action"] == "regenerate_all":
+            elif analysis.action == "regenerate_all":
                 logger.info("Regenerating all tweets")
                 # Mark existing tweets as rejected
                 for tweet in pending_tweets:
@@ -1101,13 +1116,13 @@ Requirements:
             if remaining > 0:
                 return {
                     "status": "in_progress",
-                    "response": f"{analysis['feedback']}\nWe still need {remaining} more tweets. Would you like me to generate them now?",
+                    "response": f"{analysis.feedback}\nWe still need {remaining} more tweets. Would you like me to generate them now?",
                     "requires_tts": True
                 }
 
             return {
                 "status": "awaiting_input",
-                "response": f"{analysis['feedback']}\nWhat would you like me to do with these tweets?",
+                "response": f"{analysis.feedback}\nWhat would you like me to do with these tweets?",
                 "requires_tts": True
             }
 
