@@ -134,7 +134,7 @@ class LLMService:
                     "presence_penalty": 0.3,
                     "frequency_penalty": 0.3,
                     "repetition_penalty": 1.1,
-                    "max_tokens": 800,
+                    "max_tokens": 300,
                     "stream": False,
                     "response_format": {"type": "text"}
                 }
@@ -323,7 +323,7 @@ class LLMService:
             # Create minimal config
             api_config = {
                 'temperature': 0.88,
-                'max_tokens': 1200,
+                'max_tokens': 300,
                 'stream': True
             }
             
@@ -451,7 +451,7 @@ class LLMService:
             # Create minimal config
             api_config = {
                 'temperature': config.get('temperature', 0.88),
-                'max_tokens': config.get('max_tokens', 1200),
+                'max_tokens': config.get('max_tokens', 300),
                 'stream': False
             }
             

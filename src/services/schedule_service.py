@@ -31,8 +31,9 @@ class ScheduleService:
         """Main scheduling loop that checks for and executes due tweets"""
         while self.running:
             try:
-                # Get tweets ready for execution using RinDB method
+                # Skip cancelled schedules
                 due_tweets = await self.db.get_scheduled_tweets_for_execution()
+                due_tweets = [t for t in due_tweets if t.get('schedule_status') != 'cancelled']
                 
                 for tweet in due_tweets:
                     try:

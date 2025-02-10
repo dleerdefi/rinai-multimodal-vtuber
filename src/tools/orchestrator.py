@@ -7,7 +7,15 @@ from dotenv import load_dotenv
 from datetime import datetime, UTC, timedelta
 import json
 from pydantic import ValidationError
-from src.tools.base import AgentResult, AgentDependencies
+from src.tools.base import (
+    AgentResult, 
+    AgentDependencies, 
+    TweetApprovalAnalysis,
+    ToolCommand,
+    TweetContent,
+    TweetGenerationResponse,
+    CommandAnalysis
+)
 from src.services.llm_service import LLMService, ModelType
 from src.clients.perplexity_client import PerplexityClient
 from src.clients.coingecko_client import CoinGeckoClient
@@ -20,23 +28,6 @@ from src.utils.trigger_detector import TriggerDetector
 
 load_dotenv()
 logger = logging.getLogger(__name__)
-
-class ToolCommand(BaseModel):
-    """Structure for tool commands"""
-    tool_name: str = Field(description="Name of tool to execute")
-    action: str = Field(description="Action to perform")
-    parameters: Dict = Field(default={}, description="Tool parameters")
-    priority: int = Field(
-        default=1,
-        ge=1,
-        le=5,
-        description="Execution priority (1-5)"
-    )
-
-class CommandAnalysis(BaseModel):
-    """AI model for analyzing commands"""
-    tools_needed: List[ToolCommand] = Field(description="Tools required for this command")
-    reasoning: str = Field(description="Explanation of tool selection")
 
 class Orchestrator:
     """Core tool orchestrator powered by Groq"""
@@ -144,7 +135,7 @@ class Orchestrator:
             logger.error(f"Error in process_command: {e}", exc_info=True)
             raise
         
-    async def _analyze_command(self, command: str) -> CommandAnalysis:
+    async def _analyze_command(self, command: str) -> Optional[CommandAnalysis]:
         """Analyze command to determine required tools"""
         try:
             # Check if this is a Twitter command using TriggerDetector
@@ -217,7 +208,6 @@ For current events:
                 }
             ]
 
-            # Get LLM response
             response = await self.llm_service.get_response(
                 prompt=messages,
                 model_type=ModelType.GROQ_LLAMA_3_3_70B,
@@ -228,15 +218,9 @@ For current events:
             )
             
             try:
-                # Extract JSON if response contains extra text
-                response = response.strip()
-                start_idx = response.find('{')
-                end_idx = response.rfind('}') + 1
-                if start_idx != -1 and end_idx != 0:
-                    json_str = response[start_idx:end_idx]
-                    logger.debug(f"Extracted JSON string: {json_str}")
-                    data = json.loads(json_str)
-                    return CommandAnalysis(**data)
+                data = parse_strict_json(response, CommandAnalysis)
+                if data:
+                    return data
                 else:
                     logger.debug("No tools needed - returning empty analysis")
                     return CommandAnalysis(
@@ -247,7 +231,6 @@ For current events:
             except (json.JSONDecodeError, ValidationError) as e:
                 logger.error(f"Failed to parse LLM response: {response}")
                 logger.error(f"Parse error: {str(e)}")
-                # Default to no tools
                 return CommandAnalysis(
                     tools_needed=[],
                     reasoning="Failed to parse response, defaulting to no tools"
@@ -255,7 +238,10 @@ For current events:
             
         except Exception as e:
             logger.error(f"Error analyzing command: {e}", exc_info=True)
-            raise
+            return CommandAnalysis(
+                tools_needed=[],
+                reasoning="Error during analysis, defaulting to no tools"
+            )
             
     async def _execute_tools(self, tools: List[ToolCommand]) -> Dict:
         """Execute tools in parallel based on priority"""
@@ -299,20 +285,22 @@ For current events:
                             tweets = await self._generate_tweet_series(
                                 topic=tool.parameters.get("topic"),
                                 count=tool.parameters.get("tweet_count", 1),
-                                tone=tool.parameters.get("tone", "professional")
+                                tone=tool.parameters.get("tone", "professional"),
+                                original_request=tool.parameters.get("original_request"),
+                                session_id=session_id
                             )
                             
                             # Handle approval flow
                             if session_id:
                                 approval_result = await self._handle_tweet_approval_flow(
-                                    tweets=tweets,
+                                    tweets=tweets["tweets"],
                                     session_id=session_id
                                 )
                                 results["twitter"] = approval_result
                             else:
                                 results["twitter"] = {
                                     "status": "pending_approval",
-                                    "content": tweets,
+                                    "content": tweets["tweets"],
                                     "schedule": tool.parameters,
                                     "timestamp": datetime.utcnow().isoformat()
                                 }
@@ -654,7 +642,7 @@ Example response format:
                 model_type=ModelType.GROQ_LLAMA_3_3_70B,
                 override_config={
                     "temperature": 0.1,
-                    "max_tokens": 500
+                    "max_tokens": 200
                 }
             )
 
@@ -683,132 +671,108 @@ Example response format:
                 await self.tool_state_manager.end_operation(session_id, success=False)
             raise
 
-    async def _generate_tweet_series(self, topic: str, count: int = 1, tone: str = "professional") -> List[Dict]:
+    async def _generate_tweet_series(self, topic: str, count: int = 1, tone: str = "professional", 
+                                   original_request: str = None, session_id: str = None) -> Dict:
         """Generate one or more tweets about a topic"""
         try:
-            # Adjust prompt based on count
-            if count == 1:
-                prompt = [
+            # Use session_id from deps if not provided
+            current_session_id = session_id or (self.deps.conversation_id if self.deps else None)
+            if not current_session_id:
+                raise ValueError("No session_id available")
+
+            # Create schedule first with proper positional arguments
+            schedule_id = await self.db.create_tweet_schedule(
+                session_id=current_session_id,
+                topic=topic,
+                total_tweets=count,
+                schedule_info={
+                    "topic": topic,
+                    "total_tweets": count,
+                    "status": "pending",
+                    "created_at": datetime.now(UTC),
+                    "updated_at": datetime.now(UTC),
+                    "start_time": datetime.now(UTC),
+                    "interval_minutes": 60,
+                    "schedule_type": "one_time",
+                    "metadata": {
+                        "tone": tone,
+                        "original_request": original_request
+                    }
+                }
+            )
+
+            # Generate tweets using existing logic
+            response = await self.llm_service.get_response(
+                prompt=[
                     {
                         "role": "system",
                         "content": "You are Rin, an AI VTuber who creates engaging tweets. Return ONLY valid JSON."
                     },
                     {
                         "role": "user",
-                        "content": f"""Generate a single engaging tweet about {topic}.
+                        "content": f"""Generate {'a single' if count == 1 else str(count)} engaging tweet{'s' if count > 1 else ''} about {topic}.
                         
 Requirements:
-- Must be under 280 characters
+- {'Each tweet must be' if count > 1 else 'Must be'} under 280 characters
 - Maintain a {tone} tone
 - Be engaging and natural
 - Return as JSON: {{"tweets": [{{"content": "tweet text"}}]}}"""
                     }
-                ]
-            else:
-                prompt = [
-                    {
-                        "role": "system",
-                        "content": "You are Rin, an AI VTuber who creates engaging tweets. Return ONLY valid JSON."
-                    },
-                    {
-                        "role": "user",
-                        "content": f"""Generate {count} unique tweets about {topic}.
-                        
-Requirements:
-- Each tweet must be under 280 characters
-- Maintain a {tone} tone
-- Make each tweet unique and engaging
-- Space content appropriately across the series
-- Return as JSON: {{"tweets": [{{"content": "tweet 1"}}, {{"content": "tweet 2"}}, ...]}}"""
-                    }
-                ]
-
-            response = await self.llm_service.get_response(
-                prompt=prompt,
+                ],
                 model_type=ModelType.GPT4o,
                 override_config={
                     "temperature": 0.7,
-                    "max_tokens": 1000,
+                    "max_tokens": 500,
                     "response_format": {"type": "json_object"}
                 }
             )
 
-            try:
-                # Clean the response - remove markdown code block if present
-                cleaned_response = response
-                if "```json" in response:
-                    cleaned_response = response.split("```json")[1].split("```")[0].strip()
-                elif "```" in response:
-                    cleaned_response = response.split("```")[1].strip()
-                
-                data = json.loads(cleaned_response)
-                tweets = data.get("tweets", [])
-                
-                # Clean and validate tweets
-                validated_tweets = []
-                for tweet in tweets:
-                    if len(tweet["content"]) <= 280:
-                        tweet_data = {
-                            "content": tweet["content"],
-                            "metadata": {
-                                "estimated_engagement": "medium",
-                                "generated_at": datetime.utcnow().isoformat()
-                            }
+            # Parse and validate tweets using parse_strict_json
+            tweet_data = parse_strict_json(response, TweetGenerationResponse)
+            if not tweet_data:
+                logger.error("Failed to parse tweet generation response")
+                raise ValueError("Failed to generate valid tweets")
+
+            validated_tweets = []
+            for tweet in tweet_data.tweets:
+                if len(tweet.content) <= 280:
+                    tweet_data = {
+                        "content": tweet.content,
+                        "metadata": {
+                            "estimated_engagement": "medium",
+                            "generated_at": datetime.utcnow().isoformat()
                         }
-                        validated_tweets.append(tweet_data)
-                
-                if not validated_tweets:
-                    logger.error("No valid tweets generated")
-                    raise ValueError("Failed to generate valid tweets")
-
-                # Store the tweets in MongoDB
-                db = MongoManager.get_db()
-                
-                # First create the schedule with proper schedule_info
-                schedule_id = await db.create_tweet_schedule(
-                    session_id=self.deps.conversation_id,
-                    topic=topic,
-                    total_tweets=count,
-                    schedule_info={
-                        "session_id": self.deps.conversation_id,
-                        "topic": topic,
-                        "total_tweets": count,
-                        "status": "pending",
-                        "created_at": datetime.now(UTC),
-                        "updated_at": datetime.now(UTC),
-                        "start_time": datetime.now(UTC),  # Add default start_time
-                        "interval_minutes": 60,  # Default to hourly posts
-                        "schedule_type": "one_time"
                     }
-                )
-                logger.info(f"Created schedule with ID: {schedule_id}")
-                
-                # Then store the tweets with the schedule_id
-                stored_tweet_ids = []
-                for tweet in validated_tweets:
-                    tweet_id = await db.create_tweet(
-                        content=tweet["content"],
-                        schedule_id=schedule_id,
-                        session_id=self.deps.conversation_id
-                    )
-                    stored_tweet_ids.append(tweet_id)
-                    logger.info(f"Stored tweet with ID: {tweet_id}")
-                
-                # Update schedule with pending tweet IDs
-                await db.update_tweet_schedule(
-                    schedule_id=schedule_id,
-                    pending_tweet_ids=stored_tweet_ids,
-                    status="collecting_approval"
-                )
-                
-                return validated_tweets
+                    validated_tweets.append(tweet_data)
 
-            except json.JSONDecodeError:
-                logger.error(f"Failed to parse generated tweets response: {response}")
-                raise
+            if not validated_tweets:
+                raise ValueError("No valid tweets generated")
+
+            # Store tweets with schedule reference
+            stored_tweet_ids = []
+            for tweet in validated_tweets:
+                tweet_id = await self.db.create_tweet(
+                    content=tweet["content"],
+                    schedule_id=schedule_id,
+                    session_id=current_session_id
+                )
+                stored_tweet_ids.append(tweet_id)
+
+            # Update schedule with pending tweet IDs
+            await self.db.update_tweet_schedule(
+                schedule_id=schedule_id,
+                pending_tweet_ids=stored_tweet_ids,
+                status="collecting_approval"
+            )
+
+            return {
+                "schedule_id": schedule_id,
+                "tweets": validated_tweets,
+                "stored_tweet_ids": stored_tweet_ids
+            }
 
         except Exception as e:
-            logger.error(f"Error generating tweets: {e}")
+            logger.error(f"Error generating tweet series: {e}")
             raise
 
     async def _store_approved_tweets(self, tweets: List[Dict], schedule_info: Dict) -> str:
@@ -948,6 +912,35 @@ Requirements:
             logger.info(f"Processing approval for session {session_id}")
             db = MongoManager.get_db()
             
+            # Get operation state first
+            operation_state = await self.tool_state_manager.get_operation_state(session_id)
+            logger.debug(f"Current operation state: {operation_state}")
+            
+            # More lenient state validation - accept any collecting state
+            if not operation_state or operation_state.get('state') != 'collecting':
+                logger.warning(f"Invalid state for tweet approval: {operation_state}")
+                return {
+                    "status": "error",
+                    "response": "I've lost track of our tweet approval process. Would you like to start over?",
+                    "requires_tts": True
+                }
+
+            # Check for exit commands first
+            exit_keywords = ["stop", "cancel", "exit", "quit", "end", "terminate"]
+            if any(keyword in message.lower() for keyword in exit_keywords):
+                logger.info(f"Exit command detected: {message}")
+                await self.tool_state_manager.end_operation(
+                    session_id=session_id,
+                    success=False,
+                    reason="User requested to stop"
+                )
+                return {
+                    "status": "exited",
+                    "response": "I've stopped the tweet process. Let me know if you need anything else!",
+                    "requires_tts": True,
+                    "exit_to_main": True
+                }
+
             # Get active schedule and pending tweets
             schedule = await db.get_session_tweet_schedule(session_id)
             if not schedule:
@@ -958,25 +951,25 @@ Requirements:
                     "requires_tts": True
                 }
 
-            # Get ONLY the most recent pending tweets for this session
+            # Get ONLY the most recent pending tweets
             pending_tweets = await db.get_tweets_by_schedule(str(schedule["_id"]))
             pending_tweets = [t for t in pending_tweets if t["status"] == TweetStatus.PENDING.value]
             logger.info(f"Found {len(pending_tweets)} pending tweets")
 
             # Analyze user response with LLM
             analysis = await self._analyze_tweets_and_response(
-                tweets=[{"content": t["content"]} for t in pending_tweets],
+                tweets=pending_tweets,
                 user_response=message,
                 metadata={"topic": schedule.get("topic", "general")}
             )
             logger.info(f"Analysis result: {analysis}")
 
             if analysis["action"] == "full_approval":
-                # Update all pending tweets to approved - use .value for enum
+                # Update all pending tweets to approved
                 for tweet in pending_tweets:
                     await db.update_tweet_status(
                         tweet_id=str(tweet["_id"]),
-                        status=TweetStatus.APPROVED.value  # Use .value here
+                        status=TweetStatus.APPROVED.value
                     )
                 
                 # Update schedule status
@@ -999,7 +992,20 @@ Requirements:
                     }
 
             elif analysis["action"] in ["partial_approval", "partial_regenerate"]:
-                # Process approved tweets
+                # Update operation state to track partial approval
+                await self.tool_state_manager.update_operation(
+                    session_id=session_id,
+                    state=ToolOperationState.COLLECTING,
+                    step="partial_approval_in_progress",
+                    data={
+                        "schedule_id": str(schedule["_id"]),
+                        "approved_indices": analysis["approved_indices"],
+                        "pending_indices": analysis.get("regenerate_indices", []),
+                        "total_needed": schedule["total_tweets_requested"]
+                    }
+                )
+
+                # Process approved tweets first
                 for idx in analysis["approved_indices"]:
                     if 0 <= idx - 1 < len(pending_tweets):
                         await db.update_tweet_status(
@@ -1007,27 +1013,84 @@ Requirements:
                             status=TweetStatus.APPROVED.value
                         )
                 
-                # Handle regeneration if needed
-                if analysis.get("regenerate_indices"):
+                # Mark and regenerate rejected tweets immediately
+                rejected_count = len(analysis.get("regenerate_indices", []))
+                if rejected_count > 0:
+                    # Mark tweets as rejected
+                    for idx in analysis["regenerate_indices"]:
+                        if 0 <= idx - 1 < len(pending_tweets):
+                            await db.update_tweet_status(
+                                tweet_id=str(pending_tweets[idx - 1]["_id"]),
+                                status=TweetStatus.REJECTED.value
+                            )
+                    
+                    # Generate new tweets immediately
+                    new_tweets = await self._generate_tweet_series(
+                        topic=schedule["topic"],
+                        count=rejected_count,
+                        original_request=schedule.get("metadata", {}).get("original_request")
+                    )
+                    
+                    # Store new tweets
+                    stored_tweet_ids = []
+                    for tweet in new_tweets:
+                        tweet_id = await db.create_tweet(
+                            content=tweet["content"],
+                            schedule_id=str(schedule["_id"]),
+                            session_id=session_id,
+                            status=TweetStatus.PENDING.value
+                        )
+                        stored_tweet_ids.append(tweet_id)
+                    
                     return {
-                        "status": "regenerate_partial",
-                        "response": f"{analysis['feedback']}\nI'll generate new versions of the tweets you want to improve.",
+                        "status": "partial_regenerated",
+                        "response": f"{analysis['feedback']}\nI've kept the approved tweets and generated new ones to replace the others. Here are the new tweets:\n{self._format_tweets_for_presentation(new_tweets)}",
                         "requires_tts": True,
-                        "regenerate_count": len(analysis["regenerate_indices"])
+                        "data": {
+                            "new_tweets": new_tweets,
+                            "stored_tweet_ids": stored_tweet_ids,
+                            "regenerate_count": rejected_count
+                        }
                     }
-                
+
             elif analysis["action"] == "regenerate_all":
-                # Mark all pending tweets as rejected - use .value for enum
+                logger.info("Regenerating all tweets")
+                # Mark existing tweets as rejected
                 for tweet in pending_tweets:
                     await db.update_tweet_status(
                         tweet_id=str(tweet["_id"]),
-                        status=TweetStatus.REJECTED.value  # Use .value here
+                        status=TweetStatus.REJECTED.value
                     )
                 
+                # Generate new tweets with original request context
+                new_tweets = await self._generate_tweet_series(
+                    topic=schedule["topic"],
+                    count=schedule["total_tweets_requested"],
+                    original_request=schedule.get("metadata", {}).get("original_request")
+                )
+                
+                # Store new tweets
+                stored_tweet_ids = []
+                for tweet in new_tweets:
+                    tweet_id = await db.create_tweet(
+                        content=tweet["content"],
+                        schedule_id=str(schedule["_id"]),
+                        session_id=session_id
+                    )
+                    stored_tweet_ids.append(tweet_id)
+                
+                # Update schedule
+                await db.update_tweet_schedule(
+                    schedule_id=str(schedule["_id"]),
+                    pending_tweet_ids=stored_tweet_ids,
+                    status="collecting_approval"
+                )
+                
                 return {
-                    "status": "regenerate_all",
-                    "response": f"{analysis['feedback']}\nI'll generate a completely new set of tweets.",
-                    "requires_tts": True
+                    "status": "regenerated",
+                    "response": f"I've generated new tweets for you. Here they are:\n{self._format_tweets_for_presentation(new_tweets)}",
+                    "requires_tts": True,
+                    "data": {"tweets": new_tweets}
                 }
 
             # Check remaining tweets needed
@@ -1049,10 +1112,22 @@ Requirements:
             }
 
         except Exception as e:
-            logger.error(f"Error processing approval: {e}")
+            logger.error(f"Error processing approval: {e}", exc_info=True)
+            # Try to recover state if possible
+            try:
+                current_state = await self.tool_state_manager.get_operation_state(session_id)
+                if current_state and current_state.get("state") == ToolOperationState.COLLECTING:
+                    return {
+                        "status": "retry",
+                        "response": "I had trouble processing that. Could you try telling me which tweets to approve again?",
+                        "requires_tts": True
+                    }
+            except Exception as state_error:
+                logger.error(f"Error recovering state: {state_error}")
+            
             return {
                 "status": "error",
-                "response": "I had trouble processing your response. Could you try again?",
+                "response": "I had trouble processing your response. Would you like to try again or stop?",
                 "requires_tts": True
             }
 
@@ -1072,7 +1147,7 @@ Requirements:
                 start_time = datetime.fromisoformat(start_time.replace('Z', '+00:00'))
                 logger.info(f"Parsed start_time from string: {start_time}")
             
-            interval_minutes = schedule_info.get("interval_minutes", 60)
+            interval_minutes = schedule_info.get("interval_minutes", 2)
             interval = timedelta(minutes=interval_minutes)
             
             logger.info(f"Scheduling {len(approved_tweets)} tweets starting at {start_time} with {interval_minutes} minute intervals")
@@ -1115,24 +1190,14 @@ Requirements:
         try:
             presentation = self._format_tweets_for_presentation(tweets)
             
-            # Create example indices based on actual tweet count
-            all_indices = list(range(1, len(tweets) + 1))
-            example_indices = {
-                "full": all_indices,
-                "partial": all_indices[:len(tweets)//2],  # Example of partial approval
-                "regenerate": all_indices[len(tweets)//2:]  # Example of partial regeneration
-            }
-            
-            if user_response:
-                # Analyzing user's response to previous tweets
-                prompt = [
-                    {
-                        "role": "system",
-                        "content": "You are Rin, an AI VTuber who helps create and schedule tweets. Analyze user responses and return structured JSON."
-                    },
-                    {
-                        "role": "user",
-                        "content": f"""Context: Previous tweets presented:
+            prompt = [
+                {
+                    "role": "system",
+                    "content": "Analyze user instructions on how to proceed with the proposed draft tweet(s) and return structured JSON."
+                },
+                {
+                    "role": "user",
+                    "content": f"""Context: Previous tweets presented:
 {presentation}
 
 User response: "{user_response}"
@@ -1144,83 +1209,51 @@ There are {len(tweets)} tweets to analyze. Return ONLY valid JSON in this exact 
     "regenerate_indices": [list of tweet numbers to regenerate from 1 to {len(tweets)}],
     "feedback": "explanation in Rin's voice"
 }}"""
-                    }
-                ]
-            else:
-                # Initial tweet quality analysis
-                prompt = [
-                    {
-                        "role": "system",
-                        "content": "You are Rin, an AI VTuber who helps create and schedule tweets. Analyze tweet quality and return structured JSON."
-                    },
-                    {
-                        "role": "user",
-                        "content": f"""Analyze these tweets for a {metadata.get('topic', 'general')} thread:
-{presentation}
-
-Return ONLY valid JSON in this exact format:
-{{
-    "quality_check": "pass" | "needs_improvement",
-    "feedback": "detailed feedback in Rin's voice",
-    "suggestions": ["specific improvement points"]
-}}"""
-                    }
-                ]
+                }
+            ]
 
             response = await self.llm_service.get_response(
                 prompt=prompt,
                 model_type=ModelType.GPT4o,
                 override_config={
-                    "temperature": 0.2,
-                    "max_tokens": 500,
+                    "temperature": 0.1,
+                    "max_tokens": 200,
                     "response_format": {"type": "json_object"}
                 }
             )
 
-            # Add debug logging
-            logger.debug(f"Raw LLM response: {response}")
-
-            try:
-                # Clean the response - remove markdown code block if present
-                cleaned_response = response.strip()
-                if "```json" in cleaned_response:
-                    cleaned_response = cleaned_response.split("```json")[1].split("```")[0].strip()
-                elif "```" in cleaned_response:
-                    cleaned_response = cleaned_response.split("```")[1].strip()
-                
-                logger.debug(f"Cleaned response: {cleaned_response}")
-                
-                # Extract JSON if response contains extra text
-                start_idx = cleaned_response.find('{')
-                end_idx = cleaned_response.rfind('}') + 1
-                if start_idx != -1 and end_idx != 0:
-                    json_str = cleaned_response[start_idx:end_idx]
-                    logger.debug(f"Extracted JSON string: {json_str}")
-                    return json.loads(json_str)
-                else:
-                    raise ValueError("No JSON found in response")
-
-            except (json.JSONDecodeError, ValueError) as e:
-                logger.error(f"Failed to parse response: {response}")
-                logger.error(f"Parse error: {str(e)}")
-                # Fallback based on simple keyword matching
-                if any(word in user_response.lower() for word in ["yes", "approve", "good", "proceed"]):
-                    return {
-                        "action": "full_approval",
-                        "approved_indices": list(range(1, len(tweets) + 1)),
-                        "regenerate_indices": [],
-                        "feedback": "Great! I'll proceed with scheduling these tweets."
-                    }
-                return {
-                    "action": "regenerate_all",
-                    "approved_indices": [],
-                    "regenerate_indices": list(range(1, len(tweets) + 1)),
-                    "feedback": "I'll generate new tweets for you."
-                }
+            # Use the new parse_approval_response method
+            return await self._parse_approval_response(response)
 
         except Exception as e:
             logger.error(f"Error in tweet response analysis: {e}")
             raise
+
+    async def _parse_approval_response(self, response: str) -> Dict:
+        """Parse the approval response from the LLM"""
+        try:
+            # Use existing parse_strict_json from json_parser
+            data = parse_strict_json(response, TweetApprovalAnalysis)
+            
+            if not data:
+                logger.warning("Failed to parse approval response, using default regenerate")
+                return {
+                    'action': 'regenerate_all',
+                    'approved_indices': [],
+                    'regenerate_indices': [1, 2],
+                    'feedback': "I'll generate new tweets for you."
+                }
+                
+            return data
+
+        except Exception as e:
+            logger.error(f"Failed to parse approval response: {e}")
+            return {
+                'action': 'regenerate_all',
+                'approved_indices': [],
+                'regenerate_indices': [1, 2],
+                'feedback': "I'll generate new tweets for you."
+            }
 
     async def _get_db(self):
         """Get database instance"""
@@ -1234,7 +1267,7 @@ Return ONLY valid JSON in this exact format:
             prompt = [
                 {
                     "role": "system",
-                    "content": "You are Rin, an AI VTuber who helps create and schedule tweets. Analyze tweet quality and return structured JSON."
+                    "content": "You are a professional tweet creator. Analyze tweet quality and return structured JSON."
                 },
                 {
                     "role": "user",
@@ -1255,7 +1288,7 @@ Return ONLY valid JSON in this exact format:
                 model_type=ModelType.GPT4o,
                 override_config={
                     "temperature": 0.2,
-                    "max_tokens": 500,
+                    "max_tokens": 200,
                     "response_format": {"type": "json_object"}
                 }
             )
@@ -1268,4 +1301,122 @@ Return ONLY valid JSON in this exact format:
                 "quality_check": "needs_improvement",
                 "feedback": "I had trouble analyzing the tweet quality. Let me generate new ones to be safe.",
                 "suggestions": ["Generate new tweets with better quality assurance"]
+            }
+
+    async def _validate_content_alignment(self, original_query: str, generated_content: List[Dict], topic: str) -> Dict:
+        """Validate if generated content aligns with the original query"""
+        try:
+            prompt = [
+                {
+                    "role": "system",
+                    "content": "You are a professional tweet creator. Analyze if the generated content matches the user's request."
+                },
+
+                {
+                    "role": "user",
+                    "content": f"""
+Original Request: "{original_query}"
+Topic: {topic}
+
+Generated Content:
+{self._format_tweets_for_presentation(generated_content)}
+
+Return ONLY valid JSON in this format:
+{{
+    "is_aligned": true/false,
+    "reason": "brief explanation in Rin's voice",
+    "suggestions": ["improvement suggestions if needed"],
+    "severity": "low" | "medium" | "high"  // how badly misaligned
+}}"""
+                }
+            ]
+
+            response = await self.llm_service.get_response(
+                prompt=prompt,
+                model_type=ModelType.GPT4o,
+                override_config={
+                    "temperature": 0.2,
+                    "max_tokens": 200,
+                    "response_format": {"type": "json_object"}
+                }
+            )
+
+            validation = json.loads(response)
+            logger.info(f"Content validation result: {validation}")
+            return validation
+
+        except Exception as e:
+            logger.error(f"Error in content validation: {e}")
+            return {
+                "is_aligned": False,
+                "reason": "Validation check failed",
+                "suggestions": ["Please try regenerating the content"],
+                "severity": "high"
+            }
+
+    async def _validate_command_analysis(self, analysis_result: Dict, current_state: Dict) -> Dict:
+        """Validate if the command analysis aligns with the current system state"""
+        try:
+            # Extract current state information
+            actual_tweet_count = len(current_state.get("pending_tweets", []))
+            original_topic = current_state.get("topic")
+            original_request = current_state.get("original_request")
+
+            # Extract analyzed parameters
+            analyzed_params = analysis_result.get("tools_needed", [{}])[0].get("parameters", {})
+            
+            # Validate key parameters
+            mismatches = []
+            if analyzed_params.get("tweet_count") != actual_tweet_count:
+                mismatches.append({
+                    "field": "tweet_count",
+                    "expected": actual_tweet_count,
+                    "received": analyzed_params.get("tweet_count"),
+                    "severity": "high"
+                })
+            
+            if analyzed_params.get("topic") != original_topic:
+                mismatches.append({
+                    "field": "topic",
+                    "expected": original_topic,
+                    "received": analyzed_params.get("topic"),
+                    "severity": "high"
+                })
+
+            # If mismatches found, correct the analysis
+            if mismatches:
+                logger.warning(f"Command analysis mismatches found: {mismatches}")
+                # Create corrected version of the command
+                corrected_command = {
+                    "tools_needed": [{
+                        "tool_name": "twitter",
+                        "action": "schedule_tweets",
+                        "parameters": {
+                            "tweet_count": actual_tweet_count,
+                            "topic": original_topic,
+                            "schedule_type": analyzed_params.get("schedule_type", "one_time"),
+                            "schedule_time": analyzed_params.get("schedule_time", "now"),
+                            "approval_required": True
+                        },
+                        "priority": 1
+                    }],
+                    "reasoning": f"Corrected analysis for scheduling {actual_tweet_count} tweets about {original_topic}"
+                }
+                return {
+                    "is_valid": False,
+                    "corrected_analysis": corrected_command,
+                    "mismatches": mismatches
+                }
+            
+            return {
+                "is_valid": True,
+                "original_analysis": analysis_result
+            }
+
+        except Exception as e:
+            logger.error(f"Error validating command analysis: {e}")
+            return {
+                "is_valid": False,
+                "error": str(e),
+                "severity": "high"
             }

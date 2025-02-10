@@ -56,13 +56,14 @@ class TweetSchedule(TypedDict):
     session_id: str
     topic: str
     total_tweets_requested: int
-    schedule_info: Dict[str, any]  # Overall schedule parameters (frequency, time slots, etc)
+    schedule_info: Dict[str, any]  # Overall schedule parameters
     approved_tweets: List[str]  # List of Tweet IDs
     pending_tweets: Optional[List[str]]  # List of Tweet IDs awaiting approval
-    status: str  # 'collecting_approval', 'ready_to_schedule', 'scheduled', 'completed', 'error'
+    status: str  # 'collecting_approval', 'ready_to_schedule', 'scheduled', 'completed', 'error', 'cancelled'
     created_at: datetime
     last_updated: datetime
     last_error: Optional[str]
+    metadata: Optional[Dict]  # Add this to store original_request and other context
 
 class ToolOperation(TypedDict):
     session_id: str
@@ -273,7 +274,8 @@ class RinDB:
             status='collecting_approval',
             created_at=datetime.utcnow(),
             last_updated=datetime.utcnow(),
-            last_error=None
+            last_error=None,
+            metadata=None
         )
         result = await self.tweet_schedules.insert_one(schedule)
         return str(result.inserted_id)

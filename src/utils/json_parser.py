@@ -9,6 +9,12 @@ T = TypeVar('T', bound=BaseModel)
 
 def extract_json(response: str) -> str:
     """Extract JSON substring from text"""
+    # Handle markdown code blocks first
+    if "```json" in response:
+        response = response.split("```json")[1].split("```")[0].strip()
+    elif "```" in response:
+        response = response.split("```")[1].strip()
+        
     start_idx = response.find('{')
     end_idx = response.rfind('}')
     if start_idx == -1 or end_idx == -1 or end_idx < start_idx:

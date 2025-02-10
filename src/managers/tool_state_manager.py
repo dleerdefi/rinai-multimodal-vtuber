@@ -93,15 +93,27 @@ class ToolStateManager:
         """Get current operation state"""
         return await self.db.get_tool_operation_state(session_id)
 
-    async def end_operation(self, session_id: str, success: bool = True) -> bool:
+    async def end_operation(self, session_id: str, success: bool = True, reason: str = None) -> bool:
         """End an operation"""
         try:
-            state = ToolOperationState.COMPLETED if success else ToolOperationState.ERROR
+            state = ToolOperationState.COMPLETED if success else ToolOperationState.CANCELLED
             operation_data = {
                 "state": state.value,
                 "step": "completed",
-                "last_updated": datetime.now(UTC)
+                "last_updated": datetime.now(UTC),
+                "end_reason": reason
             }
+            
+            # Get current operation to check if it's a tweet operation
+            current_op = await self.get_operation(session_id)
+            if current_op and current_op.get("operation_type") in ["send_tweet", "schedule_tweets"]:
+                # Cancel any active tweet schedules
+                schedule = await self.db.get_session_tweet_schedule(session_id)
+                if schedule:
+                    await self.db.update_tweet_schedule(
+                        schedule_id=str(schedule["_id"]),
+                        status="cancelled"
+                    )
             
             result = await self.db.set_tool_operation_state(session_id, operation_data)
             if result:

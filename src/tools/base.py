@@ -38,6 +38,23 @@ class BaseTool(ABC):
         }
         return data
 
+class ToolCommand(BaseModel):
+    """Structure for tool commands"""
+    tool_name: str = Field(description="Name of tool to execute")
+    action: str = Field(description="Action to perform")
+    parameters: Dict = Field(default={}, description="Tool parameters")
+    priority: int = Field(
+        default=1,
+        ge=1,
+        le=5,
+        description="Execution priority (1-5)"
+    )
+
+class CommandAnalysis(BaseModel):
+    """AI model for analyzing commands"""
+    tools_needed: List[ToolCommand] = Field(description="Tools required for this command")
+    reasoning: str = Field(description="Explanation of tool selection")
+
 class AgentResult(BaseModel):
     """Universal result structure for all agents"""
     response: str = Field(description="Response to the command/query")
@@ -56,3 +73,18 @@ class AgentDependencies(BaseModel):
     user_id: Optional[str]
     context: Optional[Dict] = {}
     tools_available: List[str] = []
+
+class TweetApprovalAnalysis(BaseModel):
+    """Model for tweet approval command analysis"""
+    action: str = Field(description="Action to take: full_approval | partial_approval | regenerate_all | partial_regenerate")
+    approved_indices: List[int] = Field(description="List of approved tweet numbers from 1 to N")
+    regenerate_indices: List[int] = Field(description="List of tweet numbers to regenerate from 1 to N")
+    feedback: str = Field(description="Explanation in Rin's voice")
+
+class TweetContent(BaseModel):
+    """Model for individual tweet content"""
+    content: str = Field(description="Content of the tweet")
+
+class TweetGenerationResponse(BaseModel):
+    """Model for LLM tweet generation response"""
+    tweets: List[TweetContent] = Field(description="List of generated tweets")
