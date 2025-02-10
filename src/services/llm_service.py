@@ -32,15 +32,18 @@ class ModelType(Enum):
     SAO_10K_L31_70B_EURYALE_V2_2 = "sao10k/l31-70b-euryale-v2.2"
     # Groq Models
     GROQ_LLAMA_3_2_3B = "llama2-3b-preview-8k"
-    GROQ_LLAMA_3_2_70B = "llama2-70b-preview-8k"  # Backup option if we need it
-    GROQ_LLAMA_3_3_70B = "llama-3.3-70b-versatile"  # Update to correct model name
+    GROQ_LLAMA_3_2_70B = "llama2-70b-preview-8k" 
+    GROQ_LLAMA_3_3_70B = "llama-3.3-70b-versatile"  
+    # Atoma Models
+    ATOMA_LLAMA_3_3_70B = "meta-llama/Llama-3.3-70B-Instruct"  # Atoma Supported Model
 
 class LLMProvider(Enum):
     OPENAI = "openai"
     ANTHROPIC = "anthropic"
     TOGETHER = "together"
     NOVITA = "novita"
-    GROQ = "groq"  # Add Groq provider
+    GROQ = "groq"  
+    ATOMA = "atoma"  
 
 class LLMService:
     def __init__(self, llm_settings=None):
@@ -49,8 +52,9 @@ class LLMService:
         self.anthropic_api_key = os.getenv('ANTHROPIC_API_KEY')
         self.together_api_key = os.getenv('TOGETHER_API_KEY')
         self.novita_api_key = os.getenv('NOVITA_API_KEY')
-        self.groq_api_key = os.getenv('GROQ_API_KEY')  # Add Groq API key
-        
+        self.groq_api_key = os.getenv('GROQ_API_KEY')  
+        self.atoma_api_key = os.getenv('ATOMA_API_KEY')  
+
         # Set model type from settings or use default
         self.model_type = (llm_settings or {}).get("model_type", ModelType.CLAUDE_3_5_SONNET)
         
@@ -75,8 +79,10 @@ class LLMService:
             ModelType.GROQ_LLAMA_3_2_3B: LLMProvider.GROQ,
             ModelType.GROQ_LLAMA_3_2_70B: LLMProvider.GROQ,
             ModelType.GROQ_LLAMA_3_3_70B: LLMProvider.GROQ,
+            # Atoma Models
+            ModelType.ATOMA_LLAMA_3_3_70B: LLMProvider.ATOMA,
         }
-        
+
         # Default configurations for different models with config types
         self.model_configs = {
             # OpenAI configs
@@ -162,7 +168,22 @@ class LLMService:
                     "max_tokens": 50,    # Short responses for classification
                     "top_p": 0.9
                 }
-            }
+            },
+            # Atoma configs
+            ModelType.ATOMA_LLAMA_3_3_70B: {
+                "default": {
+                    "temperature": 0.88,
+                    "top_p": 0.9,
+                    "min_p": 0.05,
+                    "top_k": 50,
+                    "presence_penalty": 0.3,
+                    "frequency_penalty": 0.3,
+                    "repetition_penalty": 1.1,
+                    "max_tokens": 900,
+                    "stream": False,
+                    "response_format": {"type": "text"}
+                }
+            },
         }
 
     async def get_response(
@@ -201,6 +222,8 @@ class LLMService:
                 return await self._get_novita_response(prompt, model_type, config)
             elif provider == LLMProvider.GROQ:
                 return await self._get_groq_response(prompt, model_type, config)
+            elif provider == LLMProvider.ATOMA:
+                return await self._get_atoma_response(prompt, model_type, config)
             
         except Exception as e:
             logger.error(f"Error getting LLM response: {str(e)}", exc_info=True)
@@ -215,8 +238,11 @@ class LLMService:
             return self._prepare_claude_messages(prompt)
         elif provider == LLMProvider.OPENAI:
             return self._prepare_openai_messages(prompt)
-        else:  # TOGETHER
+        elif provider == LLMProvider.TOGETHER:
             return self._prepare_together_messages(prompt)
+        elif provider == LLMProvider.ATOMA:
+            return self._prepare_atoma_messages(prompt)
+
 
     async def _get_openai_response(self, prompt: str | list, model_type: ModelType, config: Dict) -> str:
         messages = self._prepare_openai_messages(prompt)
@@ -542,3 +568,58 @@ class LLMService:
                         formatted_messages.append(msg)
             return formatted_messages
         return messages
+
+    def _prepare_atoma_messages(self, prompt: str | list) -> list:
+        """Format messages for Atoma API"""
+        if isinstance(prompt, str):
+            return [
+                {
+                    "role": "system",
+                    "content": "You are a helpful AI assistant powered by Llama 3.3 70B. Provide clear and concise responses."
+                },
+                {
+                    "role": "user",
+                    "content": prompt
+                }
+            ]
+        elif isinstance(prompt, list):
+            formatted_messages = []
+            for msg in prompt:
+                if isinstance(msg, dict) and 'role' in msg and 'content' in msg:
+                    if msg['role'] in ['system', 'user', 'assistant']:
+                        formatted_messages.append(msg)
+            return formatted_messages
+        return []
+
+    async def _get_atoma_response(self, prompt: str | list, model_type: ModelType, config: Dict) -> str:
+        """Handle Atoma API requests"""
+        try:
+            messages = self._prepare_atoma_messages(prompt)
+            validated_messages = self._validate_messages(messages)
+            
+            client = OpenAI(
+                base_url="https://api.atoma.network/v1",  # Updated API endpoint
+                api_key=self.atoma_api_key
+            )
+            
+            logger.debug(f"Sending request to Atoma {model_type.value}")
+            
+            # Prepare config with required fields
+            api_config = {
+                "stream": False,  # We're not handling streaming for now
+                "model": model_type.value,
+                "temperature": config.get('temperature', 0.88),  # Updated to match our config
+                "max_tokens": config.get('max_tokens', 900)      # Updated to match our config
+            }
+            
+            # Remove await since this client doesn't support it
+            completion = client.chat.completions.create(
+                messages=validated_messages,
+                **api_config
+            )
+            
+            return completion.choices[0].message.content
+
+        except Exception as e:
+            logger.error(f"Error in Atoma response: {str(e)}", exc_info=True)
+            raise
