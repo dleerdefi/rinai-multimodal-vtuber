@@ -1093,11 +1093,17 @@ Requirements:
                         # Store new tweets with metadata
                         stored_tweet_ids = []
                         for tweet in new_tweets["tweets"]:
+                            # Create tweet with basic parameters
                             tweet_id = await db.create_tweet(
                                 content=tweet["content"],
                                 schedule_id=str(schedule["_id"]),
-                                session_id=session_id,
-                                status=TweetStatus.PENDING.value,
+                                session_id=session_id
+                            )
+                            
+                            # Update the tweet's metadata separately
+                            await db.update_tweet_status(
+                                tweet_id=tweet_id,
+                                status=TweetStatus.PENDING,
                                 metadata={
                                     "original_request": original_request,
                                     "tone": tone,

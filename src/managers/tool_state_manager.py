@@ -78,7 +78,13 @@ class ToolStateManager:
             }
             
             if data:
-                operation_data["data"] = {**await self.db.get_tool_operation_state(session_id).get("data", {}), **data}
+                # Get current operation state and await it properly
+                current_state = await self.db.get_tool_operation_state(session_id)
+                if current_state:
+                    current_data = current_state.get("data", {})
+                    operation_data["data"] = {**current_data, **data}
+                else:
+                    operation_data["data"] = data
                 
             success = await self.db.set_tool_operation_state(session_id, operation_data)
             if success:
