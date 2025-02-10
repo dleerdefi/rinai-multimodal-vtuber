@@ -1,7 +1,9 @@
-import requests
+# future use
+# import requests
 
 class TimeApiClient:
     """
+
     A simple client to interact with timeapi.io, providing
     methods to get the current time in a specific IANA time zone.
     """

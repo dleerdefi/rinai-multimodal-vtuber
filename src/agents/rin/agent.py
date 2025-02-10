@@ -164,13 +164,13 @@ class RinAgent:
             # Check for active tool operation
             operation = await self.tool_state_manager.get_operation(session_id)
             
-            if operation and operation.get('state') != ToolOperationState.INACTIVE.value:
+            if operation and operation.get('state') not in [ToolOperationState.INACTIVE.value, ToolOperationState.CANCELLED.value]:
                 # Let orchestrator handle the operation step
                 result = await self.orchestrator.process_command(
                     command=message,
                     deps=AgentDependencies(
                         conversation_id=session_id,
-                        user_id=role,  # Add user_id here
+                        user_id=role,
                         context={
                             "operation": operation,
                             "interaction_type": interaction_type
@@ -178,28 +178,58 @@ class RinAgent:
                     )
                 )
                 
-                # Update operation state based on result
-                if result.data.get("operation_update"):
-                    await self.tool_state_manager.update_operation(
-                        session_id,
-                        **result.data["operation_update"]
+                # If operation was cancelled or completed, allow normal conversation to resume
+                if result.data.get("status") in ["cancelled", "completed"]:
+                    logger.info(f"Tool operation ended with status: {result.data.get('status')}")
+                    
+                    # Update operation state based on result
+                    if result.data.get("operation_update"):
+                        await self.tool_state_manager.update_operation(
+                            session_id,
+                            **result.data["operation_update"]
+                        )
+                    
+                    # Store the final tool interaction in context
+                    await self.context_manager.store_interaction(
+                        session_id=session_id,
+                        user_message=message,
+                        assistant_response=result.response,
+                        interaction_type=interaction_type,
+                        metadata={
+                            'formatted_for_tts': True,
+                            'role': role,
+                            'tool_operation': operation.get('operation_type'),
+                            'tool_step': operation.get('step'),
+                            'operation_status': result.data.get("status")
+                        }
                     )
-                
-                # Store the tool interaction in context
-                await self.context_manager.store_interaction(
-                    session_id=session_id,
-                    user_message=message,
-                    assistant_response=result.response,
-                    interaction_type=interaction_type,
-                    metadata={
-                        'formatted_for_tts': True,
-                        'role': role,
-                        'tool_operation': operation.get('operation_type'),
-                        'tool_step': operation.get('step')
-                    }
-                )
-                
-                return result.response
+                    
+                    # Return the final message and allow fall through to normal conversation
+                    if result.response:
+                        return result.response
+                else:
+                    # For ongoing operations, update state and return response
+                    if result.data.get("operation_update"):
+                        await self.tool_state_manager.update_operation(
+                            session_id,
+                            **result.data["operation_update"]
+                        )
+                    
+                    # Store the tool interaction in context
+                    await self.context_manager.store_interaction(
+                        session_id=session_id,
+                        user_message=message,
+                        assistant_response=result.response,
+                        interaction_type=interaction_type,
+                        metadata={
+                            'formatted_for_tts': True,
+                            'role': role,
+                            'tool_operation': operation.get('operation_type'),
+                            'tool_step': operation.get('step')
+                        }
+                    )
+                    
+                    return result.response
 
             # Initialize session if needed
             if session_id not in self.sessions:

@@ -850,6 +850,24 @@ Requirements:
                     "requires_tts": True
                 }
             
+            # Get metadata from both possible locations in schedule
+            schedule_info = schedule.get("schedule_info", {})
+            schedule_metadata = schedule.get("metadata", {}) or {}  # Ensure it's never None
+
+            # Get nested metadata from schedule_info safely
+            schedule_info_metadata = schedule_info.get("metadata", {}) or {}
+
+            # Combine them with schedule_info taking precedence
+            tone = (
+                schedule_info_metadata.get("tone") or 
+                schedule_metadata.get("tone") or 
+                "professional"
+            )
+            original_request = (
+                schedule_info_metadata.get("original_request") or 
+                schedule_metadata.get("original_request")
+            )
+            
             # Use combined analysis for initial quality check
             analysis = await self._analyze_tweet_quality(
                 tweets=tweets,
@@ -923,12 +941,17 @@ Requirements:
     async def _process_tweet_approval_response(self, message: str, session_id: str) -> Dict:
         """Process user's response to tweet approval"""
         try:
-            logger.info(f"Processing approval for session {session_id}")
-            db = MongoManager.get_db()
-            
             # Get operation state first
             operation_state = await self.tool_state_manager.get_operation_state(session_id)
             logger.debug(f"Current operation state: {operation_state}")
+            
+            # If tweets are already approved or scheduled, don't process any more commands
+            if operation_state and operation_state.get("status") in ["approved", "scheduled"]:
+                return {
+                    "status": "success",
+                    "response": "Your tweets are already scheduled and being processed. You can safely exit.",
+                    "requires_tts": True
+                }
             
             # More lenient state validation - accept any collecting state
             if not operation_state or operation_state.get('state') != 'collecting':
@@ -949,13 +972,13 @@ Requirements:
                     reason="User requested to stop"
                 )
                 return {
-                    "status": "exited",
+                    "status": "cancelled",
                     "response": "I've stopped the tweet process. Let me know if you need anything else!",
-                    "requires_tts": True,
-                    "exit_to_main": True
+                    "requires_tts": True
                 }
 
             # Get active schedule and pending tweets
+            db = MongoManager.get_db()
             schedule = await db.get_session_tweet_schedule(session_id)
             if not schedule:
                 logger.error("No active schedule found")
@@ -978,173 +1001,217 @@ Requirements:
             )
             logger.info(f"Analysis result: {analysis}")
 
-            # Access Pydantic model attributes with dot notation
-            if analysis.action == "full_approval":
-                # Update all pending tweets to approved
-                for tweet in pending_tweets:
-                    await db.update_tweet_status(
-                        tweet_id=str(tweet["_id"]),
-                        status=TweetStatus.APPROVED.value
-                    )
-                
-                # Update schedule status
-                await db.update_tweet_schedule(
-                    schedule_id=str(schedule["_id"]),
-                    status="ready_to_schedule"
-                )
-                
-                # Activate the schedule
-                schedule_activated = await self._activate_tweet_schedule(
-                    str(schedule["_id"]), 
-                    schedule["schedule_info"]
-                )
-                
-                if schedule_activated:
-                    return {
-                        "status": "completed",
-                        "response": analysis.feedback,
-                        "requires_tts": True
-                    }
-
-            elif analysis.action in ["partial_approval", "partial_regenerate"]:
-                # Update operation state to track partial approval
-                await self.tool_state_manager.update_operation(
-                    session_id=session_id,
-                    state=ToolOperationState.COLLECTING,
-                    step="partial_approval_in_progress",
-                    data={
-                        "schedule_id": str(schedule["_id"]),
-                        "approved_indices": analysis.approved_indices,
-                        "pending_indices": analysis.regenerate_indices,
-                        "total_needed": schedule["total_tweets_requested"]
-                    }
-                )
-
-                # Process approved tweets first
-                for idx in analysis.approved_indices:
-                    if 0 <= idx - 1 < len(pending_tweets):
+            try:
+                # Access Pydantic model attributes with dot notation
+                if analysis.action == "full_approval":
+                    # Update all pending tweets to approved
+                    for tweet in pending_tweets:
                         await db.update_tweet_status(
-                            tweet_id=str(pending_tweets[idx - 1]["_id"]),
+                            tweet_id=str(tweet["_id"]),
                             status=TweetStatus.APPROVED.value
                         )
-                
-                # Mark and regenerate rejected tweets immediately
-                rejected_count = len(analysis.regenerate_indices)
-                if rejected_count > 0:
-                    # Mark tweets as rejected
-                    for idx in analysis.regenerate_indices:
+                    
+                    # Update schedule status
+                    await db.update_tweet_schedule(
+                        schedule_id=str(schedule["_id"]),
+                        status="ready_to_schedule"
+                    )
+                    
+                    # Activate the schedule
+                    schedule_activated = await self._activate_tweet_schedule(
+                        str(schedule["_id"]), 
+                        schedule["schedule_info"]
+                    )
+                    
+                    if schedule_activated:
+                        return {
+                            "status": "completed",
+                            "response": analysis.feedback,
+                            "requires_tts": True
+                        }
+
+                elif analysis.action in ["partial_approval", "partial_regenerate"]:
+                    # Update operation state to track partial approval
+                    await self.tool_state_manager.update_operation(
+                        session_id=session_id,
+                        state=ToolOperationState.COLLECTING,
+                        step="partial_approval_in_progress",
+                        data={
+                            "schedule_id": str(schedule["_id"]),
+                            "approved_indices": analysis.approved_indices,
+                            "pending_indices": analysis.regenerate_indices,
+                            "total_needed": schedule["total_tweets_requested"]
+                        }
+                    )
+
+                    # Process approved tweets first
+                    for idx in analysis.approved_indices:
                         if 0 <= idx - 1 < len(pending_tweets):
                             await db.update_tweet_status(
                                 tweet_id=str(pending_tweets[idx - 1]["_id"]),
-                                status=TweetStatus.REJECTED.value
+                                status=TweetStatus.APPROVED.value
                             )
                     
-                    # Generate new tweets immediately
-                    new_tweets = await self._generate_tweet_series(
-                        topic=schedule["topic"],
-                        count=rejected_count,
-                        original_request=schedule.get("metadata", {}).get("original_request")
+                    # Mark and regenerate rejected tweets immediately
+                    rejected_count = len(analysis.regenerate_indices)
+                    if rejected_count > 0:
+                        # Mark tweets as rejected
+                        for idx in analysis.regenerate_indices:
+                            if 0 <= idx - 1 < len(pending_tweets):
+                                await db.update_tweet_status(
+                                    tweet_id=str(pending_tweets[idx - 1]["_id"]),
+                                    status=TweetStatus.REJECTED.value
+                                )
+                        
+                        # Get metadata from both possible locations in schedule
+                        schedule_info = schedule.get("schedule_info", {})
+                        schedule_metadata = schedule.get("metadata", {}) or {}  # Ensure it's never None
+
+                        # Get nested metadata from schedule_info safely
+                        schedule_info_metadata = schedule_info.get("metadata", {}) or {}
+
+                        # Combine them with schedule_info taking precedence
+                        tone = (
+                            schedule_info_metadata.get("tone") or 
+                            schedule_metadata.get("tone") or 
+                            "professional"
+                        )
+                        original_request = (
+                            schedule_info_metadata.get("original_request") or 
+                            schedule_metadata.get("original_request")
+                        )
+                        
+                        # Generate new tweets with proper metadata handling
+                        new_tweets = await self._generate_tweet_series(
+                            topic=schedule["topic"],
+                            count=rejected_count,
+                            tone=tone,
+                            original_request=original_request,
+                            session_id=session_id
+                        )
+                        
+                        # Store new tweets with metadata
+                        stored_tweet_ids = []
+                        for tweet in new_tweets["tweets"]:
+                            tweet_id = await db.create_tweet(
+                                content=tweet["content"],
+                                schedule_id=str(schedule["_id"]),
+                                session_id=session_id,
+                                status=TweetStatus.PENDING.value,
+                                metadata={
+                                    "original_request": original_request,
+                                    "tone": tone,
+                                    "generated_at": datetime.now(UTC).isoformat()
+                                }
+                            )
+                            stored_tweet_ids.append(tweet_id)
+                        
+                        return {
+                            "status": "partial_regenerated",
+                            "response": f"{analysis.feedback}\nI've kept the approved tweets and generated new ones to replace the others. Here are the new tweets:\n{self._format_tweets_for_presentation(new_tweets['tweets'])}",
+                            "requires_tts": True,
+                            "data": {
+                                "new_tweets": new_tweets,
+                                "stored_tweet_ids": stored_tweet_ids,
+                                "regenerate_count": rejected_count
+                            }
+                        }
+
+                elif analysis.action == "regenerate_all":
+                    logger.info("Regenerating all tweets")
+                    # Mark existing tweets as rejected
+                    for tweet in pending_tweets:
+                        await db.update_tweet_status(
+                            tweet_id=str(tweet["_id"]),
+                            status=TweetStatus.REJECTED.value
+                        )
+                    
+                    # Get metadata from both possible locations in schedule
+                    schedule_info = schedule.get("schedule_info", {})
+                    schedule_metadata = schedule.get("metadata", {}) or {}  # Ensure it's never None
+
+                    # Get nested metadata from schedule_info safely
+                    schedule_info_metadata = schedule_info.get("metadata", {}) or {}
+
+                    # Combine them with schedule_info taking precedence
+                    tone = (
+                        schedule_info_metadata.get("tone") or 
+                        schedule_metadata.get("tone") or 
+                        "professional"
+                    )
+                    original_request = (
+                        schedule_info_metadata.get("original_request") or 
+                        schedule_metadata.get("original_request")
                     )
                     
-                    # Store new tweets
+                    # Generate new tweets with proper metadata handling
+                    new_tweets = await self._generate_tweet_series(
+                        topic=schedule["topic"],
+                        count=schedule["total_tweets_requested"],
+                        tone=tone,
+                        original_request=original_request,
+                        session_id=session_id
+                    )
+                    
+                    # Store new tweets with metadata
                     stored_tweet_ids = []
-                    for tweet in new_tweets:
+                    for tweet in new_tweets["tweets"]:
                         tweet_id = await db.create_tweet(
                             content=tweet["content"],
                             schedule_id=str(schedule["_id"]),
                             session_id=session_id,
-                            status=TweetStatus.PENDING.value
+                            status=TweetStatus.PENDING.value,
+                            metadata={
+                                "original_request": original_request,
+                                "tone": tone,
+                                "generated_at": datetime.now(UTC).isoformat()
+                            }
                         )
                         stored_tweet_ids.append(tweet_id)
                     
+                    # Update schedule
+                    await db.update_tweet_schedule(
+                        schedule_id=str(schedule["_id"]),
+                        pending_tweet_ids=stored_tweet_ids,
+                        status="collecting_approval"
+                    )
+                    
                     return {
-                        "status": "partial_regenerated",
-                        "response": f"{analysis.feedback}\nI've kept the approved tweets and generated new ones to replace the others. Here are the new tweets:\n{self._format_tweets_for_presentation(new_tweets)}",
+                        "status": "regenerated",
+                        "response": f"I've generated new tweets for you. Here they are:\n{self._format_tweets_for_presentation(new_tweets['tweets'])}",
                         "requires_tts": True,
-                        "data": {
-                            "new_tweets": new_tweets,
-                            "stored_tweet_ids": stored_tweet_ids,
-                            "regenerate_count": rejected_count
-                        }
+                        "data": {"tweets": new_tweets}
                     }
 
-            elif analysis.action == "regenerate_all":
-                logger.info("Regenerating all tweets")
-                # Mark existing tweets as rejected
-                for tweet in pending_tweets:
-                    await db.update_tweet_status(
-                        tweet_id=str(tweet["_id"]),
-                        status=TweetStatus.REJECTED.value
-                    )
-                
-                # Generate new tweets with original request context
-                new_tweets = await self._generate_tweet_series(
-                    topic=schedule["topic"],
-                    count=schedule["total_tweets_requested"],
-                    original_request=schedule.get("metadata", {}).get("original_request")
-                )
-                
-                # Store new tweets
-                stored_tweet_ids = []
-                for tweet in new_tweets:
-                    tweet_id = await db.create_tweet(
-                        content=tweet["content"],
-                        schedule_id=str(schedule["_id"]),
-                        session_id=session_id
-                    )
-                    stored_tweet_ids.append(tweet_id)
-                
-                # Update schedule
-                await db.update_tweet_schedule(
-                    schedule_id=str(schedule["_id"]),
-                    pending_tweet_ids=stored_tweet_ids,
-                    status="collecting_approval"
-                )
-                
-                return {
-                    "status": "regenerated",
-                    "response": f"I've generated new tweets for you. Here they are:\n{self._format_tweets_for_presentation(new_tweets)}",
-                    "requires_tts": True,
-                    "data": {"tweets": new_tweets}
-                }
+                # Check remaining tweets needed
+                approved_tweets = await db.get_tweets_by_schedule(str(schedule["_id"]))
+                approved_count = sum(1 for t in approved_tweets if t["status"] == TweetStatus.APPROVED.value)
+                remaining = schedule["total_tweets_requested"] - approved_count
 
-            # Check remaining tweets needed
-            approved_tweets = await db.get_tweets_by_schedule(str(schedule["_id"]))
-            approved_count = sum(1 for t in approved_tweets if t["status"] == TweetStatus.APPROVED.value)
-            remaining = schedule["total_tweets_requested"] - approved_count
+                if remaining > 0:
+                    return {
+                        "status": "in_progress",
+                        "response": f"{analysis.feedback}\nWe still need {remaining} more tweets. Would you like me to generate them now?",
+                        "requires_tts": True
+                    }
 
-            if remaining > 0:
                 return {
-                    "status": "in_progress",
-                    "response": f"{analysis.feedback}\nWe still need {remaining} more tweets. Would you like me to generate them now?",
+                    "status": "awaiting_input",
+                    "response": f"{analysis.feedback}\nWhat would you like me to do with these tweets?",
                     "requires_tts": True
                 }
 
-            return {
-                "status": "awaiting_input",
-                "response": f"{analysis.feedback}\nWhat would you like me to do with these tweets?",
-                "requires_tts": True
-            }
+            except Exception as e:
+                logger.error(f"Error in approval action processing: {e}", exc_info=True)
+                return {
+                    "status": "error",
+                    "response": "I had trouble processing your approval. Would you like to try again?",
+                    "requires_tts": True
+                }
 
         except Exception as e:
             logger.error(f"Error processing approval: {e}", exc_info=True)
-            # Try to recover state if possible
-            try:
-                current_state = await self.tool_state_manager.get_operation_state(session_id)
-                if current_state and current_state.get("state") == ToolOperationState.COLLECTING:
-                    return {
-                        "status": "retry",
-                        "response": "I had trouble processing that. Could you try telling me which tweets to approve again?",
-                        "requires_tts": True
-                    }
-            except Exception as state_error:
-                logger.error(f"Error recovering state: {state_error}")
-            
-            return {
-                "status": "error",
-                "response": "I had trouble processing your response. Would you like to try again or stop?",
-                "requires_tts": True
-            }
+            # ... outer exception handling ...
 
     async def _activate_tweet_schedule(self, schedule_id: str, schedule_info: Dict) -> bool:
         """Activate a tweet schedule after approval"""
