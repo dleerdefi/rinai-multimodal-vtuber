@@ -69,7 +69,7 @@ This project uses a custom fork of the [ElizaOS Twitter Client](https://github.c
 4. **Installation:**
    ```bash
    # Clone main repository
-   git clone [https://github.com/dleerdefi/rinai-multimodal-vtuber] rinai-multimodal-vtuber
+   git clone [rinai-multimodal-vtuber](https://github.com/dleerdefi/rinai-multimodal-vtuber)
    cd rinai-multimodal-vtuber
 
    # Setup Python environment
@@ -78,10 +78,11 @@ This project uses a custom fork of the [ElizaOS Twitter Client](https://github.c
    pip install -r requirements.txt
 
    # Setup Twitter API Client
-   git clone [Your Forked ElizaOS Twitter Client Repo URL] twitter-client
+   git clone [agent-twitter-client](https://github.com/dleerdefi/agent-twitter-client)
    cd twitter-client
    npm install
    ```
+
 
 5. **Starting the Services:**
 
