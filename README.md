@@ -10,8 +10,15 @@
 - 🔧 Extensible tool framework
 - 🎮 VTube Studio integration
 - 💬 YouTube chat interaction
+- 💸 ElizaOS Twitter Client Integration
 
-Perfect for V-Tubing or as a powerful desktop assistant.
+Built with Python, TypeScript, and modern AI services. Perfect for V-Tubing or as a powerful desktop assistant.
+
+## Architecture Overview
+![RinAI Architecture](https://github.com/dleerdefi/rinai-multimodal-vtuber/blob/main/assets/images/RinAI%20Multimodal%20Vtuber%20Diagram.png)
+
+## ElizaOS Twitter Client Integration
+This project uses a custom fork of the [ElizaOS Twitter Client](https://github.com/elizaOS/agent-twitter-client) that we've enhanced with an API server layer. Our version ([agent-twitter-client](https://github.com/dleerdefi/agent-twitter-client)) provides a REST API interface for the RinAI agent stack to schedule and manage tweets without requiring Twitter API keys.
 
 **Key Features:**
 
@@ -31,30 +38,6 @@ Perfect for V-Tubing or as a powerful desktop assistant.
 *   **Smart LLM Gateway:** Dynamically selects optimal LLM based on task complexity
 *   **Streaming Architecture:** End-to-end streaming for minimal latency
 *   **Open Source & Extensible:** Built to be customizable with community contributions welcome
-
-**Architecture Overview:**
-
-![RinAI Architecture](https://github.com/dleerdefi/rinai-multimodal-vtuber/blob/main/assets/images/RinAI%20Multimodal%20Vtuber%20Diagram.png)
-
-*   **V-Tuber Front-End:**
-    *   [Vtube Studio]
-    *   [OBS]
-    *   [Frontend Web UI]
-*   **Python WebSocket Server:**
-    *   WebSocket communication with front-end
-    *   Multi-modal pipeline orchestration
-    *   Task scheduling and tool calls
-    *   Keyword-based intent recognition
-    *   LLM Gateway integration
-*   **Twitter API Server:**
-    *   Based on customized Eliza OS Twitter Agent Client
-    *   Tweet creation and scheduling API
-*   **STT/TTS Pipeline:**
-    *   Groq for Whisper AI (STT)
-    *   11Labs (TTS)
-*   **Tool Orchestration:** Individual Python modules for each tool capability
-*   **Database:** MongoDB for storing messages, scheduled tasks and tool usage
-*   **Neo4j Graph Database:** For storing and querying knowledge graph for hybrid queries.
 
 **Tech Stack:**
 
