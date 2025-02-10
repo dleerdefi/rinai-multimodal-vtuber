@@ -1,4 +1,17 @@
-# RinAI Multimodal V-Tuber and Desktop Agent
+# RinAI Multimodal V-Tuber & Desktop Agent
+
+![RinAI Multimodal UX](https://github.com/dleerdefi/rinai-multimodal-vtuber/blob/main/assets/images/RinAI%20Multimodal%20UX%20Example.png)
+
+🤖 An open-source AI V-Tuber and desktop agent that combines speech processing, LLMs, and tool automation. Features include:
+
+- 🎙️ Real-time STT/TTS with Groq & 11Labs
+- 🐦 Twitter scheduling & automation
+- 🧠 GraphRAG memory system
+- 🔧 Extensible tool framework
+- 🎮 VTube Studio integration
+- 💬 YouTube chat interaction
+
+Perfect for V-Tubing or as a powerful desktop assistant.
 
 **Key Features:**
 
@@ -20,6 +33,8 @@
 *   **Open Source & Extensible:** Built to be customizable with community contributions welcome
 
 **Architecture Overview:**
+
+![RinAI Architecture](https://github.com/dleerdefi/rinai-multimodal-vtuber/blob/main/assets/images/RinAI%20Multimodal%20Vtuber%20Diagram.png)
 
 *   **V-Tuber Front-End:**
     *   [Vtube Studio]
