@@ -472,11 +472,17 @@ RESPONSE GUIDELINES:
     async def _get_tool_results(self, message: str) -> Optional[str]:
         """Get results from tools based on message content"""
         try:
-            # Debug logging for tool analysis
-            logger.info(f"[TOOLS] Analyzing message for tool usage: {message}")
-            
-            # Let the orchestrator handle all tool selection and execution
-            result = await self.orchestrator.process_command(message)
+            # Single tool detection point
+            tool_type = self.trigger_detector.get_specific_tool_type(message)
+            if not tool_type:
+                logger.info("[TOOLS] No specific tool type detected")
+                return None
+
+            # Pass detected tool type to orchestrator
+            result = await self.orchestrator.process_command(
+                command=message,
+                tool_type=tool_type
+            )
             
             # Log the orchestrator's decision
             if result:
@@ -497,7 +503,7 @@ RESPONSE GUIDELINES:
             
             logger.info("[TOOLS] No tool results returned")
             return None
-        
+            
         except Exception as e:
             logger.error(f"[TOOLS] Error getting tool results: {e}", exc_info=True)
             return None
