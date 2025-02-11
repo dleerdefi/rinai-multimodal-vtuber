@@ -48,36 +48,6 @@
             to { opacity: 1; transform: translateY(0); }
         }
 
-        /* Scanline effect */
-        .scanline {
-            position: fixed;
-            top: 0;
-            left: 0;
-            width: 100%;
-            height: 2px;
-            background: rgba(51, 255, 51, 0.1);
-            animation: scan 2s linear infinite;
-            pointer-events: none;
-        }
-
-        @keyframes scan {
-            from { top: 0; }
-            to { top: 100vh; }
-        }
-
-        /* CRT screen effect */
-        .crt-overlay {
-            position: fixed;
-            top: 0;
-            left: 0;
-            width: 100%;
-            height: 100%;
-            background: linear-gradient(rgba(0,0,0,0.1) 50%, rgba(0,0,0,0.2) 50%);
-            background-size: 100% 4px;
-            pointer-events: none;
-            z-index: 10;
-        }
-
         /* Input container styles */
         #input-container {
             position: fixed;
@@ -134,8 +104,6 @@
     </style>
 </head>
 <body>
-    <div class="scanline"></div>
-    <div class="crt-overlay"></div>
     <div id="chat-container"></div>
     
     <!-- Add input container -->
@@ -213,9 +181,6 @@
                 };
                 console.log("Sending message:", message);
                 ws.send(JSON.stringify(message));
-                
-                // Add message to chat immediately for user feedback
-                addMessage(message);
                 
                 chatInput.value = '';
             } else {

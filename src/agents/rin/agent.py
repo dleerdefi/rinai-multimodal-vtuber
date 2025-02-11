@@ -66,7 +66,7 @@ class RinAgent:
         self.orchestrator = Orchestrator()
         
         # Define models for different use cases
-        self.chat_model = ModelType.ATOMA_LLAMA_3_3_70B # For role-playing
+        self.chat_model = ModelType.SAO_10K_L31_70B_EURYALE_V2_2 # For role-playing
         self.decision_model = ModelType.GPT4_TURBO  # For analysis/decisions
         self.response_model = ModelType.CLAUDE_3_5_SONNET # For tool-based responses
         
