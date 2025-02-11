@@ -9,10 +9,11 @@ from datetime import datetime
 logger = logging.getLogger(__name__)
 
 class ChatWebSocketServer:
-    def __init__(self, host='localhost', port=8765):
+    def __init__(self, host='localhost', port=8765, orchestrator=None):
         self.host = host
         self.port = port
         self.clients = set()
+        self.orchestrator = orchestrator  # Store orchestrator reference
         
     async def register(self, websocket):
         """Register a new client"""
@@ -62,8 +63,30 @@ class ChatWebSocketServer:
         try:
             async for msg in ws:
                 if msg.type == web.WSMsgType.TEXT:
-                    # Handle any incoming messages if needed
-                    pass
+                    try:
+                        data = json.loads(msg.data)
+                        # Route message through appropriate stream orchestrator handler
+                        if hasattr(self.orchestrator, 'handle_host_message') or hasattr(self.orchestrator, 'handle_chat_message'):
+                            if data.get('type') == 'host_message':
+                                # Use handle_host_message for messages from web interface
+                                if hasattr(self.orchestrator, 'handle_host_message'):
+                                    await self.orchestrator.handle_host_message(
+                                        message=data.get('content', ''),
+                                        author=data.get('author', 'Host')
+                                    )
+                                logger.info(f"Processed message from {data.get('author')}: {data.get('content')}")
+                            else:
+                                # Default to handle_chat_message for other messages
+                                if hasattr(self.orchestrator, 'handle_chat_message'):
+                                    await self.orchestrator.handle_chat_message(
+                                        message=data.get('content', ''),
+                                        author=data.get('author', 'User')
+                                    )
+                                logger.info(f"Processed message from {data.get('author')}: {data.get('content')}")
+                    except json.JSONDecodeError:
+                        logger.error("Failed to parse WebSocket message as JSON")
+                    except Exception as e:
+                        logger.error(f"Error processing message: {e}")
                 elif msg.type == web.WSMsgType.ERROR:
                     logger.error(f'WebSocket connection closed with error: {ws.exception()}')
         finally:
@@ -83,7 +106,7 @@ class ChatWebSocketServer:
             
             # Add routes
             app.router.add_get('/', self.serve_static)
-            app.router.add_get('/ws', self.websocket_handler)  # Add WebSocket endpoint
+            app.router.add_get('/ws', self.websocket_handler)
             
             # Start server
             runner = web.AppRunner(app)

@@ -451,3 +451,29 @@ class RinDB:
         except Exception as e:
             logger.error(f"Error getting tool operation state: {e}")
             return None
+
+    async def delete_all_scheduled_tweets(self):
+        """Delete all tweet schedules and their associated tweets"""
+        try:
+            # Get all schedule IDs first
+            schedule_cursor = self.tweet_schedules.find({})
+            schedules = await schedule_cursor.to_list(length=None)
+            schedule_ids = [str(schedule['_id']) for schedule in schedules]
+            
+            # Delete all tweets associated with these schedules
+            for schedule_id in schedule_ids:
+                await self.tweets.delete_many({"schedule_id": schedule_id})
+                logger.info(f"Deleted tweets for schedule {schedule_id}")
+            
+            # Delete all tweet schedules
+            result = await self.tweet_schedules.delete_many({})
+            
+            logger.info(f"Deleted {result.deleted_count} tweet schedules")
+            return {
+                "schedules_deleted": result.deleted_count,
+                "schedule_ids": schedule_ids
+            }
+            
+        except Exception as e:
+            logger.error(f"Error deleting scheduled tweets: {e}")
+            raise

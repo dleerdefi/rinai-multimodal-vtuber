@@ -15,6 +15,7 @@ from src.services.schedule_service import ScheduleService
 from src.db.mongo_manager import MongoManager
 from src.managers.tool_state_manager import ToolStateManager
 from src.utils.keyboard_handler import KeyboardHandler
+from aiohttp import web
 
 logger = logging.getLogger(__name__)
 
@@ -215,9 +216,12 @@ class StreamOrchestrator:
     async def start(self):
         """Start all services"""
         try:
-            # Initialize WebSocket server
-            self.ws_server = ChatWebSocketServer()
-            await self.ws_server.start()
+            logger.info("Starting StreamOrchestrator services...")
+            
+            # Initialize WebSocket server with self reference
+            self.ws_server = ChatWebSocketServer(orchestrator=self)
+            runner = await self.ws_server.start()
+            logger.info("WebSocket server started")
             
             # Initialize RinAgent and create a session
             await self.agent.initialize()
