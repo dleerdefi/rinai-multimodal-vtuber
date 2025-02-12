@@ -27,16 +27,33 @@ class TimeTool(BaseTool):
         self.geolocator = Nominatim(user_agent="time_bot")
         self.llm_service = LLMService()
         
+    async def run(self, input_data: Any) -> Dict[str, Any]:
+        """Main execution method"""
+        return await self.execute(input_data)
+
+    def can_handle(self, input_data: Any) -> bool:
+        """Check if input can be handled by time tool"""
+        return isinstance(input_data, (dict, TimeToolParameters))
+
     async def execute(self, command: Dict) -> Dict:
         """Execute time command with standardized parameters"""
         try:
+            if not isinstance(command, dict):
+                return {
+                    "status": "error",
+                    "error": "Invalid input format",
+                    "timestamp": datetime.utcnow().isoformat()
+                }
+
             action = command.get("action")
+            result = None
+            
             if action == "get_time":
-                return await self.get_current_time_in_zone(
+                result = await self.get_current_time_in_zone(
                     command.get("timezone")
                 )
             elif action == "convert_time":
-                return await self.convert_time_between_zones(
+                result = await self.convert_time_between_zones(
                     from_zone=command.get("source_timezone"),
                     date_time=command.get("source_time"),
                     to_zone=command.get("timezone")
@@ -44,48 +61,28 @@ class TimeTool(BaseTool):
             else:
                 return {
                     "status": "error",
-                    "error": f"Unknown action: {action}",
+                    "response": f"Unknown action: {action}",
+                    "requires_tts": True,
                     "timestamp": datetime.utcnow().isoformat()
                 }
+
+            # Format the response to match orchestrator's expectations
+            return {
+                "status": "success",
+                "response": self._format_time_response(result),
+                "requires_tts": True,  # Since we have emojis
+                "data": result,
+                "timestamp": datetime.utcnow().isoformat()
+            }
+
         except Exception as e:
             logger.error(f"Error executing time command: {e}")
             return {
                 "status": "error",
-                "error": str(e),
+                "response": f"Error: {str(e)}",
+                "requires_tts": True,
                 "timestamp": datetime.utcnow().isoformat()
             }
-
-    async def run(self, input_data: Any) -> Dict[str, Any]:
-        """Required implementation of BaseTool's abstract run method"""
-        try:
-            if isinstance(input_data, dict):
-                result = await self.execute(input_data)
-                # Wrap response in AgentResult
-                return AgentResult(
-                    response=self._format_time_response(result),
-                    data=result
-                ).dict()
-            return AgentResult(
-                response="Invalid input format",
-                data={
-                    "status": "error",
-                    "error": "Invalid input format",
-                    "timestamp": datetime.utcnow().isoformat()
-                }
-            ).dict()
-        except Exception as e:
-            return AgentResult(
-                response=f"Error: {str(e)}",
-                data={
-                    "status": "error",
-                    "error": str(e),
-                    "timestamp": datetime.utcnow().isoformat()
-                }
-            ).dict()
-
-    def can_handle(self, input_data: Any) -> bool:
-        """Check if input can be handled by time tool"""
-        return isinstance(input_data, (dict, TimeToolParameters))
 
     async def get_current_time_in_zone(self, location_or_timezone: str) -> Dict:
         """Get current time for a location or timezone"""
@@ -95,7 +92,9 @@ class TimeTool(BaseTool):
             if not timezone:
                 return {
                     "status": "error",
-                    "message": f"Could not determine timezone for: {location_or_timezone}"
+                    "response": f"Could not determine timezone for: {location_or_timezone}",
+                    "requires_tts": True,
+                    "timestamp": datetime.utcnow().isoformat()
                 }
 
             # Try cache first
@@ -108,10 +107,12 @@ class TimeTool(BaseTool):
             if not data:
                 return {
                     "status": "error",
-                    "message": "Failed to fetch time data"
+                    "response": "Failed to fetch time data",
+                    "requires_tts": True,
+                    "timestamp": datetime.utcnow().isoformat()
                 }
-            
-            return {
+
+            result = {
                 "status": "success",
                 "location": location_or_timezone,
                 "timezone": timezone,
@@ -119,12 +120,22 @@ class TimeTool(BaseTool):
                 "day_of_week": data.get("dayOfWeek"),
                 "dst_active": data.get("dstActive")
             }
+            
+            return {
+                "status": "success",
+                "response": self._format_time_response(result),
+                "requires_tts": True,
+                "data": result,
+                "timestamp": datetime.utcnow().isoformat()
+            }
 
         except Exception as e:
             logger.error(f"Error getting current time: {e}")
             return {
                 "status": "error",
-                "message": str(e)
+                "response": f"Error: {str(e)}",
+                "requires_tts": True,
+                "timestamp": datetime.utcnow().isoformat()
             }
 
     async def convert_time_between_zones(
@@ -142,7 +153,9 @@ class TimeTool(BaseTool):
             if not from_timezone or not to_timezone:
                 return {
                     "status": "error",
-                    "message": "Could not resolve one or both timezones"
+                    "response": "Could not resolve one or both timezones",
+                    "requires_tts": True,
+                    "timestamp": datetime.utcnow().isoformat()
                 }
 
             # Parse the input time
@@ -150,7 +163,9 @@ class TimeTool(BaseTool):
             if not parsed_time:
                 return {
                     "status": "error",
-                    "message": f"Could not parse time format: {date_time}"
+                    "response": f"Could not parse time format: {date_time}",
+                    "requires_tts": True,
+                    "timestamp": datetime.utcnow().isoformat()
                 }
 
             data = await self.client.convert_time_zone(
@@ -158,8 +173,8 @@ class TimeTool(BaseTool):
                 date_time=parsed_time.isoformat(),
                 to_zone=to_timezone
             )
-            
-            return {
+
+            result = {
                 "status": "success",
                 "from_location": from_zone,
                 "to_location": to_zone,
@@ -168,12 +183,22 @@ class TimeTool(BaseTool):
                 "from_timezone": from_timezone,
                 "to_timezone": to_timezone
             }
+            
+            return {
+                "status": "success",
+                "response": self._format_time_response(result),
+                "requires_tts": True,
+                "data": result,
+                "timestamp": datetime.utcnow().isoformat()
+            }
 
         except Exception as e:
             logger.error(f"Error converting time: {e}")
             return {
                 "status": "error",
-                "message": str(e)
+                "response": f"Error: {str(e)}",
+                "requires_tts": True,
+                "timestamp": datetime.utcnow().isoformat()
             }
 
     async def _resolve_timezone(self, location_or_timezone: str) -> Optional[str]:
@@ -302,13 +327,13 @@ class TimeTool(BaseTool):
             return None
 
     def _format_time_response(self, result: Dict) -> str:
-        """Format time data into human readable response"""
+        """Format time data into human readable response with emojis"""
         if result.get("status") == "error":
             return f"Sorry, {result.get('message', 'an error occurred')}"
             
         if "current_time" in result:
-            return f"The current time in {result['location']} is {result['current_time']}"
+            return f"🕐 The current time in {result['location']} is {result['current_time']}"
         elif "converted_time" in result:
-            return f"When it's {result['from_time']} in {result['from_location']}, it's {result['converted_time']} in {result['to_location']}"
+            return f"🕐 When it's {result['from_time']} in {result['from_location']}, it's {result['converted_time']} in {result['to_location']}"
         
         return "I couldn't process that time request"

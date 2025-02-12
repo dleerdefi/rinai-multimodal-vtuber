@@ -73,23 +73,6 @@ class WeatherTool(BaseTool):
                 "timestamp": datetime.utcnow().isoformat()
             }
 
-    def _clean_location(self, location: str) -> str:
-        """Clean location string from query"""
-        # Remove common weather-related words
-        clean_words = [
-            "weather", "in", "at", "for", "of", "the", 
-            "forecast", "temperature", "current", "conditions"
-        ]
-        
-        # Convert to lowercase and split into words
-        words = location.lower().split()
-        
-        # Remove weather-related words
-        location_words = [word for word in words if word not in clean_words]
-        
-        # Join remaining words back together
-        return " ".join(location_words).title()
-
     async def _analyze_weather_query(self, query: str) -> Dict:
         """Use LLM to analyze weather query for location and time intent"""
         try:

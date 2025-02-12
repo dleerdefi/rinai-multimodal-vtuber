@@ -27,6 +27,14 @@ class CryptoTool(BaseTool):
         if self.coingecko:
             await self.coingecko.__aexit__(None, None, None)
 
+    async def run(self, input_data: Any) -> Dict[str, Any]:
+        """Main execution method"""
+        return await self._get_crypto_data(input_data)
+
+    def can_handle(self, input_data: Any) -> bool:
+        """Delegate to TriggerDetector"""
+        return isinstance(input_data, str)  # Basic type check only
+
     async def execute(self, command: str) -> Dict:
         """Execute crypto data command"""
         try:
@@ -195,11 +203,3 @@ class CryptoTool(BaseTool):
         except Exception as e:
             logger.error(f"Error formatting crypto response: {e}")
             return str(data)  # Fallback to basic string representation
-
-    def can_handle(self, input_data: Any) -> bool:
-        """Delegate to TriggerDetector"""
-        return isinstance(input_data, str)  # Basic type check only
-
-    async def run(self, input_data: Any) -> Dict[str, Any]:
-        """Main execution method"""
-        return await self._get_crypto_data(input_data)
