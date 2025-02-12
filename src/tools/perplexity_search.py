@@ -50,7 +50,7 @@ class PerplexityTool(BaseTool):
         return await self.search(input_data)
 
     async def search(self, query: str, max_tokens: int = 300) -> Dict:
-        """Execute search query"""
+        """Execute search query with specified parameters"""
         try:
             if not self.perplexity:
                 return {

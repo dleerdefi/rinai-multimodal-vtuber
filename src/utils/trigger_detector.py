@@ -95,6 +95,30 @@ class TriggerDetector:
             ]
         }
 
+        # Time Tool Triggers
+        self.tool_triggers['time'] = {
+            'keywords': [
+                'time', 'clock', 'timezone', 'tz', 'hour', 'date', 'schedule',
+                'convert time', 'what time', 'current time'
+            ],
+            'phrases': [
+                'what time is it', 'show me the time', 'current time in',
+                'convert time from', 'time difference between'
+            ]
+        }
+
+        # Weather Tool Triggers
+        self.tool_triggers['weather'] = {
+            'keywords': [
+                'weather', 'temperature', 'forecast', 'rain', 'snow', 'humidity',
+                'wind', 'precipitation', 'sunny', 'cloudy'
+            ],
+            'phrases': [
+                'what\'s the weather', 'how\'s the weather', 'weather forecast',
+                'is it going to rain', 'temperature in'
+            ]
+        }
+
     def should_use_tools(self, message: str) -> bool:
         """Check if message should trigger tool usage"""
         message = message.lower()
@@ -179,6 +203,15 @@ class TriggerDetector:
     def get_specific_tool_type(self, message: str) -> Optional[str]:
         """Determine specific tool type needed"""
         message = message.lower()
+        
+        # Add time and weather checks
+        if any(keyword.lower() in message for keyword in self.tool_triggers['time']['keywords']) or \
+           any(phrase.lower() in message for phrase in self.tool_triggers['time']['phrases']):
+            return "time_tools"
+        
+        if any(keyword.lower() in message for keyword in self.tool_triggers['weather']['keywords']) or \
+           any(phrase.lower() in message for phrase in self.tool_triggers['weather']['phrases']):
+            return "weather_tools"
         
         # Check crypto triggers
         if any(keyword.lower() in message for keyword in self.tool_triggers['crypto']['keywords']) or \

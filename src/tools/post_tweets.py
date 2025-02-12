@@ -210,6 +210,7 @@ Example response format:
             )
 
             # Generate tweets using existing logic
+            # TODO: Add perplexity search call to enrich contents for tweet generation.
             response = await self.llm_service.get_response(
                 prompt=[
                     {
@@ -574,7 +575,7 @@ Requirements:
                             # Update the tweet's metadata separately
                             await db.update_tweet_status(
                                 tweet_id=tweet_id,
-                                status=TweetStatus.PENDING,
+                                status=TweetStatus.PENDING.value,
                                 metadata={
                                     "original_request": original_request,
                                     "tone": tone,

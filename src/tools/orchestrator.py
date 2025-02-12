@@ -12,13 +12,19 @@ from src.tools.base import (
     AgentResult, 
     AgentDependencies,
     ToolCommand,
-    CommandAnalysis  # Needed for _analyze_command return type
+    CommandAnalysis,
+    TimeToolParameters,
+    WeatherToolParameters,
+    CryptoToolParameters,
+    SearchToolParameters
 )
 
 # Tool imports
 from src.tools.crypto_data import CryptoTool
 from src.tools.post_tweets import TweetTool
 from src.tools.perplexity_search import PerplexityTool
+from src.tools.time_tools import TimeTool
+from src.tools.weather_tools import WeatherTool
 
 # Client imports
 from src.clients.coingecko_client import CoinGeckoClient
@@ -33,7 +39,10 @@ from src.db.mongo_manager import MongoManager
 
 # Utility imports
 from src.utils.trigger_detector import TriggerDetector
-from src.utils.json_parser import parse_strict_json
+from src.utils.json_parser import parse_strict_json, extract_json
+
+# Prompt imports
+from src.prompts.tool_prompts import ToolPrompts
 
 load_dotenv()
 logger = logging.getLogger(__name__)
@@ -65,11 +74,17 @@ class Orchestrator:
             deps=self.deps  # Pass deps immediately
         )
         
+        # Add new tools
+        self.time_tool = TimeTool()
+        self.weather_tool = WeatherTool()
+        
         # Store tools in a dictionary for easy access
         self.tools = {
+            "twitter": self.tweet_tool,
             "crypto_data": self.crypto_tool,
             "perplexity_search": self.perplexity_tool,
-            "twitter": self.tweet_tool
+            "time_tools": self.time_tool,
+            "weather_tools": self.weather_tool
         }
         
     async def initialize(self):
@@ -114,7 +129,7 @@ class Orchestrator:
             if not tool_type:
                 tool_type = trigger_detector.get_specific_tool_type(command)
             
-            if tool_type in ["crypto_data", "perplexity_search"]:
+            if tool_type in ["crypto_data", "perplexity_search", "time_tools", "weather_tools"]:
                 logger.info(f"Processing direct tool request: {tool_type}")
                 analysis = await self._analyze_command(command)
                 if analysis and analysis.tools_needed:
@@ -180,114 +195,96 @@ class Orchestrator:
                 data={"error": str(e)}
             )
             
-    # This is kind of redundant now that we have the trigger detector...    
-    async def _analyze_command(self, command: str) -> Optional[CommandAnalysis]: 
+    async def _analyze_command(self, command: str) -> Optional[CommandAnalysis]:
         """Analyze command to determine required tools"""
         try:
             # Check if this is a Twitter command using TriggerDetector
             trigger_detector = TriggerDetector()
+            
+            # Check for Twitter commands first (maintain existing Twitter flow)
             if trigger_detector.should_use_twitter(command):
-                # Use specialized Twitter analysis
+                logger.info("Processing as Twitter command")
                 return await self.tweet_tool._analyze_twitter_command(command)
             
-            prompt = f"""You are a tool orchestrator that carefully analyzes commands to determine if special tools are required.
-DEFAULT BEHAVIOR: Most commands should return an empty tools array - tools are only used in specific cases.
+            # Get tool type if not already determined
+            tool_type = trigger_detector.get_specific_tool_type(command)
+            logger.debug(f"Tool type detected: {tool_type}")
+            
+            if not tool_type:
+                return CommandAnalysis(
+                    tools_needed=[],
+                    reasoning="No specific tool type detected"
+                )
 
-Command: "{command}"
+            # For perplexity search, we can directly create the command analysis
+            if tool_type == "perplexity_search":
+                logger.info("Creating direct perplexity search command")
+                return CommandAnalysis(
+                    tools_needed=[
+                        ToolCommand(
+                            tool_name="perplexity_search",
+                            action="search",
+                            parameters={
+                                "query": command,
+                                "max_tokens": 300
+                            },
+                            priority=1
+                        )
+                    ],
+                    reasoning="Query requires current information from web search"
+                )
 
-Available tools (use ONLY when specifically needed):
-1. crypto_data: ONLY use when explicitly asking about cryptocurrency prices or market data
-   Example: "What's Bitcoin's price?" or "Show me ETH market data"
-   
-2. perplexity_search: ONLY use for queries requiring current events or real-time information
-   Example: "What happened at the latest Fed meeting?" or "What are today's top AI developments?"
+            # For other tools, use LLM analysis
+            messages = []
+            if tool_type == "time_tools":
+                formatted_prompt = ToolPrompts.TIME_TOOL.format(command=command)
+                messages = [
+                    {"role": "system", "content": formatted_prompt}
+                ]
+            elif tool_type == "weather_tools":
+                formatted_prompt = ToolPrompts.WEATHER_TOOL.format(command=command)
+                messages = [
+                    {"role": "system", "content": formatted_prompt}
+                ]
+            elif tool_type == "crypto_data":
+                formatted_prompt = ToolPrompts.CRYPTO_TOOL.format(command=command)
+                messages = [
+                    {"role": "system", "content": formatted_prompt}
+                ]
 
-Instructions:
-- Default response should be empty tools array unless command CLEARLY requires a tool
-- For most general conversation, return empty tools array
-- Only use crypto_data for explicit cryptocurrency price/market requests
-- Only use perplexity_search for queries needing current/real-time information
-- Respond with valid JSON only
+            if not messages:
+                logger.warning(f"No prompt found for tool type: {tool_type}")
+                return CommandAnalysis(
+                    tools_needed=[],
+                    reasoning=f"No prompt available for {tool_type}"
+                )
 
-Example responses:
-
-For general chat (MOST COMMON):
-{{
-    "tools_needed": [],
-    "reasoning": "No special tools required for general conversation"
-}}
-
-For crypto price request:
-{{
-    "tools_needed": [
-        {{
-            "tool_name": "crypto_data",
-            "action": "get_price",
-            "parameters": {{"symbol": "BTC"}},
-            "priority": 1
-        }}
-    ],
-    "reasoning": "Explicit request for cryptocurrency price data"
-}}
-
-For current events:
-{{
-    "tools_needed": [
-        {{
-            "tool_name": "perplexity_search",
-            "action": "search",
-            "parameters": {{"query": "latest Fed meeting results"}},
-            "priority": 1
-        }}
-    ],
-    "reasoning": "Query demands current real-time information from the web"
-}}"""
-
-            messages = [
-                {
-                    "role": "system",
-                    "content": "You are a conservative tool orchestrator. Default to using NO tools unless explicitly required."
-                },
-                {
-                    "role": "user",
-                    "content": prompt
-                }
-            ]
-
+            # Get LLM response
             response = await self.llm_service.get_response(
                 prompt=messages,
                 model_type=ModelType.GROQ_LLAMA_3_3_70B,
                 override_config={
                     "temperature": 0.1,
-                    "max_tokens": 500
+                    "max_tokens": 300
                 }
             )
             
-            try:
-                data = parse_strict_json(response, CommandAnalysis)
-                if data:
-                    return data
-                else:
-                    logger.debug("No tools needed - returning empty analysis")
-                    return CommandAnalysis(
-                        tools_needed=[],
-                        reasoning="No special tools required"
-                    )
+            logger.debug(f"LLM Analysis Response: {response}")
+
+            # For crypto, parse directly to CommandAnalysis
+            data = parse_strict_json(response, CommandAnalysis)
+            if data:
+                return data
                 
-            except (json.JSONDecodeError, ValidationError) as e:
-                logger.error(f"Failed to parse LLM response: {response}")
-                logger.error(f"Parse error: {str(e)}")
-                return CommandAnalysis(
-                    tools_needed=[],
-                    reasoning="Failed to parse response, defaulting to no tools"
-                )
-            
-        except Exception as e:
-            logger.error(f"Error analyzing command: {e}", exc_info=True)
+            logger.debug("No tools needed - returning empty analysis")
             return CommandAnalysis(
                 tools_needed=[],
-                reasoning="Error during analysis, defaulting to no tools"
+                reasoning="No special tools required"
             )
+
+        except Exception as e:
+            logger.error(f"Error analyzing command: {e}", exc_info=True)
+            return None
             
     async def _execute_tools(self, tools: List[ToolCommand]) -> Dict:
         """Execute tools in parallel based on priority"""
@@ -363,6 +360,22 @@ For current events:
                                 symbol=tool.parameters.get("symbol", "").upper(),
                                 include_details=tool.parameters.get("include_details", False)
                             ))
+                        elif tool.tool_name == "time_tools":
+                            if tool.action == "get_time":
+                                tasks.append(tool_instance.get_current_time_in_zone(
+                                    tool.parameters.get("timezone")
+                                ))
+                            elif tool.action == "convert_time":
+                                tasks.append(tool_instance.convert_time_between_zones(
+                                    from_timezone=tool.parameters.get("source_timezone"),
+                                    date_time=tool.parameters.get("source_time"),
+                                    to_timezone=tool.parameters.get("timezone")
+                                ))
+                        elif tool.tool_name == "weather_tools":
+                            tasks.append(tool_instance.get_weather_data(
+                                location=tool.parameters.get("location"),
+                                units=tool.parameters.get("units", "metric")
+                            ))
                     else:
                         results[tool.tool_name] = {
                             "status": "error",
@@ -433,17 +446,23 @@ For current events:
             
             # Handle dictionary of tool results
             for tool_name, result in results.items():
-                # Handle TTS responses from tools
                 if isinstance(result, dict):
-                    if result.get("requires_tts"):
+                    # First check if it's a direct response with requires_tts
+                    if result.get("requires_tts") and result.get("response"):
                         logger.info(f"Found TTS response from {tool_name}")
                         return result["response"]
-                    elif result.get("response"):
-                        logger.info(f"Found regular response from {tool_name}")
-                        response.append(result["response"])
+                    
+                    # Then check if it's a success with data
                     elif result.get("status") == "success":
+                        logger.info(f"Found success response from {tool_name}")
                         if "data" in result:
                             response.append(self._format_tool_data(tool_name, result["data"]))
+                    
+                    # Finally check for direct response
+                    elif result.get("response"):
+                        logger.info(f"Found direct response from {tool_name}")
+                        response.append(result["response"])
+                        
                 else:
                     logger.warning(f"Unexpected result format from {tool_name}: {result}")
                     
@@ -460,6 +479,16 @@ For current events:
             if tool:
                 return tool._format_crypto_response(data)
             return f"Crypto data: {data}"  # Fallback if tool not available
+        elif tool_name.startswith("weather"):
+            tool = self.tools.get("weather_tools")
+            if tool:
+                return tool._format_weather_response(data)
+            return f"Weather data: {data}"
+        elif tool_name.startswith("time"):
+            tool = self.tools.get("time_tools")
+            if tool:
+                return tool._format_time_response(data)
+            return f"Time data: {data}"
         elif tool_name.startswith("tweet"):
             return f"Tweet tool response: {data}"
         else:

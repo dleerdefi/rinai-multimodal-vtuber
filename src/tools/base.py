@@ -1,5 +1,5 @@
 from abc import ABC, abstractmethod
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Optional, Literal
 import asyncio
 from datetime import datetime
 from pydantic import BaseModel, Field
@@ -89,7 +89,33 @@ class TweetGenerationResponse(BaseModel):
     """Model for LLM tweet generation response"""
     tweets: List[TweetContent] = Field(description="List of generated tweets")
 
-# TODO: Add weather tool parameters
-# class WeatherToolParameters(BaseModel):
-#     """Parameters for the weather tool function call."""
-#     location: str = Field(..., description="City or place name. E.g., 'Berlin' or 'New York'.")
+class TimeToolParameters(BaseModel):
+    """Parameters for time tool operations"""
+    timezone: str = Field(description="IANA timezone string (e.g., 'America/New_York')")
+    action: Literal["get_time", "convert_time"] = Field(description="Time operation to perform")
+    source_time: Optional[str] = Field(None, description="Source time for conversion")
+    source_timezone: Optional[str] = Field(None, description="Source timezone for conversion")
+
+class WeatherToolParameters(BaseModel):
+    """Parameters for weather tool operations"""
+    location: str = Field(description="Location to get weather for")
+    units: Literal["metric", "imperial"] = Field(
+        default="metric",
+        description="Units system to use"
+    )
+
+class CryptoToolParameters(BaseModel):
+    """Parameters for crypto tool operations"""
+    symbol: str = Field(description="Cryptocurrency symbol (e.g., BTC, ETH)")
+    include_details: bool = Field(
+        default=False,
+        description="Whether to include detailed metrics"
+    )
+
+class SearchToolParameters(BaseModel):
+    """Parameters for search tool operations"""
+    query: str = Field(description="Search query string")
+    max_tokens: int = Field(
+        default=300,
+        description="Maximum response length"
+    )
