@@ -92,3 +92,4 @@ config.local.json
 weather_cache.sqlite
 
 credentials.json
+token.pickle
