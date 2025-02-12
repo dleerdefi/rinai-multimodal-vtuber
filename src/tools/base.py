@@ -1,7 +1,7 @@
 from abc import ABC, abstractmethod
 from typing import Dict, Any, List, Optional, Literal
 import asyncio
-from datetime import datetime
+from datetime import datetime, timedelta
 from pydantic import BaseModel, Field
 
 class BaseTool(ABC):
@@ -118,4 +118,21 @@ class SearchToolParameters(BaseModel):
     max_tokens: int = Field(
         default=300,
         description="Maximum response length"
+    )
+
+class CalendarToolParameters(BaseModel):
+    """Parameters for calendar tool operations"""
+    max_events: int = Field(
+        default=5,
+        ge=1,
+        le=20,
+        description="Maximum number of events to fetch"
+    )
+    time_min: Optional[str] = Field(
+        default=None,
+        description="Start time for event fetch (ISO format)"
+    )
+    time_max: Optional[str] = Field(
+        default=None,
+        description="End time for event fetch (ISO format)"
     )

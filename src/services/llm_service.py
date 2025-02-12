@@ -35,7 +35,7 @@ class ModelType(Enum):
     GROQ_LLAMA_3_2_70B = "llama2-70b-preview-8k" 
     GROQ_LLAMA_3_3_70B = "llama-3.3-70b-versatile"  
     # Atoma Models
-    ATOMA_LLAMA_3_3_70B = "meta-llama/Llama-3.3-70B-Instruct"  # Atoma Supported Model
+    ATOMA_LLAMA_3_3_70B = "meta-llama/Llama-3.3-70B-Instruct"
 
 class LLMProvider(Enum):
     OPENAI = "openai"
@@ -135,11 +135,6 @@ class LLMService:
                 "default": {
                     "temperature": 0.88,
                     "top_p": 0.9,
-                    "min_p": 0.05,
-                    "top_k": 50,
-                    "presence_penalty": 0.3,
-                    "frequency_penalty": 0.3,
-                    "repetition_penalty": 1.1,
                     "max_tokens": 300,
                     "stream": False,
                     "response_format": {"type": "text"}
@@ -164,8 +159,8 @@ class LLMService:
             },
             ModelType.GROQ_LLAMA_3_3_70B: {
                 "default": {
-                    "temperature": 0.1,  # Low for classification
-                    "max_tokens": 50,    # Short responses for classification
+                    "temperature": 0.88,  # Low for classification
+                    "max_tokens": 500,    # Short responses for classification
                     "top_p": 0.9
                 }
             },
@@ -298,7 +293,7 @@ class LLMService:
                         for msg in user_messages  # Only pass non-system messages
                     ],
                     temperature=config.get('temperature', 0.7),
-                    max_tokens=config.get('max_tokens', 800)
+                    max_tokens=config.get('max_tokens', 500)
                 )
                 
                 print("\nClaude API call successful!")
@@ -339,19 +334,11 @@ class LLMService:
         try:
             # Reset conversation if there are errors
             if isinstance(messages, list):
-                # Keep only system message and latest user message
                 system_msg = next((msg for msg in messages if msg['role'] == 'system'), None)
                 user_msg = next((msg for msg in reversed(messages) if msg['role'] == 'user'), None)
                 
                 if system_msg and user_msg:
                     messages = [system_msg, user_msg]
-                
-            # Create minimal config
-            api_config = {
-                'temperature': 0.88,
-                'max_tokens': 300,
-                'stream': True
-            }
             
             # Create client
             client = OpenAI(
@@ -360,12 +347,12 @@ class LLMService:
             )
             
             logger.debug(f"Sending request with {len(messages)} messages")
-            logger.debug(f"Config: {api_config}")
+            logger.debug(f"Using config: {config}")
             
             completion = client.chat.completions.create(
                 model=model_type.value,
                 messages=messages,
-                **api_config
+                **config  # Use the passed config which comes from model_configs
             )
             
             return completion.choices[0].message.content
@@ -463,112 +450,6 @@ class LLMService:
             
         return validated_messages
 
-    async def _get_novita_response(self, messages: str | list, model_type: ModelType, config: Dict) -> str:
-        try:
-            # Reset conversation if there are errors
-            if isinstance(messages, list):
-                # Keep only system message and latest user message
-                system_msg = next((msg for msg in messages if msg['role'] == 'system'), None)
-                user_msg = next((msg for msg in reversed(messages) if msg['role'] == 'user'), None)
-                
-                if system_msg and user_msg:
-                    messages = [system_msg, user_msg]
-                
-            # Create minimal config
-            api_config = {
-                'temperature': config.get('temperature', 0.88),
-                'max_tokens': config.get('max_tokens', 300),
-                'stream': False
-            }
-            
-            # Create client
-            client = OpenAI(
-                base_url="https://api.novita.ai/v3/openai",
-                api_key=self.novita_api_key
-            )
-            
-            logger.debug(f"Sending request with {len(messages)} messages")
-            logger.debug(f"Config: {api_config}")
-            
-            completion = client.chat.completions.create(
-                model=model_type.value,
-                messages=messages,
-                **api_config
-            )
-            
-            return completion.choices[0].message.content
-
-        except Exception as e:
-            logger.error(f"Error in Novita response: {str(e)}", exc_info=True)
-            return f"API Error: {str(e)}"
-
-    def _prepare_novita_messages(self, prompt: str | list) -> list:
-        if isinstance(prompt, str):
-            return [
-                {
-                    "role": "system",
-                    "content": "You are a helpful AI assistant that creates engaging Twitter content. Keep responses concise and suitable for Twitter's format."
-                },
-                {
-                    "role": "user",
-                    "content": prompt
-                }
-            ]
-        elif isinstance(prompt, list):
-            # Ensure messages are in the correct format
-            formatted_messages = []
-            for msg in prompt:
-                if isinstance(msg, dict) and 'role' in msg and 'content' in msg:
-                    if msg['role'] in ['system', 'user', 'assistant']:
-                        formatted_messages.append(msg)
-            return formatted_messages
-        return prompt
-    
-    async def _get_groq_response(self, messages: str | list, model_type: ModelType, config: Dict) -> str:
-        """Handle Groq API requests"""
-        try:
-            client = AsyncGroq(api_key=self.groq_api_key)
-            formatted_messages = self._prepare_groq_messages(messages)
-            
-            model_config = self.model_configs[model_type]["default"].copy()
-            model_config.update(config)
-            
-            logger.debug(f"Sending request to Groq {model_type.value}")
-            
-            completion = await client.chat.completions.create(
-                model=model_type.value,
-                messages=formatted_messages,
-                **model_config
-            )
-            
-            return completion.choices[0].message.content
-
-        except Exception as e:
-            logger.error(f"Error in Groq response: {str(e)}", exc_info=True)
-            raise
-        
-    def _prepare_groq_messages(self, messages: str | list) -> list:
-        """Format messages for Groq API"""
-        if isinstance(messages, str):
-            return [
-                {
-                    "role": "system",
-                    "content": "You are a classifier. Given a user query, determine if it requires cryptocurrency price checking or internet search. Respond with EXACTLY one word: either 'CRYPTO' or 'SEARCH'. Nothing else."
-                },
-                {
-                    "role": "user",
-                    "content": messages
-                }
-            ]
-        elif isinstance(messages, list):
-            formatted_messages = []
-            for msg in messages:
-                if isinstance(msg, dict) and 'role' in msg and 'content' in msg:
-                    if msg['role'] in ['system', 'user', 'assistant']:
-                        formatted_messages.append(msg)
-            return formatted_messages
-        return messages
-
     def _prepare_atoma_messages(self, prompt: str | list) -> list:
         """Format messages for Atoma API"""
         if isinstance(prompt, str):
@@ -623,3 +504,48 @@ class LLMService:
         except Exception as e:
             logger.error(f"Error in Atoma response: {str(e)}", exc_info=True)
             raise
+
+    async def _get_groq_response(self, messages: str | list, model_type: ModelType, config: Dict) -> str:
+        """Handle Groq API requests"""
+        try:
+            client = AsyncGroq(api_key=self.groq_api_key)
+            formatted_messages = self._prepare_groq_messages(messages)
+            
+            model_config = self.model_configs[model_type]["default"].copy()
+            model_config.update(config)
+            
+            logger.debug(f"Sending request to Groq {model_type.value}")
+            
+            completion = await client.chat.completions.create(
+                model=model_type.value,
+                messages=formatted_messages,
+                **model_config
+            )
+            
+            return completion.choices[0].message.content
+
+        except Exception as e:
+            logger.error(f"Error in Groq response: {str(e)}", exc_info=True)
+            raise
+        
+    def _prepare_groq_messages(self, messages: str | list) -> list:
+        """Format messages for Groq API"""
+        if isinstance(messages, str):
+            return [
+                {
+                    "role": "system",
+                    "content": "You are a classifier. Given a user query, determine if it requires cryptocurrency price checking or internet search. Respond with EXACTLY one word: either 'CRYPTO' or 'SEARCH'. Nothing else."
+                },
+                {
+                    "role": "user",
+                    "content": messages
+                }
+            ]
+        elif isinstance(messages, list):
+            formatted_messages = []
+            for msg in messages:
+                if isinstance(msg, dict) and 'role' in msg and 'content' in msg:
+                    if msg['role'] in ['system', 'user', 'assistant']:
+                        formatted_messages.append(msg)
+            return formatted_messages
+        return messages

@@ -90,3 +90,5 @@ config.local.json
 .sqlite3
 
 weather_cache.sqlite
+
+credentials.json

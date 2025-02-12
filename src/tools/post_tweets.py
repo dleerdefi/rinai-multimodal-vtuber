@@ -146,7 +146,7 @@ Example response format:
                 model_type=ModelType.GROQ_LLAMA_3_3_70B,
                 override_config={
                     "temperature": 0.1,
-                    "max_tokens": 200
+                    "max_tokens": 150
                 }
             )
 
@@ -225,6 +225,7 @@ Requirements:
 - {'Each tweet must be' if count > 1 else 'Must be'} under 280 characters
 - Maintain a {tone} tone
 - Be engaging and natural
+- No hashtags
 - Return as JSON: {{"tweets": [{{"content": "tweet text"}}]}}"""
                     }
                 ],
@@ -445,7 +446,7 @@ Requirements:
                 )
                 return {
                     "status": "cancelled",
-                    "response": "I've stopped the tweet process. Let me know if you need anything else!",
+                    "response": "I've stopped the tweet process.",
                     "requires_tts": True
                 }
 

@@ -16,7 +16,8 @@ from src.tools.base import (
     TimeToolParameters,
     WeatherToolParameters,
     CryptoToolParameters,
-    SearchToolParameters
+    SearchToolParameters,
+    CalendarToolParameters
 )
 
 # Tool imports
@@ -25,10 +26,12 @@ from src.tools.post_tweets import TweetTool
 from src.tools.perplexity_search import PerplexityTool
 from src.tools.time_tools import TimeTool
 from src.tools.weather_tools import WeatherTool
+from src.tools.calendar_tool import CalendarTool
 
 # Client imports
 from src.clients.coingecko_client import CoinGeckoClient
 from src.clients.perplexity_client import PerplexityClient
+from src.clients.google_calendar_client import GoogleCalendarClient
 
 # Service imports
 from src.services.llm_service import LLMService, ModelType
@@ -71,10 +74,14 @@ class Orchestrator:
         self.tweet_tool = TweetTool(
             tool_state_manager=self.tool_state_manager,
             llm_service=self.llm_service,
-            deps=self.deps  # Pass deps immediately
+            deps=self.deps
         )
         
-        # Add new tools
+        # Initialize calendar tool with client
+        calendar_client = self._init_calendar()
+        self.calendar_tool = CalendarTool(calendar_client=calendar_client)
+        
+        # Add other tools
         self.time_tool = TimeTool()
         self.weather_tool = WeatherTool()
         
@@ -84,7 +91,8 @@ class Orchestrator:
             "crypto_data": self.crypto_tool,
             "perplexity_search": self.perplexity_tool,
             "time_tools": self.time_tool,
-            "weather_tools": self.weather_tool
+            "weather_tools": self.weather_tool,
+            "calendar_tool": self.calendar_tool
         }
         
     async def initialize(self):
@@ -98,6 +106,10 @@ class Orchestrator:
             if hasattr(self.perplexity_tool, 'initialize'):
                 await self.perplexity_tool.initialize()
         
+        if self.calendar_tool:
+            if hasattr(self.calendar_tool, 'initialize'):
+                await self.calendar_tool.initialize()
+        
     async def cleanup(self):
         """Cleanup async resources"""
         if self.crypto_tool:
@@ -107,6 +119,10 @@ class Orchestrator:
         if self.perplexity_tool:
             if hasattr(self.perplexity_tool, 'cleanup'):
                 await self.perplexity_tool.cleanup()
+                
+        if self.calendar_tool:
+            if hasattr(self.calendar_tool, 'cleanup'):
+                await self.calendar_tool.cleanup()
         
     async def process_command(self, command: str, deps: Optional[AgentDependencies] = None, tool_type: Optional[str] = None) -> AgentResult:
         """Process a command and execute required tools
@@ -129,7 +145,7 @@ class Orchestrator:
             if not tool_type:
                 tool_type = trigger_detector.get_specific_tool_type(command)
             
-            if tool_type in ["crypto_data", "perplexity_search", "time_tools", "weather_tools"]:
+            if tool_type in ["crypto_data", "perplexity_search", "time_tools", "weather_tools", "calendar_tool"]:
                 logger.info(f"Processing direct tool request: {tool_type}")
                 analysis = await self._analyze_command(command)
                 if analysis and analysis.tools_needed:
@@ -251,6 +267,11 @@ class Orchestrator:
                 messages = [
                     {"role": "system", "content": formatted_prompt}
                 ]
+            elif tool_type == "calendar_tool":
+                formatted_prompt = ToolPrompts.CALENDAR_TOOL.format(command=command)
+                messages = [
+                    {"role": "system", "content": formatted_prompt}
+                ]
 
             if not messages:
                 logger.warning(f"No prompt found for tool type: {tool_type}")
@@ -350,7 +371,12 @@ class Orchestrator:
                     # For other tools, use the tool instances
                     tool_instance = self.tools.get(tool.tool_name)
                     if tool_instance:
-                        if tool.tool_name == "perplexity_search":
+                        if tool.tool_name == "calendar_tool":
+                            if tool.action == "get_schedule":
+                                tasks.append(tool_instance.get_schedule(
+                                    max_events=tool.parameters.get("max_events", 5)
+                                ))
+                        elif tool.tool_name == "perplexity_search":
                             tasks.append(tool_instance.search(
                                 query=tool.parameters.get("query", ""),
                                 max_tokens=tool.parameters.get("max_tokens", 300)
@@ -364,13 +390,13 @@ class Orchestrator:
                             if tool.action == "get_time":
                                 tasks.append(tool_instance.get_current_time_in_zone(
                                     tool.parameters.get("timezone")
-                                ))
-                            elif tool.action == "convert_time":
-                                tasks.append(tool_instance.convert_time_between_zones(
-                                    from_timezone=tool.parameters.get("source_timezone"),
-                                    date_time=tool.parameters.get("source_time"),
-                                    to_timezone=tool.parameters.get("timezone")
-                                ))
+                            ))
+                        elif tool.action == "convert_time":
+                            tasks.append(tool_instance.convert_time_between_zones(
+                                from_timezone=tool.parameters.get("source_timezone"),
+                                date_time=tool.parameters.get("source_time"),
+                                to_timezone=tool.parameters.get("timezone")
+                            ))
                         elif tool.tool_name == "weather_tools":
                             tasks.append(tool_instance.get_weather_data(
                                 location=tool.parameters.get("location"),
@@ -474,7 +500,12 @@ class Orchestrator:
             
     def _format_tool_data(self, tool_name: str, data: Any) -> str:
         """Format specific tool data into readable response"""
-        if tool_name.startswith("crypto"):
+        if tool_name.startswith("calendar"):
+            tool = self.tools.get("calendar_tool")
+            if tool:
+                return tool._format_calendar_response(data)
+            return f"Calendar data: {data}"
+        elif tool_name.startswith("crypto"):
             tool = self.tools.get("crypto_data")
             if tool:
                 return tool._format_crypto_response(data)
@@ -518,4 +549,13 @@ class Orchestrator:
             return PerplexityClient(api_key)
         except Exception as e:
             logger.warning(f"Failed to initialize Perplexity client: {e}")
+            return None
+
+    def _init_calendar(self) -> Optional[GoogleCalendarClient]:
+        """Initialize Google Calendar client if configured"""
+        try:
+            calendar_client = GoogleCalendarClient()
+            return calendar_client
+        except Exception as e:
+            logger.warning(f"Failed to initialize Google Calendar client: {e}")
             return None

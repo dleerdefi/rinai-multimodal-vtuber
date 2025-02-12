@@ -119,6 +119,20 @@ class TriggerDetector:
             ]
         }
 
+        # Calendar Tool Triggers
+        self.tool_triggers['calendar'] = {
+            'keywords': [
+                'calendar', 'schedule', 'event', 'appointment', 'meeting',
+                'agenda', 'upcoming', 'planned', 'booked', 'reminder'
+            ],
+            'phrases': [
+                'what\'s on my calendar', 'show my schedule', 'upcoming events',
+                'what do i have planned', 'check my calendar', 'what meetings do i have',
+                'show my appointments', 'what\'s next on my schedule',
+                'am i free', 'do i have any meetings'
+            ]
+        }
+
     def should_use_tools(self, message: str) -> bool:
         """Check if message should trigger tool usage"""
         message = message.lower()
@@ -222,5 +236,10 @@ class TriggerDetector:
         if any(keyword.lower() in message for keyword in self.tool_triggers['search']['keywords']) or \
            any(phrase.lower() in message for phrase in self.tool_triggers['search']['phrases']):
             return "perplexity_search"
+            
+        # Add calendar check
+        if any(keyword.lower() in message for keyword in self.tool_triggers['calendar']['keywords']) or \
+           any(phrase.lower() in message for phrase in self.tool_triggers['calendar']['phrases']):
+            return "calendar_tool"
             
         return None 

@@ -66,10 +66,10 @@ class RinAgent:
         self.orchestrator = Orchestrator()
         
         # Define models for different use cases
-        self.chat_model = ModelType.SAO_10K_L31_70B_EURYALE_V2_2 # For role-playing
-        self.decision_model = ModelType.GPT4_TURBO  # For analysis/decisions
+        self.chat_model = ModelType.GROQ_LLAMA_3_3_70B # For main conversation
         self.response_model = ModelType.CLAUDE_3_5_SONNET # For tool-based responses
-        
+        # add role playing model
+
         # Add ScheduleService initialization
         self.schedule_service = ScheduleService(mongo_uri)
         
@@ -397,6 +397,7 @@ RESPONSE GUIDELINES:
 - Only reference personality traits if naturally relevant
 - Match user's emotional tone and engagement level
 - Keep responses natural and contextual
+- If you are unable to answer the user's question, say so concisely (1-2 sentences)
 - Tool results are RARE and very valuable - use them to make your responses accurate and helpful
 <</SYS>>
 

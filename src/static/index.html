@@ -1,22 +1,28 @@
 <!DOCTYPE html>
 <html>
 <head>
-    <title>AI Chat Interface</title>
+    <title>RinAI</title>
     <style>
         body {
             background-color: #000;
             color: #33ff33;
             font-family: 'Courier New', monospace;
             margin: 0;
-            padding: 20px;
+            padding: 20px 20px 0 20px;  /* Remove bottom padding */
             overflow: hidden;
+            display: flex;           /* Add flex display */
+            flex-direction: column;  /* Stack children vertically */
+            height: 100vh;          /* Full viewport height */
         }
 
         #chat-container {
-            height: calc(100vh - 120px); /* Increased space for input */
-            overflow-y: auto;
+            flex: 1;                /* Take remaining space */
+            overflow-y: auto;       /* Enable scrolling */
             padding-right: 20px;
-            margin-bottom: 100px;  /* More space at bottom */
+            /* Increase bottom margin to account for input container height + padding */
+            margin-bottom: 120px;  /* Increased from 100px */
+            /* Add padding to top */
+            padding-top: 20px;
         }
 
         .message {
@@ -51,28 +57,33 @@
         /* Input container styles */
         #input-container {
             position: fixed;
-            bottom: 20px;
-            left: 20px;
-            right: 20px;
+            bottom: 0;
+            left: 0;
+            right: 0;
             background-color: #000;
-            padding: 10px 0;
-            display: flex;  /* Add flex display */
-            gap: 10px;     /* Space between input and button */
+            padding: 20px;
+            display: flex;
+            gap: 10px;
+            border-top: 1px solid #33ff33;
+            /* Add z-index to ensure it stays on top */
+            z-index: 1000;
+            /* Add box shadow for better separation */
+            box-shadow: 0 -5px 10px rgba(0, 0, 0, 0.5);
         }
         
         #chat-input {
             flex: 1;
-            min-height: 60px;     /* Taller input box */
-            padding: 10px;        /* More padding */
+            min-height: 60px;
+            padding: 10px;
             font-family: 'Courier New', monospace;
             font-size: 16px;
             background-color: #111;
             color: #33ff33;
             border: 1px solid #33ff33;
             outline: none;
-            resize: vertical;     /* Allow vertical resizing */
-            min-width: 200px;     /* Minimum width */
-            max-height: 200px;    /* Maximum height */
+            resize: vertical;
+            min-width: 200px;
+            max-height: 200px;
         }
         
         #send-button {
