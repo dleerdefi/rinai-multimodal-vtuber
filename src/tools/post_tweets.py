@@ -84,6 +84,12 @@ class TwitterTool(BaseTool):
                     items=generation_result["items"]
                 )
             else:
+                # Get current items for the operation
+                current_items = await self.db.tool_items.find({
+                    "tool_operation_id": str(operation['_id']),
+                    "state": ToolOperationState.APPROVING.value
+                }).to_list(None)
+
                 # Handle approval response through ApprovalManager
                 result = await self.approval_manager.process_approval_response(
                     message=input_data,
@@ -93,31 +99,24 @@ class TwitterTool(BaseTool):
                     handlers={
                         ApprovalAction.PARTIAL_APPROVAL.value: self._regenerate_rejected_tweets,
                         ApprovalAction.REGENERATE_ALL.value: self._regenerate_rejected_tweets,
-                        ApprovalAction.FULL_APPROVAL.value: self.approval_manager.handle_full_approval,
+                        ApprovalAction.FULL_APPROVAL.value: lambda tool_operation_id, session_id, analysis, **kwargs:
+                            self.approval_manager._handle_full_approval(
+                                tool_operation_id=tool_operation_id,
+                                session_id=session_id,
+                                items=current_items,  # Pass the current items
+                                analysis=analysis
+                            ),
                         ApprovalAction.EXIT.value: self.approval_manager.handle_exit
                     }
                 )
 
-                # Check if regeneration is needed
-                if result.get("regeneration_needed"):
-                    # Get topic from original operation
-                    topic = operation.get("input_data", {}).get("command_info", {}).get("topic")
-                    if not topic:
-                        raise ValueError("Could not find original topic for regeneration")
-
-                    # Generate new tweets
-                    generation_result = await self._generate_tweets(
-                        topic=topic,
-                        count=result["regenerate_count"],
-                        schedule_id=operation.get("input_data", {}).get("schedule_id"),
-                        tool_operation_id=str(operation['_id'])
-                    )
-                    
-                    # Start new approval flow for regenerated items
+                # If regeneration happened, start new approval flow with the generated items
+                if result.get("items"):  # Check for items from _regenerate_rejected_tweets
                     return await self.approval_manager.start_approval_flow(
                         session_id=self.deps.session_id,
                         tool_operation_id=str(operation['_id']),
-                        items=generation_result["items"]
+                        items=result["items"],
+                        analysis=result.get("analysis")
                     )
 
                 return result

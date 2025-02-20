@@ -239,6 +239,53 @@ async def test_analyze_twitter_command():
 @pytest.mark.asyncio
 async def test_tweet_tool_partial_approval():
     """Test partial approval and regeneration workflow"""
+    try:
+        # Setup (same as before)
+        deps = setup_test_dependencies()
+        tweet_tool = setup_tweet_tool(deps)
+        
+        # 1. Initial generation
+        initial_result = await tweet_tool.run("Generate 2 tweets about AI")
+        tool_operation_id = initial_result.get('data', {}).get('tool_operation_id')
+        
+        # 2. Partial approval - approve one, reject one
+        partial_result = await tweet_tool.run("approve item 1, regenerate item 2")
+        
+        # Verify states after partial approval
+        approved_items = await db.tool_items.find({
+            "tool_operation_id": tool_operation_id,
+            "state": ToolOperationState.EXECUTING.value
+        }).to_list(None)
+        assert len(approved_items) == 1, "Expected 1 approved item"
+        
+        rejected_items = await db.tool_items.find({
+            "tool_operation_id": tool_operation_id,
+            "state": ToolOperationState.COMPLETED.value,
+            "status": OperationStatus.REJECTED.value
+        }).to_list(None)
+        assert len(rejected_items) == 1, "Expected 1 rejected item"
+        
+        # 3. Full approval of regenerated item
+        final_result = await tweet_tool.run("approve all")
+        
+        # Verify final states
+        final_approved = await db.tool_items.find({
+            "tool_operation_id": tool_operation_id,
+            "state": ToolOperationState.EXECUTING.value
+        }).to_list(None)
+        assert len(final_approved) == 2, "Expected 2 items in EXECUTING state"
+        
+        # Verify operation completed
+        final_op = await tool_state_manager.get_operation(deps.session_id)
+        assert final_op['state'] == ToolOperationState.EXECUTING.value
+        
+    finally:
+        # Cleanup
+        await cleanup_test_data(deps)
+
+@pytest.mark.asyncio
+async def test_tweet_tool_multiple_regeneration():
+    """Test regeneration of multiple items workflow"""
     mongo_uri = os.getenv('MONGO_URI')
     if not mongo_uri:
         raise ValueError("MONGO_URI not found in environment variables")
@@ -249,7 +296,7 @@ async def test_tweet_tool_partial_approval():
     try:
         # 1. Setup
         deps = AgentDependencies(
-            session_id="test_partial_session",
+            session_id="test_multiple_regen_session",
             user_id="test_user_123",
             context={},
             tools_available=["twitter"]
@@ -270,84 +317,54 @@ async def test_tweet_tool_partial_approval():
             approval_manager=approval_manager
         )
 
-        # 2. Initial Command - Generate tweets
-        initial_command = "Generate 2 tweets about AI"
-        result = await tweet_tool.run(initial_command)
-        
-        # Verify items were generated
-        assert result.get('data', {}).get('items'), "No items returned in approval flow"
-        items = result.get('data', {}).get('items', [])
-        assert len(items) == 2, "Expected 2 items to be generated"
-        
-        # Get operation_id from the initial operation
+        # 2. Initial generation
+        initial_result = await tweet_tool.run("Generate 3 tweets about AI")
         operation = await tool_state_manager.get_operation(deps.session_id)
         tool_operation_id = str(operation['_id'])
         
-        # Verify initial states
-        initial_items = await db.tool_items.find({
-            "tool_operation_id": tool_operation_id
-        }).to_list(None)
-        assert len(initial_items) == 2, "Expected 2 items in database"
-        assert all(item['state'] == ToolOperationState.APPROVING.value for item in initial_items), "Items not in APPROVING state"
-        
-        # 3. Partial Approval Response
-        partial_approval = "approve the first one, regenerate the second"
+        # 3. Partial Approval - approve one, reject two
+        partial_approval = "approve item 1, regenerate items 2 and 3"
         approval_result = await tweet_tool.run(partial_approval)
         
-        # 4. Verify state transitions
-        # Check approved item
-        approved_item = await db.tool_items.find_one({
+        # Verify first-turn states
+        approved_items = await db.tool_items.find({
             "tool_operation_id": tool_operation_id,
-            "state": ToolOperationState.EXECUTING.value
-        })
-        assert approved_item is not None, "No item found in EXECUTING state"
-        assert approved_item['status'] == OperationStatus.APPROVED.value, "Item not marked as APPROVED"
+            "state": ToolOperationState.EXECUTING.value,
+            "status": OperationStatus.APPROVED.value
+        }).to_list(None)
+        assert len(approved_items) == 1, "Expected 1 approved item"
         
-        # Check rejected item
-        rejected_item = await db.tool_items.find_one({
+        rejected_items = await db.tool_items.find({
             "tool_operation_id": tool_operation_id,
             "state": ToolOperationState.COMPLETED.value,
             "status": OperationStatus.REJECTED.value
-        })
-        assert rejected_item is not None, "No item found in COMPLETED/REJECTED state"
-        
-        # 5. Verify regeneration response
-        assert approval_result.get('regeneration_needed') is True, "Regeneration not flagged as needed"
-        assert approval_result.get('regenerate_count') == 1, "Expected 1 item to regenerate"
-        
-        # 6. Verify operation state for regeneration
-        updated_operation = await tool_state_manager.get_operation(deps.session_id)
-        assert updated_operation['state'] == ToolOperationState.COLLECTING.value, "Operation not in COLLECTING state"
-        assert updated_operation['metadata'].get('approval_state') == ApprovalState.REGENERATING.value, "Operation not in REGENERATING state"
-
-        # 7. Verify new item generation
-        regenerated_items = await db.tool_items.find({
-            "tool_operation_id": tool_operation_id,
-            "state": ToolOperationState.APPROVING.value,
-            "created_at": {"$gt": rejected_item['created_at']}
         }).to_list(None)
-        assert len(regenerated_items) == 1, "Expected 1 regenerated item"
-
-        # 8. Final approval of regenerated item
-        final_approval = "yes, this looks good"
-        final_result = await tweet_tool.run(final_approval)
+        assert len(rejected_items) == 2, "Expected 2 rejected items"
         
-        # 9. Verify final states
-        final_items = await db.tool_items.find({
+        # The regenerated items should be in an approval flow
+        assert approval_result.get('approval_state') == ApprovalState.AWAITING_APPROVAL.value
+        assert len(approval_result.get('data', {}).get('items', [])) == 2, "Expected 2 new items for approval"
+        
+        # 4. Second turn - approve the regenerated items
+        second_approval = "approve all"
+        final_result = await tweet_tool.run(second_approval)
+        
+        # Verify all items are now approved
+        final_approved = await db.tool_items.find({
             "tool_operation_id": tool_operation_id,
-            "state": ToolOperationState.EXECUTING.value
+            "state": ToolOperationState.EXECUTING.value,
+            "status": OperationStatus.APPROVED.value
         }).to_list(None)
-        assert len(final_items) == 2, "Expected 2 items in EXECUTING state"
+        assert len(final_approved) == 3, "Expected all 3 items to be approved (1 from first turn + 2 from second)"
         
-        # 10. Verify final operation state
-        final_operation = await tool_state_manager.get_operation(deps.session_id)
-        assert final_operation['state'] == ToolOperationState.EXECUTING.value, "Operation not in final EXECUTING state"
-        assert final_operation['metadata'].get('approval_state') == ApprovalState.APPROVAL_FINISHED.value, "Operation not in APPROVAL_FINISHED state"
-
-        logger.info("Tweet tool partial approval test completed successfully")
+        # Verify operation completed successfully
+        final_op = await tool_state_manager.get_operation_by_id(tool_operation_id)
+        assert final_op['state'] == ToolOperationState.EXECUTING.value, "Operation should be in EXECUTING state"
+        
+        logger.info("Tweet tool multiple regeneration test completed successfully")
         
     except Exception as e:
-        logger.error(f"Test error in partial approval: {e}")
+        logger.error(f"Test error in multiple regeneration: {e}")
         raise
         
     finally:

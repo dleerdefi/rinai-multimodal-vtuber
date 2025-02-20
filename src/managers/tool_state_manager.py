@@ -368,7 +368,7 @@ class ToolStateManager:
         tool_operation_id: str,
         item_updates: Optional[List[Dict]] = None
     ) -> bool:
-        """Update operation status based on aggregate item states"""
+        """Update operation status based on aggregate item states and scheduling"""
         try:
             operation = await self.get_operation_by_id(tool_operation_id)
             if not operation:
@@ -377,26 +377,71 @@ class ToolStateManager:
             # Get all items if no updates provided
             items = item_updates or await self.get_operation_items(tool_operation_id)
             
-            # Get unique item states
-            item_states = {item["state"] for item in items}
+            # Get scheduling info from operation metadata
+            is_scheduled_operation = operation.get('metadata', {}).get('requires_scheduling', False)
+            expected_item_count = operation.get('metadata', {}).get('expected_item_count', len(items))
             
-            # Determine operation status based on item states
-            new_status = self._determine_operation_status(item_states)
+            # Count items by state and status
+            executing_items = [i for i in items if i['state'] == ToolOperationState.EXECUTING.value]
+            completed_items = [i for i in items if i['state'] == ToolOperationState.COMPLETED.value]
+            scheduled_items = [i for i in items if i['status'] == OperationStatus.SCHEDULED.value]
+            executed_items = [i for i in items if i['status'] == OperationStatus.EXECUTED.value]
             
-            if new_status != operation.get("status"):
-                # Update all items to match new operation status
-                await self.sync_items_to_operation_status(tool_operation_id, new_status)
-                
-                # Update operation
-                await self.db.tool_operations.update_one(
-                    {"_id": ObjectId(tool_operation_id)},
-                    {
-                        "$set": {
-                            "status": new_status,
-                            "last_updated": datetime.now(UTC)
-                        }
+            # Determine item state completeness
+            all_items_approved = len(executing_items) == expected_item_count
+            all_items_scheduled = is_scheduled_operation and len(scheduled_items) == expected_item_count
+            all_items_executed = is_scheduled_operation and len(executed_items) == expected_item_count
+            
+            # Determine new operation state based on scheduling requirements
+            if is_scheduled_operation:
+                if all_items_executed:
+                    new_state = ToolOperationState.COMPLETED.value
+                elif all_items_scheduled:
+                    new_state = ToolOperationState.EXECUTING.value
+                elif all_items_approved:
+                    # Items approved but not yet scheduled
+                    new_state = ToolOperationState.APPROVING.value
+                else:
+                    # Still in approval/scheduling process
+                    return True
+            else:
+                # Non-scheduled operation logic
+                if all_items_approved:
+                    new_state = ToolOperationState.EXECUTING.value
+                elif len(executing_items) + len(completed_items) == expected_item_count:
+                    new_state = ToolOperationState.COMPLETED.value
+                else:
+                    return True
+
+            # Update operation state with detailed metadata
+            await self.db.tool_operations.update_one(
+                {"_id": ObjectId(tool_operation_id)},
+                {
+                    "$set": {
+                        "state": new_state,
+                        "metadata": {
+                            **(operation.get('metadata', {})),
+                            "item_summary": {
+                                "total_items": expected_item_count,
+                                "executing_count": len(executing_items),
+                                "completed_count": len(completed_items),
+                                "scheduled_count": len(scheduled_items),
+                                "executed_count": len(executed_items),
+                                "requires_scheduling": is_scheduled_operation,
+                                "last_state_update": datetime.now(UTC).isoformat()
+                            }
+                        },
+                        "last_updated": datetime.now(UTC)
                     }
-                )
+                }
+            )
+            
+            logger.info(
+                f"Operation {tool_operation_id} state updated to {new_state}. "
+                f"Items: {len(executing_items)} executing, {len(scheduled_items)} scheduled, "
+                f"{len(executed_items)} executed"
+            )
+            
             return True
 
         except Exception as e:
