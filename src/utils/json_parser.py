@@ -31,8 +31,21 @@ def parse_strict_json(response: str, model_cls: Type[T]) -> Optional[T]:
             
         logger.debug(f"Attempting to parse JSON: {json_str}")
         raw_data = json.loads(json_str)
-        return model_cls(**raw_data)
+        logger.debug(f"Parsed raw data: {raw_data}")
         
-    except (json.JSONDecodeError, ValidationError) as e:
-        logger.error(f"Failed to parse/validate JSON: {e}")
+        # If model_cls is dict, return raw_data
+        if model_cls == dict:
+            return raw_data
+            
+        try:
+            validated = model_cls(**raw_data)
+            logger.debug(f"Validated data: {validated}")
+            return validated
+        except ValidationError as ve:
+            logger.error(f"Validation error: {ve}")
+            # Return raw data if validation fails
+            return raw_data
+            
+    except json.JSONDecodeError as e:
+        logger.error(f"JSON decode error: {e}")
         return None 

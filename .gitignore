@@ -87,9 +87,17 @@ yarn.lock
 config.local.json
 *.local.json
 
-.sqlite3
-
-weather_cache.sqlite
 
 credentials.json
 token.pickle
+
+# Database
+*.db
+*.sqlite3
+.sqlite3
+weather_cache.sqlite
+
+# Exclude all db scripts except schema and manager
+src/db/*
+!src/db/db_schema.py
+!src/db/mongo_manager.py

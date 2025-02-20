@@ -3,17 +3,19 @@ import logging
 from datetime import datetime, UTC
 from motor.motor_asyncio import AsyncIOMotorClient
 from src.clients.twitter_client import TwitterAgentClient
-from src.db.db_schema import TweetStatus, RinDB
-from src.managers.tool_state_manager import ToolOperationState
+from src.db.db_schema import OperationStatus, ContentType, RinDB, ToolOperationState
+from src.managers.tool_state_manager import ToolStateManager
 from bson.objectid import ObjectId
+from typing import Dict
 
 logger = logging.getLogger(__name__)
 
 class ScheduleService:
-    def __init__(self, mongo_uri: str):
+    def __init__(self, mongo_uri: str, orchestrator=None):
         self.mongo_client = AsyncIOMotorClient(mongo_uri)
-        self.db = RinDB(self.mongo_client)  # Use RinDB class instead of raw db
-        self.twitter_client = TwitterAgentClient()
+        self.db = RinDB(self.mongo_client)
+        self.tool_state_manager = ToolStateManager(db=self.db)
+        self.orchestrator = orchestrator  # Store orchestrator reference
         self.running = False
         self._task = None
 
@@ -28,79 +30,143 @@ class ScheduleService:
         logger.info("Schedule service started")
 
     async def _schedule_loop(self):
-        """Main scheduling loop that checks for and executes due tweets"""
+        """Main scheduling loop that checks for and executes operations"""
         while self.running:
             try:
-                # Skip cancelled schedules
-                due_tweets = await self.db.get_scheduled_tweets_for_execution()
-                due_tweets = [t for t in due_tweets if t.get('schedule_status') != 'cancelled']
+                # Get operations ready for execution
+                due_operations = await self.db.get_scheduled_operations_for_execution(
+                    content_type=ContentType.TWEET.value,
+                    status=OperationStatus.SCHEDULED.value
+                )
                 
-                for tweet in due_tweets:
+                due_operations = [op for op in due_operations 
+                                if op.get('state') != ToolOperationState.CANCELLED.value]
+                
+                for operation in due_operations:
                     try:
-                        logger.info(f"Processing scheduled tweet {tweet['_id']}")
-                        
-                        # Use correct parameters for send_tweet
-                        result = await self.twitter_client.send_tweet(
-                            content=tweet['content'],
-                            params={
-                                "account_id": tweet.get('twitter_api_params', {}).get('account_id', 'default'),
-                                "media_files": tweet.get('twitter_api_params', {}).get('media_files'),
-                                "poll_options": tweet.get('twitter_api_params', {}).get('poll_options'),
-                                "poll_duration": tweet.get('twitter_api_params', {}).get('poll_duration')
-                            }
-                        )
-                        
-                        if result and result.get('success'):
-                            # Update tweet status using RinDB method
-                            await self.db.update_tweet_status(
-                                tweet_id=str(tweet['_id']),
-                                status=TweetStatus.POSTED,
-                                twitter_response=result
-                            )
-                            logger.info(f"Successfully posted tweet {tweet['_id']}")
-                            
-                            # Check if schedule is complete
-                            await self._check_schedule_completion(tweet['schedule_id'])
-                        else:
-                            error_msg = result.get('error', 'Unknown error') if result else "No response from Twitter client"
-                            logger.error(f"Failed to post tweet {tweet['_id']}: {error_msg}")
-                            await self.db.update_tweet_status(
-                                tweet_id=str(tweet['_id']),
-                                status=TweetStatus.FAILED,
-                                error=error_msg
-                            )
-                    
+                        await self._handle_scheduled_operation(operation)
                     except Exception as e:
-                        logger.error(f"Error processing tweet {tweet['_id']}: {e}")
+                        logger.error(f"Error processing operation {operation['_id']}: {e}")
                         continue
                 
-                # Wait before next check
                 await asyncio.sleep(60)  # Check every minute
                 
             except Exception as e:
                 logger.error(f"Error in schedule loop: {e}")
                 await asyncio.sleep(60)  # Wait before retry
 
-    async def _check_schedule_completion(self, schedule_id: str):
-        """Check if all tweets in a schedule are posted"""
+    async def _handle_scheduled_operation(self, operation: Dict):
+        """Handle scheduled operation execution"""
         try:
-            # Get all tweets for this schedule
-            schedule_tweets = await self.db.get_tweets_by_schedule(schedule_id)
-            
-            # Count total and posted tweets
-            total = len(schedule_tweets)
-            posted = sum(1 for t in schedule_tweets if t['status'] == TweetStatus.POSTED.value)
+            # Verify operation is in PENDING state and approved
+            if (operation.get('state') != ToolOperationState.PENDING.value or 
+                operation.get('output_data', {}).get('status') != OperationStatus.APPROVED.value):
+                return
 
-            if total == posted:
-                # All tweets posted, update schedule status
-                await self.db.update_tweet_schedule(
+            # Update to executing state
+            await self.tool_state_manager.update_operation(
+                session_id=operation['session_id'],
+                state=ToolOperationState.EXECUTING,
+                step="executing_schedule",
+                content_status=OperationStatus.SCHEDULED,
+                metadata={
+                    "execution_started_at": datetime.now(UTC).isoformat()
+                }
+            )
+
+            # Get appropriate tool and execute
+            content_type = operation.get('metadata', {}).get('content_type')
+            tool = self._get_tool_for_content(content_type)
+            
+            if not tool:
+                raise ValueError(f"No tool found for content type: {content_type}")
+            
+            result = await tool.execute_scheduled_operation(operation)
+            
+            # Handle execution result
+            if result.get('success'):
+                await self.tool_state_manager.end_operation(
+                    session_id=operation['session_id'],
+                    success=True,
+                    api_response=result,
+                    reason="Schedule executed successfully"
+                )
+            else:
+                await self._handle_execution_error(operation, result.get('error', 'Unknown error'))
+
+        except Exception as e:
+            logger.error(f"Error executing schedule: {e}")
+            await self._handle_execution_error(operation, str(e))
+
+    async def _execute_operation(self, operation: Dict):
+        """Execute the operation using the appropriate tool"""
+        try:
+            # Get content type and execute appropriate tool
+            content_type = operation.get('content_type')
+            tool = self._get_tool_for_content(content_type)
+            
+            if not tool:
+                logger.warning(f"No tool found for content type: {content_type}")
+                return {'success': False, 'error': 'No tool found'}
+
+            # Execute the operation using the appropriate tool
+            result = await tool.execute_scheduled_operation(operation)
+            
+            return result
+
+        except Exception as e:
+            logger.error(f"Error executing operation: {e}")
+            return {'success': False, 'error': str(e)}
+
+    def _get_tool_for_content(self, content_type: str):
+        """Get appropriate tool from orchestrator"""
+        if not self.orchestrator:
+            logger.error("No orchestrator available for tool lookup")
+            return None
+            
+        # Map ContentType to tool name
+        tool_name_map = {
+            ContentType.TWEET.value: "twitter",
+            # Add other content types here
+        }
+        
+        tool_name = tool_name_map.get(content_type)
+        if not tool_name:
+            logger.warning(f"No tool mapping for content type: {content_type}")
+            return None
+            
+        return self.orchestrator.tools.get(tool_name)
+
+    async def _check_schedule_completion(self, schedule_id: str):
+        """Check if all operations in a schedule are complete"""
+        try:
+            schedule = await self.db.get_scheduled_operations({
+                "schedule_id": schedule_id,
+                "status": {"$ne": OperationStatus.EXECUTED.value}
+            })
+            
+            if not schedule:
+                await self.db.update_schedule_status(
                     schedule_id=schedule_id,
-                    status="completed"
+                    status=OperationStatus.COMPLETED.value
                 )
                 logger.info(f"Schedule {schedule_id} completed")
 
         except Exception as e:
             logger.error(f"Error checking schedule completion: {e}")
+
+    async def _handle_execution_error(self, operation: Dict, error: str):
+        """Handle execution error"""
+        await self.tool_state_manager.update_operation(
+            session_id=operation['session_id'],
+            state=ToolOperationState.ERROR,
+            content_status=OperationStatus.FAILED.value,
+            error=error,
+            content_updates={
+                "last_error": error,
+                "error_timestamp": datetime.now(UTC).isoformat()
+            }
+        )
 
     async def stop(self):
         """Stop the scheduling service"""
@@ -114,4 +180,4 @@ class ScheduleService:
                 await self._task
             except asyncio.CancelledError:
                 pass
-        logger.info("Schedule service stopped") 
+        logger.info("Schedule service stopped")

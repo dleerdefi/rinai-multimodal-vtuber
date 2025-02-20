@@ -49,36 +49,53 @@ async def clear_all_scheduled_tweets():
         await MongoManager.initialize(mongo_uri)
         db = MongoManager.get_db()
         
-        # Get all schedules with specific statuses
+        # Clear scheduled operations
+        scheduled_ops_result = await db.scheduled_operations.delete_many({
+            "content_type": "tweet",
+            "status": {"$in": ["pending", "scheduled", "collecting_approval"]}
+        })
+        
+        # Clear tweet schedules
         schedule_cursor = db.tweet_schedules.find({
-            "status": {"$in": ["collecting_approval", "scheduled"]}
+            "status": {"$in": ["collecting_approval", "scheduled", "pending"]}
         })
         schedules = await schedule_cursor.to_list(length=None)
-        
-        if not schedules:
-            console.print("[yellow]No tweet schedules found with status 'collecting_approval' or 'scheduled'")
-            return
-        
         schedule_ids = [str(schedule['_id']) for schedule in schedules]
         
-        # Delete all associated tweets (both pending and scheduled)
-        for schedule_id in schedule_ids:
-            tweet_result = await db.tweets.delete_many({
-                "schedule_id": schedule_id,
-                "status": {"$in": ["pending", "scheduled"]}
-            })
-            console.print(f"[green]Deleted {tweet_result.deleted_count} tweets for schedule {schedule_id}")
-        
-        # Delete the schedules
         schedule_result = await db.tweet_schedules.delete_many({
-            "status": {"$in": ["collecting_approval", "scheduled"]}
+            "status": {"$in": ["collecting_approval", "scheduled", "pending"]}
+        })
+        
+        # Clear tool operations and executions
+        tool_ops_result = await db.tool_operations.delete_many({
+            "tool_type": "twitter",
+            "state": {"$in": ["collecting", "executing", "pending"]}
+        })
+        
+        tool_exec_result = await db.tool_executions.delete_many({
+            "tool_type": "twitter",
+            "state": {"$in": ["collecting", "executing", "pending"]}
+        })
+        
+        # Delete associated tweets
+        tweet_result = await db.tweets.delete_many({
+            "$or": [
+                {"schedule_id": {"$in": schedule_ids}},
+                {"status": {"$in": ["pending", "scheduled"]}}
+            ]
         })
         
         console.print("\n[bold cyan]Operation Summary:[/]")
+        console.print(f"[green]- Deleted {scheduled_ops_result.deleted_count} scheduled operations")
         console.print(f"[green]- Deleted {schedule_result.deleted_count} tweet schedules")
-        console.print("\n[cyan]Deleted Schedule IDs:[/]")
-        for schedule_id in schedule_ids:
-            console.print(f"[green]- {schedule_id}")
+        console.print(f"[green]- Deleted {tool_ops_result.deleted_count} tool operations")
+        console.print(f"[green]- Deleted {tool_exec_result.deleted_count} tool executions")
+        console.print(f"[green]- Deleted {tweet_result.deleted_count} tweets")
+        
+        if schedule_ids:
+            console.print("\n[cyan]Deleted Schedule IDs:[/]")
+            for schedule_id in schedule_ids:
+                console.print(f"[green]- {schedule_id}")
             
     except Exception as e:
         console.print(f"[bold red]Error clearing scheduled tweets: {e}")

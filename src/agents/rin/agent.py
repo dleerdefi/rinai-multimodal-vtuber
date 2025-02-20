@@ -67,7 +67,7 @@ class RinAgent:
         
         # Define models for different use cases
         self.chat_model = ModelType.GROQ_LLAMA_3_3_70B # For main conversation
-        self.response_model = ModelType.CLAUDE_3_5_SONNET # For tool-based responses
+        self.tool_model = ModelType.CLAUDE_3_5_SONNET # For tool-based responses
         # add role playing model
 
         # Add ScheduleService initialization
@@ -122,116 +122,50 @@ class RinAgent:
     async def get_response(self, session_id: str, message: str, role: str = "user", interaction_type: str = "local_agent") -> str:
         """Main entry point for message processing"""
         try:
-            # Check for scheduling triggers using existing patterns
-            if (self.trigger_detector.should_use_twitter(message) and 
-                self.trigger_detector.get_tool_operation_type(message) == "schedule_tweets"):
+            logger.info(f"[AGENT] Processing message for session {session_id}")
+            
+            # 1. Check for active tool operation first
+            operation = await self.tool_state_manager.get_operation(session_id)
+            logger.info(f"[AGENT] Active operation check: {bool(operation)}")
+            if operation:
+                logger.info(f"[AGENT] Operation state: {operation.get('state')}")
+                logger.info(f"[AGENT] Operation type: {operation.get('tool_type')}")
+
+            if operation and operation.get('state') not in [ToolOperationState.INACTIVE.value, ToolOperationState.CANCELLED.value]:
+                logger.info("[AGENT] Continuing existing tool operation")
+                result = await self.orchestrator.process_command(
+                    command=message,
+                    deps=AgentDependencies(
+                        session_id=session_id,
+                        user_id=role,
+                        context={"operation": operation}
+                    )
+                )
+                logger.info(f"[AGENT] Tool operation result: {result.data.get('status')}")
                 
-                logger.info(f"Detected tweet scheduling request: {message}")
-                
-                # Start scheduling operation
-                await self.tool_state_manager.start_operation(
+                # Store tool interaction in context
+                await self.context_manager.store_interaction(
                     session_id=session_id,
-                    operation_type="schedule_tweets",
-                    initial_data={
-                        "message": message,
-                        "interaction_type": interaction_type,
-                        "detected_patterns": {
-                            "is_twitter": True,
-                            "is_schedule": True
-                        }
+                    user_message=message,
+                    assistant_response=result.response,
+                    interaction_type=interaction_type,
+                    metadata={
+                        'tool_operation': operation.get('tool_type'),
+                        'tool_step': operation.get('step'),
+                        'operation_status': result.data.get("status")
                     }
                 )
                 
-                # Process through orchestrator with user_id
-                result = await self.orchestrator.process_command(
-                    command=message,
-                    deps=AgentDependencies(
-                        conversation_id=session_id,
-                        user_id=role,  # Add user_id from role parameter
-                        context={
-                            "interaction_type": interaction_type,
-                            "tool_type": "twitter_scheduler"
-                        }
-                    )
-                )
-                
-                if result and result.response:
-                    return result.response
-                return "I'll help you schedule those tweets! What would you like to tweet about?"
-
-            logger.info(f"[CHECKPOINT 1] Starting response generation for session {session_id}")
-            
-            # Check for active tool operation
-            operation = await self.tool_state_manager.get_operation(session_id)
-            
-            if operation and operation.get('state') not in [ToolOperationState.INACTIVE.value, ToolOperationState.CANCELLED.value]:
-                # Let orchestrator handle the operation step
-                result = await self.orchestrator.process_command(
-                    command=message,
-                    deps=AgentDependencies(
-                        conversation_id=session_id,
-                        user_id=role,
-                        context={
-                            "operation": operation,
-                            "interaction_type": interaction_type
-                        }
-                    )
-                )
-                
-                # If operation was cancelled or completed, allow normal conversation to resume
-                if result.data.get("status") in ["cancelled", "completed"]:
-                    logger.info(f"Tool operation ended with status: {result.data.get('status')}")
-                    
-                    # Update operation state based on result
-                    if result.data.get("operation_update"):
-                        await self.tool_state_manager.update_operation(
-                            session_id,
-                            **result.data["operation_update"]
-                        )
-                    
-                    # Store the final tool interaction in context
-                    await self.context_manager.store_interaction(
+                if result.data.get("status") in ["completed", "cancelled"]:
+                    # Tool operation finished - clean up and return final response
+                    await self.tool_state_manager.end_operation(
                         session_id=session_id,
-                        user_message=message,
-                        assistant_response=result.response,
-                        interaction_type=interaction_type,
-                        metadata={
-                            'formatted_for_tts': True,
-                            'role': role,
-                            'tool_operation': operation.get('operation_type'),
-                            'tool_step': operation.get('step'),
-                            'operation_status': result.data.get("status")
-                        }
+                        success=result.data.get("status") == "completed",
+                        api_response=result.data
                     )
-                    
-                    # Return the final message and allow fall through to normal conversation
-                    if result.response:
-                        return result.response
-                else:
-                    # For ongoing operations, update state and return response
-                    if result.data.get("operation_update"):
-                        await self.tool_state_manager.update_operation(
-                            session_id,
-                            **result.data["operation_update"]
-                        )
-                    
-                    # Store the tool interaction in context
-                    await self.context_manager.store_interaction(
-                        session_id=session_id,
-                        user_message=message,
-                        assistant_response=result.response,
-                        interaction_type=interaction_type,
-                        metadata={
-                            'formatted_for_tts': True,
-                            'role': role,
-                            'tool_operation': operation.get('operation_type'),
-                            'tool_step': operation.get('step')
-                        }
-                    )
-                    
-                    return result.response
+                return result.response
 
-            # Initialize session if needed
+            # 2. Initialize session if needed
             if session_id not in self.sessions:
                 logger.info("[CHECKPOINT 2] Loading/creating session")
                 history = await self.context_manager.get_combined_context(session_id, message)
@@ -247,29 +181,33 @@ class RinAgent:
 
             logger.info("[CHECKPOINT 4] Preparing to generate response")
 
-            # Check for special triggers using TriggerDetector
+            # 3. Check for special triggers
             use_tools = self.trigger_detector.should_use_tools(message)
             use_memory = self.trigger_detector.should_use_memory(message)
             
-            # Get tool results if needed
+            # 4. Handle tool operations
             tool_results = None
             if use_tools:
-                # Check if we need to start a new tool operation
-                operation_type = self.trigger_detector.get_tool_operation_type(message)
-                if operation_type:
+                tool_type = self.trigger_detector.get_specific_tool_type(message)
+                if tool_type == "twitter":
+                    # Start multi-turn tool operation
                     await self.tool_state_manager.start_operation(
-                        session_id,
-                        operation_type,
+                        session_id=session_id,
+                        operation_type=tool_type,
                         initial_data={"message": message}
                     )
                     # Redirect to tool operation flow
                     return await self.get_response(session_id, message, role, interaction_type)
-                
-                # Otherwise get immediate tool results
-                tool_results = await self._get_tool_results(message)
-                logger.info(f"Tool results obtained: {bool(tool_results)}")
+                else:
+                    # Single-turn tool - get immediate results
+                    tool_results = await self.orchestrator.process_command(
+                        command=message,
+                        deps=AgentDependencies(session_id=session_id)
+                    )
+                    tool_results = tool_results.data.get("tool_results")
+                    logger.info(f"Tool results obtained: {bool(tool_results)}")
 
-            # Get memory/RAG guidance if needed
+            # 5. Get memory/RAG guidance if needed
             rag_guidance = None
             if use_memory and self.response_enricher:
                 try:
@@ -291,7 +229,7 @@ class RinAgent:
             )
             logger.info("[CHECKPOINT 5] Response generated")
 
-            # Store messages in session and database
+            # 7. Store interaction
             message_pair = [
                 {'role': role, 'content': message, 'timestamp': datetime.utcnow()},
                 {'role': 'assistant', 'content': response, 'timestamp': datetime.utcnow()}
@@ -370,7 +308,7 @@ class RinAgent:
 
             # Choose model based on tool results
             selected_model = (
-                self.response_model  # Use response model if tools were used
+                self.tool_model  # Use response model if tools were used
                 if tool_results 
                 else self.chat_model  # Use chat model for regular chat
             )

@@ -69,10 +69,11 @@ class AgentResult(BaseModel):
 
 class AgentDependencies(BaseModel):
     """Shared dependencies across all agents"""
-    conversation_id: str
-    user_id: Optional[str]
+    session_id: str
+    user_id: Optional[str] = None
     context: Optional[Dict] = {}
     tools_available: List[str] = []
+    agent: Optional[Any] = None  # Add agent field for user interaction
 
 class TweetApprovalAnalysis(BaseModel):
     """Model for tweet approval command analysis"""
@@ -83,11 +84,16 @@ class TweetApprovalAnalysis(BaseModel):
 
 class TweetContent(BaseModel):
     """Model for individual tweet content"""
-    content: str = Field(description="Content of the tweet")
+    content: str = Field(..., max_length=280)
+    metadata: Optional[Dict[str, Any]] = Field(default_factory=dict)
 
 class TweetGenerationResponse(BaseModel):
     """Model for LLM tweet generation response"""
     tweets: List[TweetContent] = Field(description="List of generated tweets")
+
+    def to_dict(self) -> Dict:
+        """Convert to dictionary for database storage"""
+        return self.dict(exclude_none=True)
 
 class TimeToolParameters(BaseModel):
     """Parameters for time tool operations"""
@@ -136,3 +142,20 @@ class CalendarToolParameters(BaseModel):
         default=None,
         description="End time for event fetch (ISO format)"
     )
+
+class ToolOperation(BaseModel):
+    """Model for tool operations"""
+    session_id: str
+    tool_type: str
+    state: str
+    step: str
+    input_data: Dict[str, Any] = Field(default_factory=dict)
+    output_data: Dict[str, Any] = Field(default_factory=dict)
+    metadata: Dict[str, Any] = Field(default_factory=dict)
+    created_at: datetime
+    last_updated: datetime
+    end_reason: Optional[str] = None
+
+    def to_dict(self) -> Dict:
+        """Convert to dictionary for database storage"""
+        return self.dict(exclude_none=True)

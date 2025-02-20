@@ -1,10 +1,11 @@
-from typing import TypedDict, List, Optional, Dict, Literal
-from datetime import datetime
+from typing import TypedDict, List, Optional, Dict, Literal, Any, Union
+from datetime import datetime, UTC
 import logging
 import uuid
 from bson.objectid import ObjectId
 from motor.motor_asyncio import AsyncIOMotorClient
 from enum import Enum
+from pydantic import BaseModel
 
 logger = logging.getLogger(__name__)
 
@@ -28,77 +29,231 @@ class ContextConfiguration(TypedDict):
     active_message_ids: List[str]   # IDs of messages in current context
     last_updated: datetime
 
-class TweetStatus(str, Enum):
-    """Tweet status types"""
-    PENDING = "pending"
-    APPROVED = "approved"
-    SCHEDULED = "scheduled"
-    POSTED = "posted"
-    FAILED = "failed"
-    REJECTED = "rejected"
+class OperationStatus(Enum):
+    PENDING = "pending"          # Item is waiting for action
+    APPROVED = "approved"        # Item has been approved
+    REJECTED = "rejected"        # Item was rejected
+    SCHEDULED = "scheduled"      # Item is scheduled for execution
+    EXECUTED = "executed"        # Item has been executed
+    FAILED = "failed"           # Item execution failed
 
-class Tweet(TypedDict):
-    content: str
-    status: str  # Will contain TweetStatus values
+class ToolOperationState(Enum):
+    INACTIVE = "inactive"
+    COLLECTING = "collecting"     # Tool is generating/collecting items
+    APPROVING = "approving"       # Items are being reviewed
+    EXECUTING = "executing"       # Approved items are being executed
+    COMPLETED = "completed"       # Operation is finished
+    ERROR = "error"              # Operation encountered error
+    CANCELLED = "cancelled"      # Operation was cancelled
+
+class ContentType(str, Enum):
+    """Types of content that can be produced"""
+    TWEET = "tweet"
+    CALENDAR = "calendar"
+    PROMPT = "system_prompt"
+    SEARCH_RESULT = "search_result"
+
+class ToolType(str, Enum):
+    """Types of tools available"""
+    TWEET_SCRAPER = "tweet_scraper"
+    PROMPT_ENGINEER = "prompt_engineer"
+    WEB_SEARCH = "web_search"
+    TWITTER = "twitter"
+    CALENDAR = "calendar"
+
+class WorkflowOperation(TypedDict):
+    """Top-level workflow operation"""
+    workflow_id: str
+    session_id: str
+    status: str  # Maps to OperationStatus
     created_at: datetime
-    scheduled_time: Optional[datetime]  # When this specific tweet should be posted
-    posted_time: Optional[datetime]
-    metadata: Dict[str, any]  # estimated_engagement, schedule_time, etc
-    twitter_api_params: Dict[str, any]  # API parameters
-    twitter_response: Optional[Dict]  # Response from Twitter API after posting
+    last_updated: datetime
+    tool_sequence: List[str]  # List of tool_operation_ids in order
+    dependencies: Dict[str, List[str]]  # tool_id -> [dependent_tool_ids]
+    metadata: Dict[str, Any]
+
+class ScheduledOperation(TypedDict):
+    """Base class for any scheduled operation or content"""
+    session_id: str
+    workflow_id: Optional[str]  # Link to parent workflow if part of one
+    tool_operation_id: Optional[str]  # Link to tool operation that created this
+    content_type: str  # Maps to ContentType
+    status: str  # Maps to OperationStatus
+
+    # Generic scheduling parameters
+    count: int  # Number of items to schedule (tweets, posts, etc)
+    schedule_type: Literal["one_time", "multiple", "recurring"]  # Type of schedule
+    schedule_time: str  # When to execute
+    approval_required: bool  # Whether approval is needed
+    
+    # Content management
+    content: Dict[str, Any]  # The actual content to be executed
+    pending_items: List[str]  # IDs of items pending approval
+    approved_items: List[str]  # IDs of approved items
+    rejected_items: List[str]  # IDs of rejected items
+    
+    # Timing
+    created_at: datetime
+    scheduled_time: Optional[datetime]
+    executed_time: Optional[datetime]
+    
+    # Metadata
+    metadata: Dict[str, Any]
     retry_count: int
     last_error: Optional[str]
-    schedule_id: str  # Reference to parent schedule
-    session_id: str   # Reference to conversation session
 
-class TweetSchedule(TypedDict):
-    """Manages a group of related tweets to be posted according to a schedule"""
+class ToolItemContent(TypedDict):
+    """Base content structure for all tools"""
+    raw_content: str
+    formatted_content: Optional[str]
+    references: Optional[List[str]]
+    version: str
+
+class ToolItemParams(TypedDict):
+    """Base parameters for all tools"""
+    schedule_time: Optional[datetime]
+    retry_policy: Optional[Dict]
+    execution_window: Optional[Dict]
+
+class ToolItemMetadata(TypedDict):
+    """Base metadata for all tools"""
+    generated_at: str
+    generated_by: str
+    last_modified: str
+    version: str
+
+class ToolItemResponse(TypedDict):
+    """Base API response for all tools"""
+    success: bool
+    timestamp: str
+    platform_id: Optional[str]
+    error: Optional[str]
+
+class OperationMetadata(TypedDict):
+    """Standard metadata for operations"""
+    content_type: str
+    original_request: Optional[str]
+    generated_at: str
+    execution_time: Optional[str]
+    retry_count: int
+    last_error: Optional[str]
+
+class ToolExecution(TypedDict):
+    """Individual tool execution record"""
+    operation_id: str           # Reference to tool_operations
     session_id: str
-    topic: str
-    total_tweets_requested: int
-    schedule_info: Dict[str, any]  # Overall schedule parameters
-    approved_tweets: List[str]  # List of Tweet IDs
-    pending_tweets: Optional[List[str]]  # List of Tweet IDs awaiting approval
-    status: str  # 'collecting_approval', 'ready_to_schedule', 'scheduled', 'completed', 'error', 'cancelled'
+    tool_type: str             # Maps to ToolType
+    state: str                 # Maps to ToolOperationState
+    parameters: Dict[str, Any] # Tool-specific parameters
+    result: Optional[Dict[str, Any]]
     created_at: datetime
     last_updated: datetime
+    metadata: OperationMetadata
+    retry_count: int
     last_error: Optional[str]
-    metadata: Optional[Dict]  # Add this to store original_request and other context
+
+class ToolItem(TypedDict):
+    """Generic tool item"""
+    session_id: str
+    workflow_id: Optional[str]
+    tool_operation_id: str
+    content_type: str
+    status: str
+    
+    # Content management
+    content: ToolItemContent
+    parameters: ToolItemParams
+    metadata: ToolItemMetadata
+    api_response: Optional[ToolItemResponse]
+    
+    # Timing
+    created_at: datetime
+    scheduled_time: Optional[datetime]
+    executed_time: Optional[datetime]
+    posted_time: Optional[datetime]
+    
+    # Operation tracking
+    schedule_id: str
+    operation_id: str
+    execution_id: Optional[str]
+    
+    # Error handling
+    retry_count: int
+    last_error: Optional[str]
 
 class ToolOperation(TypedDict):
+    """Individual tool operation with workflow support"""
     session_id: str
-    state: str  # Maps to ToolOperationState
-    operation_type: str
+    tool_type: str              # Maps to ToolType enum
+    state: str                  # Maps to ToolOperationState
     step: str
-    data: Dict[str, any]
+    workflow_id: Optional[str]  # Link to parent workflow
+    workflow_step: Optional[int] # Order in workflow sequence
+    input_data: Dict[str, Any]  # Data from previous tools
+    output_data: Dict[str, Any] # Data produced by this tool
+    metadata: OperationMetadata # Standard metadata including content_type
     created_at: datetime
     last_updated: datetime
+    end_reason: Optional[str]
 
-class TwitterAPIParams(TypedDict):
-    message: str
-    account_id: str
+class TwitterContent(ToolItemContent):
+    """Twitter-specific content structure"""
+    thread_structure: Optional[List[str]]
+    mentions: Optional[List[str]]
+    hashtags: Optional[List[str]]
+    urls: Optional[List[str]]
+
+class TwitterParams(ToolItemParams):
+    """Twitter-specific parameters"""
+    account_id: Optional[str]
     media_files: Optional[List[str]]
     poll_options: Optional[List[str]]
     poll_duration: Optional[int]
+    reply_settings: Optional[str]
+    quote_tweet_id: Optional[str]
 
-class TweetMetadata(TypedDict):
+class TwitterMetadata(ToolItemMetadata):
+    """Twitter-specific metadata"""
     estimated_engagement: str
-    generated_at: str
+    audience_targeting: Optional[Dict]
+    content_category: Optional[str]
+    sensitivity_level: Optional[str]
 
-class ValidatedTweet(TypedDict):
-    content: str
-    metadata: TweetMetadata
-    twitter_api_params: TwitterAPIParams
+class TwitterResponse(ToolItemResponse):
+    """Twitter-specific API response"""
+    tweet_id: str
+    engagement_metrics: Optional[Dict]
+    visibility_stats: Optional[Dict]
+
+class Tweet(ToolItem):
+    """Tweet implementation of ToolItem"""
+    content: TwitterContent
+    parameters: TwitterParams
+    metadata: TwitterMetadata
+    api_response: Optional[TwitterResponse]
+
+class TwitterCommandAnalysis(BaseModel):
+    tools_needed: List[Dict[str, Any]]
+    reasoning: str
+
+class TweetGenerationResponse(BaseModel):
+    items: List[Dict[str, Any]]
 
 class RinDB:
     def __init__(self, client: AsyncIOMotorClient):
         self.client = client
         self.db = client['rin_multimodal']
-        self.messages = self.db['rin.messages']
-        self.context_configs = self.db['rin.context_configs']
+        # Legacy collections for migration
         self.tweets = self.db['rin.tweets']
         self.tweet_schedules = self.db['rin.tweet_schedules']
-        self.tool_operations = self.db.get_collection('rin.tool_operations')
+        
+        # Current collections
+        self.messages = self.db['rin.messages']
+        self.context_configs = self.db['rin.context_configs']
+        self.tool_items = self.db['rin.tool_items']
+        self.tool_operations = self.db['rin.tool_operations']
+        self.tool_executions = self.db['rin.tool_executions']
+        self.scheduled_operations = self.db['rin.scheduled_operations']
         self._initialized = False
         logger.info(f"Connected to database: {self.db.name}")
 
@@ -108,21 +263,19 @@ class RinDB:
             collections = await self.db.list_collection_names()
             
             # Create collections if they don't exist
-            if 'rin.messages' not in collections:
-                await self.db.create_collection('rin.messages')
-                logger.info("Created rin.messages collection")
+            required_collections = [
+                'rin.messages',
+                'rin.context_configs',
+                'rin.tool_items',
+                'rin.tool_operations',
+                'rin.tool_executions',
+                'rin.scheduled_operations'
+            ]
             
-            if 'rin.context_configs' not in collections:
-                await self.db.create_collection('rin.context_configs')
-                logger.info("Created rin.context_configs collection")
-            
-            if 'rin.tweets' not in collections:
-                await self.db.create_collection('rin.tweets')
-                logger.info("Created rin.tweets collection")
-            
-            if 'rin.tweet_schedules' not in collections:
-                await self.db.create_collection('rin.tweet_schedules')
-                logger.info("Created rin.tweet_schedules collection")
+            for collection in required_collections:
+                if collection not in collections:
+                    await self.db.create_collection(collection)
+                    logger.info(f"Created {collection} collection")
             
             # Setup indexes
             await self._setup_indexes()
@@ -137,18 +290,22 @@ class RinDB:
     async def is_initialized(self) -> bool:
         """Check if database is properly initialized"""
         try:
-            # Check if collections exist
             collections = await self.db.list_collection_names()
-            has_collections = all(
-                col in collections 
-                for col in ['rin.messages', 'rin.context_configs', 'rin.tweets', 'rin.tweet_schedules']
-            )
+            required_collections = [
+                'rin.messages',
+                'rin.context_configs',
+                'rin.tool_items',
+                'rin.tool_operations',
+                'rin.tool_executions',
+                'rin.scheduled_operations'
+            ]
+            
+            has_collections = all(col in collections for col in required_collections)
             
             if not has_collections:
                 logger.warning("Required collections not found")
                 return False
                 
-            # Verify connection
             await self.db.command('ping')
             return True
         except Exception as e:
@@ -158,32 +315,57 @@ class RinDB:
     async def _setup_indexes(self):
         """Setup indexes for Rin collections"""
         try:
+            # Message and context indexes
             await self.messages.create_index([("session_id", 1)])
             await self.messages.create_index([("timestamp", 1)])
             await self.context_configs.create_index([("session_id", 1)])
+
+            # Tool operations indexes
+            await self.tool_operations.create_index([("session_id", 1)])
+            await self.tool_operations.create_index([("state", 1)])
+            await self.tool_operations.create_index([("tool_type", 1)])
+            await self.tool_operations.create_index([("last_updated", 1)])
             
-            # Indexes for tweet scheduling
-            await self.tweet_schedules.create_index([("session_id", 1)])
-            await self.tweet_schedules.create_index([("status", 1)])
+            # Tool executions tracking
+            await self.tool_executions.create_index([("operation_id", 1)])
+            await self.tool_executions.create_index([("session_id", 1)])
+            await self.tool_executions.create_index([("state", 1)])
+            await self.tool_executions.create_index([("created_at", 1)])
             
-            # Indexes for individual tweets
-            await self.tweets.create_index([("status", 1)])
-            await self.tweets.create_index([("schedule_id", 1)])
-            await self.tweets.create_index([("session_id", 1)])
-            await self.tweets.create_index([("scheduled_time", 1)])
-            await self.tweets.create_index([("created_at", 1)])
+            # Tool items (content)
+            await self.tool_items.create_index([("session_id", 1)])
+            await self.tool_items.create_index([("content_type", 1)])
+            await self.tool_items.create_index([("status", 1)])
+            await self.tool_items.create_index([("schedule_id", 1)])
+            await self.tool_items.create_index([("operation_id", 1)])
+            await self.tool_items.create_index([("created_at", 1)])
+            await self.tool_items.create_index([("scheduled_time", 1)])
+            await self.tool_items.create_index([("posted_time", 1)])
             
-            # Compound indexes for efficient querying
-            await self.tweets.create_index([
+            # Compound indexes for common queries
+            await self.tool_items.create_index([
                 ("status", 1),
                 ("scheduled_time", 1)
             ])
+            await self.tool_items.create_index([
+                ("content_type", 1),
+                ("status", 1)
+            ])
+            await self.tool_items.create_index([
+                ("session_id", 1),
+                ("content_type", 1)
+            ])
             
-            # Tool operation indexes
-            await self.tool_operations.create_index([("session_id", 1)])
-            await self.tool_operations.create_index([("state", 1)])
-            await self.tool_operations.create_index([("last_updated", 1)])
-            
+            # Scheduled operations indexes
+            await self.scheduled_operations.create_index([("session_id", 1)])
+            await self.scheduled_operations.create_index([("status", 1)])
+            await self.scheduled_operations.create_index([("scheduled_time", 1)])
+            await self.scheduled_operations.create_index([("content_type", 1)])
+            await self.scheduled_operations.create_index([
+                ("status", 1),
+                ("scheduled_time", 1)
+            ])
+
             logger.info("Successfully created database indexes")
         except Exception as e:
             logger.error(f"Error setting up indexes: {str(e)}")
@@ -261,129 +443,95 @@ class RinDB:
         }).sort("timestamp", 1)
         return await cursor.to_list(length=None)
 
-    async def create_tweet_schedule(self, session_id: str, topic: str, 
-                                  total_tweets: int, schedule_info: Dict) -> str:
-        """Create a new tweet schedule"""
-        schedule = TweetSchedule(
-            session_id=session_id,
-            topic=topic,
-            total_tweets_requested=total_tweets,
-            schedule_info=schedule_info,
-            approved_tweets=[],
-            pending_tweets=None,
-            status='collecting_approval',
-            created_at=datetime.utcnow(),
-            last_updated=datetime.utcnow(),
-            last_error=None,
-            metadata=None
-        )
-        result = await self.tweet_schedules.insert_one(schedule)
-        return str(result.inserted_id)
-
-    async def update_tweet_schedule(self, schedule_id: str, 
-                                  approved_tweet_ids: Optional[List[str]] = None,
-                                  pending_tweet_ids: Optional[List[str]] = None,
-                                  status: Optional[str] = None,
-                                  schedule_info: Optional[Dict] = None) -> bool:
-        """Update a tweet schedule with new tweet IDs, status, or schedule info"""
+    async def create_tool_item(
+        self,
+        session_id: str,
+        content_type: str,
+        content: Dict,
+        parameters: Dict,
+        metadata: Optional[Dict] = None
+    ) -> str:
+        """Create a new tool item with validation"""
         try:
-            update_data = {"last_updated": datetime.utcnow()}
-            if approved_tweet_ids is not None:
-                update_data["approved_tweets"] = approved_tweet_ids
-            if pending_tweet_ids is not None:
-                update_data["pending_tweets"] = pending_tweet_ids
-            if status:
-                update_data["status"] = status
-            if schedule_info:
-                update_data["schedule_info"] = schedule_info
+            # Validate required content
+            if not content.get('raw_content'):
+                raise ValueError("Tool item content cannot be empty")
 
-            result = await self.tweet_schedules.update_one(
-                {"_id": ObjectId(schedule_id)},
-                {"$set": update_data}
-            )
-            return result.modified_count > 0
-        except Exception as e:
-            logger.error(f"Error updating tweet schedule: {e}")
-            return False
-
-    async def get_tweet_schedule(self, schedule_id: str) -> Optional[TweetSchedule]:
-        """Get a tweet schedule by ID"""
-        try:
-            return await self.tweet_schedules.find_one({"_id": ObjectId(schedule_id)})
-        except Exception as e:
-            logger.error(f"Error fetching tweet schedule: {e}")
-            return None
-
-    async def get_session_tweet_schedule(self, session_id: str) -> Optional[TweetSchedule]:
-        """Get active tweet schedule for a session"""
-        try:
-            return await self.tweet_schedules.find_one({
+            tool_item = {
                 "session_id": session_id,
-                "status": {"$in": ["collecting_approval", "ready_to_schedule"]}
-            })
-        except Exception as e:
-            logger.error(f"Error fetching session tweet schedule: {e}")
-            return None
+                "content_type": content_type,
+                "status": OperationStatus.PENDING.value,
+                "content": {
+                    **content,
+                    "version": "1.0"
+                },
+                "parameters": {
+                    **parameters,
+                    "retry_policy": parameters.get("retry_policy", {"max_attempts": 3, "delay": 300})
+                },
+                "metadata": {
+                    **(metadata or {}),
+                    "generated_at": datetime.now(UTC).isoformat(),
+                    "generated_by": "system",
+                    "last_modified": datetime.now(UTC).isoformat(),
+                    "version": "1.0"
+                },
+                "created_at": datetime.now(UTC),
+                "retry_count": 0
+            }
 
-    async def get_pending_scheduled_tweets(self) -> List[TweetSchedule]:
-        """Get all tweet schedules ready for execution"""
+            result = await self.tool_items.insert_one(tool_item)
+            return str(result.inserted_id)
+
+        except Exception as e:
+            logger.error(f"Error creating tool item: {e}")
+            raise
+
+    async def get_pending_items(self, 
+                              content_type: Optional[str] = None,
+                              schedule_id: Optional[str] = None) -> List[Dict]:
+        """Get pending items, optionally filtered by type and schedule"""
         try:
-            current_time = datetime.utcnow()
-            cursor = self.tweet_schedules.find({
-                "status": "scheduled",
-                "execution_times": {"$lte": current_time}
-            })
+            query = {"status": OperationStatus.PENDING.value}
+            if content_type:
+                query["content_type"] = content_type
+            if schedule_id:
+                query["schedule_id"] = schedule_id
+            
+            cursor = self.tool_items.find(query)
             return await cursor.to_list(length=None)
         except Exception as e:
-            logger.error(f"Error fetching pending scheduled tweets: {e}")
+            logger.error(f"Error fetching pending items: {e}")
             return []
 
-    async def create_tweet(self, content: str, schedule_id: str, session_id: str,
-                          scheduled_time: Optional[datetime] = None) -> str:
-        """Create a new tweet"""
-        tweet = Tweet(
-            content=content,
-            status=TweetStatus.PENDING,
-            created_at=datetime.utcnow(),
-            scheduled_time=scheduled_time,
-            posted_time=None,
-            metadata={},
-            twitter_api_params={
-                "message": content,
-                "account_id": "default"
-            },
-            twitter_response=None,
-            retry_count=0,
-            last_error=None,
-            schedule_id=schedule_id,
-            session_id=session_id
-        )
-        result = await self.tweets.insert_one(tweet)
-        return str(result.inserted_id)
-
-    async def update_tweet_status(self, tweet_id: str, status: TweetStatus,
-                                twitter_response: Optional[Dict] = None,
-                                error: Optional[str] = None,
-                                metadata: Optional[Dict] = None) -> bool:
-        """Update tweet status and related fields"""
+    async def update_tool_item_status(self, 
+                                    item_id: str, 
+                                    status: OperationStatus,
+                                    api_response: Optional[Dict] = None,
+                                    error: Optional[str] = None,
+                                    metadata: Optional[Dict] = None) -> bool:
+        """Update tool item status and related fields"""
         try:
             update_data = {
-                "status": status,
-                "last_updated": datetime.utcnow()
+                "status": status.value if isinstance(status, OperationStatus) else status,
+                "last_updated": datetime.now(UTC)
             }
             
-            if status == TweetStatus.POSTED and twitter_response:
-                update_data["posted_time"] = datetime.utcnow()
-                update_data["twitter_response"] = twitter_response
+            if status == OperationStatus.EXECUTED and api_response:
+                update_data["executed_time"] = datetime.now(UTC)
+                update_data["api_response"] = api_response
             
             if error:
                 update_data["last_error"] = error
             
             if metadata:
-                update_data["metadata"] = metadata
+                update_data["metadata"] = {
+                    **update_data.get("metadata", {}),
+                    **metadata
+                }
             
-            result = await self.tweets.update_one(
-                {"_id": ObjectId(tweet_id)},
+            result = await self.tool_items.update_one(
+                {"_id": ObjectId(item_id)},
                 {
                     "$set": update_data,
                     "$inc": {"retry_count": 1} if error else {}
@@ -391,89 +539,193 @@ class RinDB:
             )
             return result.modified_count > 0
         except Exception as e:
-            logger.error(f"Error updating tweet status: {e}")
+            logger.error(f"Error updating tool item status: {e}")
             return False
 
-    async def get_tweets_by_schedule(self, schedule_id: str) -> List[Tweet]:
-        """Get all tweets for a schedule"""
+    async def set_tool_operation_state(self, session_id: str, operation_data: Dict) -> Optional[Dict]:
+        """Set tool operation state"""
         try:
-            cursor = self.tweets.find({"schedule_id": schedule_id})
-            return await cursor.to_list(length=None)
-        except Exception as e:
-            logger.error(f"Error fetching schedule tweets: {e}")
-            return []
-
-    async def get_pending_tweets(self, schedule_id: Optional[str] = None) -> List[Tweet]:
-        """Get pending tweets, optionally filtered by schedule"""
-        try:
-            query = {"status": TweetStatus.PENDING}
-            if schedule_id:
-                query["schedule_id"] = schedule_id
-            
-            cursor = self.tweets.find(query)
-            return await cursor.to_list(length=None)
-        except Exception as e:
-            logger.error(f"Error fetching pending tweets: {e}")
-            return []
-
-    async def get_scheduled_tweets_for_execution(self) -> List[Tweet]:
-        """Get tweets that are ready to be posted"""
-        try:
-            current_time = datetime.utcnow()
-            cursor = self.tweets.find({
-                "status": TweetStatus.SCHEDULED.value,
-                "$or": [
-                    {"scheduled_time": {"$lte": current_time}},
-                    {"metadata.scheduled_time": {"$lte": current_time.isoformat()}}
-                ],
-                "retry_count": {"$lt": 3}
+            # Ensure required fields
+            operation_data.update({
+                "last_updated": datetime.now(UTC)
             })
-            return await cursor.to_list(length=None)
-        except Exception as e:
-            logger.error(f"Error fetching executable tweets: {e}")
-            return []
-
-    async def set_tool_operation_state(self, session_id: str, operation_data: Dict) -> bool:
-        try:
-            await self.tool_operations.update_one(
+            
+            # Handle both new operations and updates
+            result = await self.tool_operations.find_one_and_update(
                 {"session_id": session_id},
                 {"$set": operation_data},
-                upsert=True
+                upsert=True,
+                return_document=True
             )
-            return True
-        except Exception as e:
-            logger.error(f"Error setting tool operation state: {e}")
-            return False
+            
+            if result:
+                logger.info(f"Set operation state for session {session_id}")
+                return result
+            else:
+                logger.error(f"Failed to set operation state for session {session_id}")
+                return None
 
-    async def get_tool_operation_state(self, session_id: str) -> Optional[ToolOperation]:
+        except Exception as e:
+            logger.error(f"Error setting operation state: {e}")
+            return None
+
+    async def get_tool_operation_state(self, session_id: str) -> Optional[Dict]:
+        """Get tool operation state"""
         try:
             return await self.tool_operations.find_one({"session_id": session_id})
         except Exception as e:
-            logger.error(f"Error getting tool operation state: {e}")
+            logger.error(f"Error getting operation state: {e}")
             return None
+
+    async def get_scheduled_operation(self, operation_id: str) -> Optional[Dict]:
+        """Get scheduled operation by ID"""
+        try:
+            # First try direct ObjectId lookup
+            if ObjectId.is_valid(operation_id):
+                schedule = await self.scheduled_operations.find_one({"_id": ObjectId(operation_id)})
+                if schedule:
+                    logger.info(f"Found schedule by ObjectId: {operation_id}")
+                    return schedule
+
+            # Try session_id or tool_operation_id lookup
+            schedule = await self.scheduled_operations.find_one({
+                "$or": [
+                    {"session_id": operation_id},
+                    {"tool_operation_id": operation_id}
+                ]
+            })
+            
+            if schedule:
+                logger.info(f"Found schedule by session/operation ID: {operation_id}")
+                return schedule
+            
+            logger.warning(f"No schedule found for ID: {operation_id}")
+            return None
+
+        except Exception as e:
+            logger.error(f"Error getting scheduled operation: {e}")
+            return None
+
+    async def create_scheduled_operation(self, 
+                                session_id: str,
+                                tool_operation_id: str,
+                                content_type: str,
+                                count: int,
+                                schedule_type: str,
+                                schedule_time: str,
+                                content: Dict,
+                                metadata: Optional[Dict] = None) -> str:
+        """Create new scheduled operation with proper schema"""
+        try:
+            operation = {
+                "session_id": session_id,
+                "tool_operation_id": tool_operation_id,
+                "content_type": content_type,
+                "status": OperationStatus.PENDING.value,
+                "count": count,
+                "schedule_type": schedule_type,
+                "schedule_time": schedule_time,
+                "approval_required": True,
+                "content": content,
+                "pending_items": [],
+                "approved_items": [],
+                "rejected_items": [],
+                "created_at": datetime.now(UTC),
+                "metadata": {
+                    **(metadata or {}),
+                    "content_type": content_type,
+                    "created_at": datetime.now(UTC).isoformat()
+                },
+                "retry_count": 0
+            }
+
+            result = await self.scheduled_operations.insert_one(operation)
+            logger.info(f"Created scheduled operation: {result.inserted_id}")
+            
+            # Return the created schedule
+            return str(result.inserted_id)
+
+        except Exception as e:
+            logger.error(f"Error creating scheduled operation: {e}")
+            raise
 
     async def delete_all_scheduled_tweets(self):
         """Delete all tweet schedules and their associated tweets"""
         try:
             # Get all schedule IDs first
-            schedule_cursor = self.tweet_schedules.find({})
+            schedule_cursor = self.scheduled_operations.find({})
             schedules = await schedule_cursor.to_list(length=None)
             schedule_ids = [str(schedule['_id']) for schedule in schedules]
             
             # Delete all tweets associated with these schedules
             for schedule_id in schedule_ids:
-                await self.tweets.delete_many({"schedule_id": schedule_id})
-                logger.info(f"Deleted tweets for schedule {schedule_id}")
+                await self.tool_items.delete_many({"schedule_id": schedule_id})
+                logger.info(f"Deleted items for schedule {schedule_id}")
             
             # Delete all tweet schedules
-            result = await self.tweet_schedules.delete_many({})
+            result = await self.scheduled_operations.delete_many({})
             
-            logger.info(f"Deleted {result.deleted_count} tweet schedules")
+            logger.info(f"Deleted {result.deleted_count} scheduled operations")
             return {
-                "schedules_deleted": result.deleted_count,
+                "operations_deleted": result.deleted_count,
                 "schedule_ids": schedule_ids
             }
             
         except Exception as e:
-            logger.error(f"Error deleting scheduled tweets: {e}")
+            logger.error(f"Error deleting scheduled operations: {e}")
             raise
+
+    async def update_scheduled_operation(
+        self,
+        schedule_id: str,
+        status: Optional[str] = None,
+        pending_item_ids: Optional[List[str]] = None,
+        approved_item_ids: Optional[List[str]] = None,
+        rejected_item_ids: Optional[List[str]] = None,
+        schedule_info: Optional[Dict] = None,
+        metadata: Optional[Dict] = None
+    ) -> bool:
+        """Update scheduled operation with new data"""
+        try:
+            update_data = {"last_updated": datetime.now(UTC)}
+            
+            if status:
+                update_data["status"] = status
+                
+            if pending_item_ids is not None:
+                update_data["pending_items"] = pending_item_ids
+                
+            if approved_item_ids is not None:
+                update_data["approved_items"] = approved_item_ids
+                
+            if rejected_item_ids is not None:
+                update_data["rejected_items"] = rejected_item_ids
+                
+            if schedule_info:
+                update_data["schedule_info"] = schedule_info
+                
+            if metadata:
+                update_data["metadata"] = {
+                    "$set": {
+                        **update_data.get("metadata", {}),
+                        **metadata,
+                        "last_modified": datetime.now(UTC).isoformat()
+                    }
+                }
+
+            result = await self.scheduled_operations.update_one(
+                {"_id": ObjectId(schedule_id) if ObjectId.is_valid(schedule_id) else schedule_id},
+                {"$set": update_data}
+            )
+            
+            success = result.modified_count > 0
+            if success:
+                logger.info(f"Updated scheduled operation: {schedule_id}")
+            else:
+                logger.warning(f"No scheduled operation updated for ID: {schedule_id}")
+                
+            return success
+
+        except Exception as e:
+            logger.error(f"Error updating scheduled operation: {e}")
+            return False

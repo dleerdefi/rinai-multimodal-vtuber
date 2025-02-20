@@ -50,9 +50,6 @@ class StreamOrchestrator:
             # Initialize LLM service
             self.llm_service = LLMService()
             
-            # Set default model
-            self.model_type = ModelType.SAO_10K_L31_70B_EURYALE_V2_2
-            
             # Initialize chat manager if YouTube stream ID is provided
             self.chat_manager = None
             if config.get('enable_youtube_chat') and config.get('youtube_stream_id'):
@@ -160,26 +157,6 @@ class StreamOrchestrator:
                 'timestamp': datetime.now().isoformat()
             })
             
-            # Check for tool commands before agent processing
-            try:
-                if self.tool_state_manager.should_use_tools(message):
-                    logger.info(f"Detected tool command: {message}")
-                    tool_type = self.tool_state_manager.get_tool_operation_type(message)
-                    logger.info(f"Tool type detected: {tool_type}")
-                    
-                    if tool_type:
-                        try:
-                            result = await self.tool_state_manager.execute_tool(tool_type, message)
-                            logger.info(f"Tool execution result: {result}")
-                            if not result:
-                                logger.warning("Tool execution returned no result")
-                        except Exception as tool_error:
-                            logger.error(f"Tool execution failed: {tool_error}", exc_info=True)
-                            # Continue with agent processing even if tool fails
-            except Exception as e:
-                logger.error(f"Error in tool processing: {e}", exc_info=True)
-                # Continue with agent processing
-            
             # Route through RinAgent
             response = await self.agent.get_response(
                 session_id=self.current_session_id,
@@ -244,7 +221,6 @@ class StreamOrchestrator:
             if self.speech_manager:
                 logger.info("Initializing speech input...")
                 await self.speech_manager.initialize()
-                # Don't auto-start recording, wait for Alt+S
             
             # Start schedule service
             await self.schedule_service.start()

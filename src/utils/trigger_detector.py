@@ -218,7 +218,11 @@ class TriggerDetector:
         """Determine specific tool type needed"""
         message = message.lower()
         
-        # Add time and weather checks
+        # Check Twitter patterns first
+        if self.should_use_twitter(message):
+            return "twitter"  # This matches agent.py's check
+        
+        # Rest of the tool checks remain unchanged
         if any(keyword.lower() in message for keyword in self.tool_triggers['time']['keywords']) or \
            any(phrase.lower() in message for phrase in self.tool_triggers['time']['phrases']):
             return "time_tools"

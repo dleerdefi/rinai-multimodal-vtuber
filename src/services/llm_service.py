@@ -87,7 +87,7 @@ class LLMService:
         self.model_configs = {
             # OpenAI configs
             ModelType.GPT4o: {
-                "default": {"temperature": 0.7, "max_tokens": 1000},
+                "default": {"temperature": 0.7, "max_tokens": 500},
                 "json": {
                     "temperature": 0.2,
                     "max_tokens": 500,
@@ -96,24 +96,24 @@ class LLMService:
                 "decision": {"temperature": 0.2, "max_tokens": 100}
             },
             ModelType.GPT4_TURBO: {
-                "default": {"temperature": 0.7, "max_tokens": 1000},
+                "default": {"temperature": 0.7, "max_tokens": 500},
                 "decision": {"temperature": 0.2, "max_tokens": 100}
             },
             ModelType.GPT4: {
-                "default": {"temperature": 0.7, "max_tokens": 800},
+                "default": {"temperature": 0.7, "max_tokens": 50},
                 "decision": {"temperature": 0.2, "max_tokens": 100}
             },
             ModelType.GPT35_TURBO: {
-                "default": {"temperature": 0.9, "max_tokens": 600},
+                "default": {"temperature": 0.9, "max_tokens": 500},
                 "decision": {"temperature": 0.3, "max_tokens": 100}
             },
             # Claude configs
             ModelType.CLAUDE_3_OPUS: {
-                "default": {"temperature": 0.7, "max_tokens": 1000},
+                "default": {"temperature": 0.7, "max_tokens": 500},
                 "decision": {"temperature": 0.2, "max_tokens": 100}
             },
             ModelType.CLAUDE_3_5_SONNET: {
-                "default": {"temperature": 0.7, "max_tokens": 800},
+                "default": {"temperature": 0.7, "max_tokens": 500},
                 "decision": {"temperature": 0.2, "max_tokens": 100}
             },
             ModelType.CLAUDE_3_5_HAIKU: {
