@@ -18,6 +18,7 @@ class ApprovalAnalyzer:
     ) -> Dict[str, Any]:
         """Analyze user's approval response"""
         try:
+            logger.info(f"Analyzing approval response: {user_response}")
             # Build presentation of items
             presentation = self.format_items_for_review(current_items)
             
@@ -54,10 +55,13 @@ There are {len(current_items)} items to analyze. Return ONLY valid JSON in this 
 
             # Parse response
             analysis = json.loads(response)
+            logger.info(f"LLM analysis result: {analysis}")
             
             # Convert to 0-based indices
             approved_indices = [i-1 for i in analysis.get("approved_indices", [])]
             regenerate_indices = [i-1 for i in analysis.get("regenerate_indices", [])]
+            
+            logger.info(f"Processing approval with {len(approved_indices)} approved and {len(regenerate_indices)} regenerate items")
             
             # Validate indices are within bounds
             approved_indices = [i for i in approved_indices if 0 <= i < len(current_items)]

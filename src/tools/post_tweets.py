@@ -91,10 +91,10 @@ class TwitterTool(BaseTool):
                     content_type=ContentType.TWEET.value,
                     tool_operation_id=str(operation['_id']),
                     handlers={
-                        ApprovalAction.PARTIAL_APPROVAL.value: lambda **kwargs: self._regenerate_rejected_tweets(**kwargs),
-                        ApprovalAction.REGENERATE_ALL.value: lambda **kwargs: self._regenerate_rejected_tweets(**kwargs),
-                        ApprovalAction.FULL_APPROVAL.value: lambda **kwargs: kwargs,  # Just pass through
-                        ApprovalAction.EXIT.value: lambda **kwargs: kwargs  # Just pass through
+                        ApprovalAction.PARTIAL_APPROVAL.value: self._regenerate_rejected_tweets,
+                        ApprovalAction.REGENERATE_ALL.value: self._regenerate_rejected_tweets,
+                        ApprovalAction.FULL_APPROVAL.value: self.approval_manager.handle_full_approval,
+                        ApprovalAction.EXIT.value: self.approval_manager.handle_exit
                     }
                 )
 
@@ -229,13 +229,19 @@ Example response format:
                 "last_updated": datetime.now(UTC),
                 "input_data": {
                     "command": command,
-                    "schedule_id": schedule_id  # Link to schedule
+                    "schedule_id": schedule_id,  # Link to schedule
+                    "command_info": {
+                        "topic": params["topic"],
+                        "item_count": params["item_count"],
+                        "schedule_type": params.get("schedule_type"),
+                        "schedule_time": params.get("schedule_time")
+                    }
                 },
                 "output_data": {
-                    "pending_items": [],  # Will store tool item IDs
+                    "pending_items": [],
                     "approved_items": [],
                     "rejected_items": [],
-                    "schedule_id": schedule_id,  # Duplicate for easy access
+                    "schedule_id": schedule_id,
                     "status": OperationStatus.PENDING.value
                 },
                 "metadata": {
@@ -277,6 +283,10 @@ Example response format:
             # Verify operation is in correct state
             if operation["state"] != ToolOperationState.COLLECTING.value:
                 raise ValueError(f"Operation in invalid state: {operation['state']}")
+            
+            # Add check for regeneration
+            is_regenerating = operation.get("metadata", {}).get("approval_state") == ApprovalState.REGENERATING.value
+            logger.info(f"Generating tweets in {'regeneration' if is_regenerating else 'initial'} mode")
             
             # Generate tweets using LLM
             prompt = f"""You are a professional social media manager. Generate {count} engaging tweets about {topic}.
@@ -385,6 +395,15 @@ Format the response as JSON:
 
             logger.info(f"Generated and saved {len(saved_items)} tweet items")
             
+            if is_regenerating:
+                return {
+                    "items": saved_items,
+                    "schedule_id": schedule_id,
+                    "tool_operation_id": tool_operation_id,
+                    "regeneration_needed": True,
+                    "regenerate_count": len(saved_items)
+                }
+
             return {
                 "items": saved_items,
                 "schedule_id": schedule_id,
@@ -394,25 +413,6 @@ Format the response as JSON:
         except Exception as e:
             logger.error(f"Error generating tweets: {e}", exc_info=True)
             raise
-
-    # Helper methods
-    async def _update_tweet_status(self, schedule_id: str, status: Union[str, OperationStatus]) -> bool:
-        """Update tweet status in database"""
-        try:
-            # Convert string to enum if needed
-            if isinstance(status, str):
-                status = OperationStatus[status.upper()]
-            elif not isinstance(status, OperationStatus):
-                raise ValueError(f"Invalid status type: {type(status)}")
-
-            await self.db.scheduled_operations.update_one(
-                {"_id": ObjectId(schedule_id)},
-                {"$set": {"status": status.value}}
-            )
-            return True
-        except Exception as e:
-            logger.error(f"Error updating tweet status: {e}")
-            return False
 
     async def _activate_tweet_schedule(self, schedule_id: str, schedule_info: Dict) -> bool:
         """Activate a tweet schedule after approval"""
@@ -575,32 +575,36 @@ Format the response as JSON:
                 'error': str(e)
             }
 
-    async def _regenerate_rejected_tweets(self, tool_operation_id: str, **kwargs) -> Dict:
-        """Handle tweet regeneration based on ApprovalManager's response"""
+    async def _regenerate_rejected_tweets(
+        self,
+        tool_operation_id: str,
+        regenerate_count: int,
+        analysis: Dict,
+        **kwargs
+    ) -> Dict:
+        """Handle tweet regeneration after partial approval"""
         try:
             # Get operation for topic
             operation = await self.tool_state_manager.get_operation_by_id(tool_operation_id)
             if not operation:
                 raise ValueError(f"No operation found for ID {tool_operation_id}")
 
-            # Get count from kwargs (set by ApprovalManager)
-            count = kwargs.get('regenerate_count', 0)
-            if not count:
-                raise ValueError("No regeneration count provided")
+            # Get topic from command_info
+            topic = operation.get("input_data", {}).get("command_info", {}).get("topic")
+            if not topic:
+                raise ValueError("Could not find topic for regeneration")
 
-            logger.info(f"Regenerating {count} tweets for operation {tool_operation_id}")
-            
-            # Generate new tweets using original topic
-            generation_result = await self._generate_tweets(
-                topic=operation.get("input_data", {}).get("topic"),
-                count=count,
-                schedule_id=operation.get("input_data", {}).get("schedule_id"),
+            logger.info(f"Regenerating {regenerate_count} tweets about topic: {topic}")
+
+            # Generate new tweet content - _generate_tweets handles state management
+            return await self._generate_tweets(
+                topic=topic, 
+                count=regenerate_count, 
+                schedule_id=operation.get("input_data", {}).get("schedule_id"), 
                 tool_operation_id=tool_operation_id
             )
 
-            return generation_result
-
         except Exception as e:
             logger.error(f"Error regenerating tweets: {e}")
-            raise
+            return self.approval_manager._create_error_response(str(e))
 

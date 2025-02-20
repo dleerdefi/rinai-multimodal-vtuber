@@ -32,7 +32,6 @@ class ApprovalState(Enum):
     """Sub-states during the approval workflow"""
     AWAITING_INITIAL = "awaiting_initial"
     AWAITING_APPROVAL = "awaiting_approval"
-    PARTIALLY_APPROVED = "partial_approval"
     REGENERATING = "regenerating"
     APPROVAL_FINISHED = "approval_finished"
     APPROVAL_CANCELLED = "approval_cancelled"
@@ -51,9 +50,8 @@ class ApprovalManager:
     STATE_MAPPING = {
         ApprovalState.AWAITING_INITIAL: ToolOperationState.APPROVING,
         ApprovalState.AWAITING_APPROVAL: ToolOperationState.APPROVING,
-        ApprovalState.PARTIALLY_APPROVED: ToolOperationState.APPROVING,
-        ApprovalState.REGENERATING: ToolOperationState.APPROVING,
-        ApprovalState.APPROVAL_FINISHED: ToolOperationState.EXECUTING,
+        ApprovalState.REGENERATING: ToolOperationState.COLLECTING,      # For rejected items
+        ApprovalState.APPROVAL_FINISHED: ToolOperationState.EXECUTING,  # For approved items
         ApprovalState.APPROVAL_CANCELLED: ToolOperationState.CANCELLED
     }
 
@@ -117,7 +115,7 @@ class ApprovalManager:
     ) -> Dict:
         """Process user's response during approval flow"""
         try:
-            # Get current items for this operation using tool_operation_id
+            # Get current items for this operation
             items = await self.db.tool_items.find({
                 "tool_operation_id": tool_operation_id,
                 "state": ToolOperationState.APPROVING.value,
@@ -127,12 +125,6 @@ class ApprovalManager:
             if not items:
                 logger.error(f"No items found for approval in operation {tool_operation_id}")
                 return self.analyzer.create_error_response("No items found for approval")
-
-            # Get current operation state
-            operation = await self.tool_state_manager.get_operation_by_id(tool_operation_id)
-            if not operation:
-                logger.error(f"Operation {tool_operation_id} not found")
-                return self.analyzer.create_error_response("Operation not found")
 
             # Analyze the response with the current items
             analysis = await self.analyzer.analyze_response(
@@ -144,76 +136,97 @@ class ApprovalManager:
             action = self._map_to_approval_action(analysis)
             
             if action == ApprovalAction.ERROR:
-                # Keep operation in AWAITING_APPROVAL state
-                await self.tool_state_manager.update_operation(
-                    session_id=session_id,
-                    tool_operation_id=tool_operation_id,
-                    state=ToolOperationState.APPROVING.value,
-                    metadata={
-                        "approval_state": ApprovalState.AWAITING_APPROVAL.value,
-                        "last_response_at": datetime.now(UTC).isoformat(),
-                        "error": "Could not determine action from response"
-                    }
-                )
                 return self.analyzer.create_error_response("Could not determine action from response")
             
             if action == ApprovalAction.AWAITING_INPUT:
-                # Keep operation in AWAITING_APPROVAL state
-                await self.tool_state_manager.update_operation(
-                    session_id=session_id,
-                    tool_operation_id=tool_operation_id,
-                    state=ToolOperationState.APPROVING.value,
-                    metadata={
-                        "approval_state": ApprovalState.AWAITING_APPROVAL.value,
-                        "last_response_at": datetime.now(UTC).isoformat(),
-                        "awaiting_input": True
-                    }
-                )
                 return self.analyzer.create_awaiting_response()
+
+            # For partial approval, we need to handle both APPROVAL_FINISHED and REGENERATING states
+            if action == ApprovalAction.PARTIAL_APPROVAL:
+                approved_indices = analysis.get('indices', [])
+                regenerate_indices = analysis.get('regenerate_indices', [])
+                
+                # Important: Set operation state to COLLECTING first if we have items to regenerate
+                if regenerate_indices:
+                    await self.tool_state_manager.update_operation(
+                        session_id=session_id,
+                        tool_operation_id=tool_operation_id,
+                        state=ToolOperationState.COLLECTING.value,
+                        metadata={
+                            "approval_state": ApprovalState.REGENERATING.value,
+                            "regenerate_count": len(regenerate_indices)
+                        }
+                    )
+                
+                # Then update individual items
+                if approved_indices:
+                    await self._update_approved_items(tool_operation_id, approved_indices, items)
+                if regenerate_indices:
+                    await self._update_rejected_items(tool_operation_id, regenerate_indices, items)
+                
+                # Get the handler and call with appropriate state information
+                handler = handlers.get(action.value)
+                return await handler(
+                    tool_operation_id=tool_operation_id,
+                    session_id=session_id,
+                    analysis=analysis,
+                    regenerate_count=len(regenerate_indices)
+                )
             
-            # For valid actions (FULL_APPROVAL, PARTIAL_APPROVAL, REGENERATE_ALL)
-            # Get the appropriate handler
+            # For other actions, use standard handler
             handler = handlers.get(action.value)
             if not handler:
                 logger.error(f"No handler found for action {action}")
-                # Keep operation in AWAITING_APPROVAL state
-                await self.tool_state_manager.update_operation(
-                    session_id=session_id,
-                    tool_operation_id=tool_operation_id,
-                    state=ToolOperationState.APPROVING.value,
-                    metadata={
-                        "approval_state": ApprovalState.AWAITING_APPROVAL.value,
-                        "last_response_at": datetime.now(UTC).isoformat(),
-                        "error": f"No handler for action {action}"
-                    }
-                )
                 return self.analyzer.create_error_response(f"No handler for action {action}")
             
-            # Call the handler with the analysis
-            # Each handler is responsible for:
-            # - FULL_APPROVAL: All items -> EXECUTING state
-            # - PARTIAL_APPROVAL: Approved -> EXECUTING, Rejected -> new items in COLLECTING
-            # - REGENERATE_ALL: All items -> new items in COLLECTING
+            # Call the handler with the analysis and tool_operation_id
             return await handler(
                 tool_operation_id=tool_operation_id,
                 session_id=session_id,
-                analysis=analysis
+                analysis=analysis,
+                regenerate_count=len(analysis.get('regenerate_indices', [])) # Pass regenerate count explicitly
             )
 
         except Exception as e:
             logger.error(f"Error processing approval response: {e}")
-            # Keep operation in AWAITING_APPROVAL state on error
-            await self.tool_state_manager.update_operation(
-                session_id=session_id,
-                tool_operation_id=tool_operation_id,
-                state=ToolOperationState.APPROVING.value,
-                metadata={
-                    "approval_state": ApprovalState.AWAITING_APPROVAL.value,
-                    "last_response_at": datetime.now(UTC).isoformat(),
-                    "error": str(e)
-                }
-            )
             return self.analyzer.create_error_response(str(e))
+
+    async def _update_approved_items(self, tool_operation_id: str, approved_indices: List[int], items: List[Dict]):
+        """Update approved items to APPROVAL_FINISHED state"""
+        approved_ids = [items[idx]['_id'] for idx in approved_indices if 0 <= idx < len(items)]
+        logger.info(f"Updating {len(approved_ids)} items to APPROVED/EXECUTING state")
+        
+        await self.db.tool_items.update_many(
+            {
+                "tool_operation_id": tool_operation_id,
+                "_id": {"$in": approved_ids}
+            },
+            {"$set": {
+                "state": ToolOperationState.EXECUTING.value,
+                "status": OperationStatus.APPROVED.value,
+                "metadata.approval_state": ApprovalState.APPROVAL_FINISHED.value,
+                "metadata.approved_at": datetime.now(UTC).isoformat()
+            }}
+        )
+        logger.info(f"Successfully updated items {approved_ids} to APPROVED/EXECUTING")
+
+    async def _update_rejected_items(self, tool_operation_id: str, regenerate_indices: List[int], items: List[Dict]):
+        """Update rejected items to COMPLETED state"""
+        rejected_ids = [items[idx]['_id'] for idx in regenerate_indices if 0 <= idx < len(items)]
+        logger.info(f"Updating {len(rejected_ids)} items to REJECTED/COMPLETED state")
+        
+        await self.db.tool_items.update_many(
+            {
+                "tool_operation_id": tool_operation_id,
+                "_id": {"$in": rejected_ids}
+            },
+            {"$set": {
+                "state": ToolOperationState.COMPLETED.value,
+                "status": OperationStatus.REJECTED.value,
+                "metadata.rejected_at": datetime.now(UTC).isoformat()
+            }}
+        )
+        logger.info(f"Successfully updated items {rejected_ids} to REJECTED/COMPLETED")
 
     async def handle_full_approval(self, session_id: str, tool_operation_id: str, **kwargs) -> Dict:
         """Handle full approval of all items"""
@@ -259,13 +272,15 @@ class ApprovalManager:
         self,
         session_id: str,
         tool_operation_id: str,
-        approved_indices: List[int],
-        items: List[Dict]
+        analysis: Dict
     ) -> Dict:
         """Handle partial approval of items"""
         try:
             logger.info(f"Processing partial approval for operation {tool_operation_id}")
+            approved_indices = analysis.get('indices', [])
+            regenerate_indices = analysis.get('regenerate_indices', [])
             logger.info(f"Approved indices: {approved_indices}")
+            logger.info(f"Regenerate indices: {regenerate_indices}")
             
             # Get all items for this operation
             current_items = await self.db.tool_items.find({
@@ -280,64 +295,34 @@ class ApprovalManager:
             # Track items for different states
             approved_items = []
             rejected_items = []
-            regeneration_needed = []
 
-            for idx, item in enumerate(current_items):
-                item_id = str(item['_id'])
-                if idx in approved_indices:
-                    logger.info(f"Approving item {item_id}")
-                    await self.db.tool_items.update_one(
-                        {"_id": item['_id']},
-                        {"$set": {
-                            "state": ToolOperationState.EXECUTING.value,
-                            "status": OperationStatus.APPROVED.value,
-                            "metadata": {
-                                **item.get("metadata", {}),
-                                "approved_at": datetime.now(UTC).isoformat()
-                            }
-                        }}
-                    )
-                    approved_items.append(item_id)
-                else:
-                    logger.info(f"Rejecting item {item_id} for regeneration")
-                    await self.db.tool_items.update_one(
-                        {"_id": item['_id']},
-                        {"$set": {
-                            "state": ToolOperationState.COMPLETED.value,  # Changed from CANCELLED
-                            "status": OperationStatus.REJECTED.value,
-                            "metadata": {
-                                **item.get("metadata", {}),
-                                "rejected_at": datetime.now(UTC).isoformat()
-                            }
-                        }}
-                    )
-                    rejected_items.append(item_id)
-                    regeneration_needed.append(idx)
+            # Update approved items first
+            if approved_indices:
+                logger.info(f"Updating {len(approved_indices)} items to EXECUTING state")
+                await self._update_approved_items(tool_operation_id, approved_indices, current_items)
+                approved_items = [current_items[idx] for idx in approved_indices if 0 <= idx < len(current_items)]
 
-            # Only update operation metadata, let tool handle regeneration
+            # Update rejected items - just mark them as COMPLETED/REJECTED
+            if regenerate_indices:
+                logger.info(f"Updating {len(regenerate_indices)} items to COMPLETED state")
+                await self._update_rejected_items(tool_operation_id, regenerate_indices, current_items)
+                rejected_items = [current_items[idx] for idx in regenerate_indices if 0 <= idx < len(current_items)]
+
+            # Update operation state for regeneration
             await self.tool_state_manager.update_operation(
                 session_id=session_id,
                 tool_operation_id=tool_operation_id,
+                state=ToolOperationState.COLLECTING.value,  # Let _generate_tweets handle this
                 metadata={
-                    "approval_state": ApprovalState.PARTIALLY_APPROVED.value,
-                    "approved_items": approved_items,
-                    "rejected_items": rejected_items,
-                    "last_updated": datetime.now(UTC).isoformat()
+                    "approval_state": ApprovalState.REGENERATING.value,
+                    "regenerate_count": len(regenerate_indices)
                 }
             )
 
-            logger.info(f"Partial approval complete. Approved: {len(approved_items)}, Rejected: {len(rejected_items)}")
             return {
-                "status": "partial_approval",
-                "approved_count": len(approved_items),
-                "regenerate_count": len(rejected_items),
-                "regeneration_needed": True,
-                "response": f"Approved {len(approved_items)} items. {len(rejected_items)} items need regeneration.",
-                "data": {
-                    "approved_items": approved_items,
-                    "rejected_items": rejected_items,
-                    "completion_type": "partial"
-                }
+                "status": "regeneration_needed",
+                "regenerate_count": len(regenerate_indices),
+                "response": f"{len(approved_indices)} items approved, {len(regenerate_indices)} to regenerate."
             }
 
         except Exception as e:

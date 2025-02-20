@@ -449,3 +449,114 @@ class ToolStateManager:
                     }
                 }
             )
+
+    async def create_tool_items(
+        self,
+        session_id: str,
+        tool_operation_id: str,
+        items_data: List[Dict],
+        content_type: str,
+        schedule_id: Optional[str] = None,
+        initial_state: str = ToolOperationState.COLLECTING.value,
+        initial_status: str = OperationStatus.PENDING.value
+    ) -> List[Dict]:
+        """Create new tool items with proper state tracking"""
+        try:
+            # Validate operation exists
+            operation = await self.get_operation_by_id(tool_operation_id)
+            if not operation:
+                raise ValueError(f"No operation found for ID {tool_operation_id}")
+
+            saved_items = []
+            for item in items_data:
+                tool_item = {
+                    "session_id": session_id,
+                    "tool_operation_id": tool_operation_id,
+                    "schedule_id": schedule_id,
+                    "content_type": content_type,
+                    "state": initial_state,
+                    "status": initial_status,
+                    "content": {
+                        "raw_content": item.get("content"),
+                        "formatted_content": item.get("content"),
+                        "version": "1.0"
+                    },
+                    "metadata": {
+                        **item.get("metadata", {}),
+                        "created_at": datetime.now(UTC).isoformat(),
+                        "state_history": [{
+                            "state": initial_state,
+                            "status": initial_status,
+                            "timestamp": datetime.now(UTC).isoformat()
+                        }]
+                    }
+                }
+                
+                result = await self.db.tool_items.insert_one(tool_item)
+                saved_item = {**tool_item, "_id": str(result.inserted_id)}
+                saved_items.append(saved_item)
+                
+                logger.info(f"Created tool item {saved_item['_id']} in {initial_state} state")
+
+            # Update operation's pending items
+            await self.update_operation(
+                session_id=session_id,
+                tool_operation_id=tool_operation_id,
+                content_updates={
+                    "pending_items": [str(item["_id"]) for item in saved_items]
+                }
+            )
+
+            return saved_items
+
+        except Exception as e:
+            logger.error(f"Error creating tool items: {e}")
+            raise
+
+    async def create_regeneration_items(
+        self,
+        session_id: str,
+        tool_operation_id: str,
+        items_data: List[Dict],
+        content_type: str,
+        schedule_id: Optional[str] = None
+    ) -> List[Dict]:
+        """Create new items specifically for regeneration"""
+        try:
+            # Validate operation exists and is in valid state
+            operation = await self.get_operation_by_id(tool_operation_id)
+            if not operation:
+                raise ValueError(f"No operation found for ID {tool_operation_id}")
+            
+            if operation['state'] not in [
+                ToolOperationState.APPROVING.value,
+                ToolOperationState.COLLECTING.value
+            ]:
+                raise ValueError(f"Operation in invalid state for regeneration: {operation['state']}")
+
+            # Create items starting in COLLECTING state
+            items = await self.create_tool_items(
+                session_id=session_id,
+                tool_operation_id=tool_operation_id,
+                items_data=items_data,
+                content_type=content_type,
+                schedule_id=schedule_id,
+                initial_state=ToolOperationState.COLLECTING.value,
+                initial_status=OperationStatus.PENDING.value
+            )
+
+            # Update operation metadata
+            await self.update_operation(
+                session_id=session_id,
+                tool_operation_id=tool_operation_id,
+                metadata={
+                    "regeneration_count": len(items),
+                    "last_regeneration": datetime.now(UTC).isoformat()
+                }
+            )
+
+            return items
+
+        except Exception as e:
+            logger.error(f"Error creating regeneration items: {e}")
+            raise

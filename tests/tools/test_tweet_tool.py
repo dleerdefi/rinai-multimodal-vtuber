@@ -315,10 +315,35 @@ async def test_tweet_tool_partial_approval():
         assert approval_result.get('regeneration_needed') is True, "Regeneration not flagged as needed"
         assert approval_result.get('regenerate_count') == 1, "Expected 1 item to regenerate"
         
-        # 6. Verify operation state
+        # 6. Verify operation state for regeneration
         updated_operation = await tool_state_manager.get_operation(deps.session_id)
-        assert updated_operation['state'] == ToolOperationState.APPROVING.value, "Operation not in APPROVING state"
+        assert updated_operation['state'] == ToolOperationState.COLLECTING.value, "Operation not in COLLECTING state"
+        assert updated_operation['metadata'].get('approval_state') == ApprovalState.REGENERATING.value, "Operation not in REGENERATING state"
+
+        # 7. Verify new item generation
+        regenerated_items = await db.tool_items.find({
+            "tool_operation_id": tool_operation_id,
+            "state": ToolOperationState.APPROVING.value,
+            "created_at": {"$gt": rejected_item['created_at']}
+        }).to_list(None)
+        assert len(regenerated_items) == 1, "Expected 1 regenerated item"
+
+        # 8. Final approval of regenerated item
+        final_approval = "yes, this looks good"
+        final_result = await tweet_tool.run(final_approval)
         
+        # 9. Verify final states
+        final_items = await db.tool_items.find({
+            "tool_operation_id": tool_operation_id,
+            "state": ToolOperationState.EXECUTING.value
+        }).to_list(None)
+        assert len(final_items) == 2, "Expected 2 items in EXECUTING state"
+        
+        # 10. Verify final operation state
+        final_operation = await tool_state_manager.get_operation(deps.session_id)
+        assert final_operation['state'] == ToolOperationState.EXECUTING.value, "Operation not in final EXECUTING state"
+        assert final_operation['metadata'].get('approval_state') == ApprovalState.APPROVAL_FINISHED.value, "Operation not in APPROVAL_FINISHED state"
+
         logger.info("Tweet tool partial approval test completed successfully")
         
     except Exception as e:
