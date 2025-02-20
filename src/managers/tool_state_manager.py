@@ -55,11 +55,11 @@ class ToolStateManager:
     ) -> Dict:
         """Start any tool operation with a unique ID"""
         try:
-            operation_id = str(ObjectId())
+            tool_operation_id = str(ObjectId())
             requires_approval = initial_data.get("requires_approval", True)
             
             operation_data = {
-                "_id": ObjectId(operation_id),
+                "_id": ObjectId(tool_operation_id),
                 "session_id": session_id,
                 "tool_type": operation_type,
                 "state": ToolOperationState.COLLECTING.value,
@@ -92,7 +92,7 @@ class ToolStateManager:
             # Create new operation
             result = await self.db.tool_operations.insert_one(operation_data)
             operation_data['_id'] = result.inserted_id
-            logger.info(f"Started {operation_type} operation {operation_id} for session {session_id}")
+            logger.info(f"Started {operation_type} operation {tool_operation_id} for session {session_id}")
             return operation_data
 
         except Exception as e:
@@ -102,7 +102,7 @@ class ToolStateManager:
     async def update_operation(
         self,
         session_id: str,
-        operation_id: str,  # Now required
+        tool_operation_id: str,  # Now required
         state: str = None,
         step: str = None,
         metadata: Dict = None,
@@ -112,12 +112,12 @@ class ToolStateManager:
         try:
             # Fetch current operation by ID and session
             current_op = await self.db.tool_operations.find_one({
-                "_id": ObjectId(operation_id),
+                "_id": ObjectId(tool_operation_id),
                 "session_id": session_id
             })
             
             if not current_op:
-                logger.error(f"No operation found for ID {operation_id} and session {session_id}")
+                logger.error(f"No operation found for ID {tool_operation_id} and session {session_id}")
                 return False
 
             # Build update data
@@ -155,7 +155,7 @@ class ToolStateManager:
 
             # Update operation by ID
             result = await self.db.tool_operations.find_one_and_update(
-                {"_id": ObjectId(operation_id)},
+                {"_id": ObjectId(tool_operation_id)},
                 {"$set": update_data},
                 return_document=True
             )
@@ -173,7 +173,7 @@ class ToolStateManager:
     async def end_operation(
         self,
         session_id: str,
-        operation_id: str,  # Now required
+        tool_operation_id: str,  # Now required
         status: OperationStatus,
         reason: str = None,
         api_response: Dict = None,
@@ -184,7 +184,7 @@ class ToolStateManager:
         """End operation with proper state transition"""
         try:
             current_op = await self.db.tool_operations.find_one({
-                "_id": ObjectId(operation_id),
+                "_id": ObjectId(tool_operation_id),
                 "session_id": session_id
             })
             
@@ -216,7 +216,7 @@ class ToolStateManager:
 
             return await self.update_operation(
                 session_id=session_id,
-                operation_id=operation_id,
+                tool_operation_id=tool_operation_id,
                 state=final_state,
                 metadata=operation_data.get("metadata", {})
             )
@@ -281,3 +281,171 @@ class ToolStateManager:
         except Exception as e:
             logger.error(f"Error getting operation state: {e}")
             return None
+
+    async def validate_operation_items(self, tool_operation_id: str) -> bool:
+        """Validate all items are properly linked to operation"""
+        try:
+            operation = await self.db.tool_operations.find_one({"_id": ObjectId(tool_operation_id)})
+            if not operation:
+                return False
+
+            # Get all items for this operation
+            items = await self.db.tool_items.find({
+                "tool_operation_id": tool_operation_id
+            }).to_list(None)
+
+            # Validate items match operation's pending_items
+            pending_ids = set(operation["output_data"]["pending_items"])
+            item_ids = {str(item["_id"]) for item in items}
+            
+            if pending_ids != item_ids:
+                logger.error(f"Mismatch in operation items. Expected: {pending_ids}, Found: {item_ids}")
+                return False
+
+            return True
+
+        except Exception as e:
+            logger.error(f"Error validating operation items: {e}")
+            return False
+
+    async def get_operation_by_id(self, tool_operation_id: str) -> Optional[Dict]:
+        """Get operation by ID"""
+        try:
+            operation = await self.db.tool_operations.find_one({"_id": ObjectId(tool_operation_id)})
+            return operation
+        except Exception as e:
+            logger.error(f"Error getting operation by ID: {e}")
+            return None
+
+    async def update_operation_items(
+        self,
+        tool_operation_id: str,
+        item_ids: List[str],
+        new_state: str,
+        new_status: str
+    ) -> bool:
+        """Update state and status for specific items in an operation"""
+        try:
+            result = await self.db.tool_items.update_many(
+                {
+                    "_id": {"$in": [ObjectId(id) for id in item_ids]},
+                    "tool_operation_id": tool_operation_id
+                },
+                {
+                    "$set": {
+                        "state": new_state,
+                        "status": new_status,
+                        "last_updated": datetime.now(UTC)
+                    }
+                }
+            )
+            return result.modified_count > 0
+        except Exception as e:
+            logger.error(f"Error updating operation items: {e}")
+            return False
+
+    async def get_operation_items(
+        self,
+        tool_operation_id: str,
+        state: Optional[str] = None,
+        status: Optional[str] = None
+    ) -> List[Dict]:
+        """Get items for an operation with optional state/status filters"""
+        try:
+            query = {"tool_operation_id": tool_operation_id}
+            if state:
+                query["state"] = state
+            if status:
+                query["status"] = status
+            
+            return await self.db.tool_items.find(query).to_list(None)
+        except Exception as e:
+            logger.error(f"Error getting operation items: {e}")
+            return []
+
+    async def update_operation_state(
+        self,
+        tool_operation_id: str,
+        item_updates: Optional[List[Dict]] = None
+    ) -> bool:
+        """Update operation status based on aggregate item states"""
+        try:
+            operation = await self.get_operation_by_id(tool_operation_id)
+            if not operation:
+                return False
+
+            # Get all items if no updates provided
+            items = item_updates or await self.get_operation_items(tool_operation_id)
+            
+            # Get unique item states
+            item_states = {item["state"] for item in items}
+            
+            # Determine operation status based on item states
+            new_status = self._determine_operation_status(item_states)
+            
+            if new_status != operation.get("status"):
+                # Update all items to match new operation status
+                await self.sync_items_to_operation_status(tool_operation_id, new_status)
+                
+                # Update operation
+                await self.db.tool_operations.update_one(
+                    {"_id": ObjectId(tool_operation_id)},
+                    {
+                        "$set": {
+                            "status": new_status,
+                            "last_updated": datetime.now(UTC)
+                        }
+                    }
+                )
+            return True
+
+        except Exception as e:
+            logger.error(f"Error updating operation state: {e}")
+            return False
+
+    def _determine_operation_status(self, item_states: set) -> str:
+        """Determine operation status based on item states"""
+        # If any items are still processing, operation remains PENDING
+        if any(state in {
+            ToolOperationState.COLLECTING.value,
+            ToolOperationState.APPROVING.value,
+            ToolOperationState.EXECUTING.value
+        } for state in item_states):
+            return OperationStatus.PENDING.value
+            
+        # All items must be in the same final state
+        if all(state == ToolOperationState.COMPLETED.value for state in item_states):
+            return OperationStatus.EXECUTED.value
+        elif all(state == ToolOperationState.CANCELLED.value for state in item_states):
+            return OperationStatus.REJECTED.value
+        elif all(state == ToolOperationState.ERROR.value for state in item_states):
+            return OperationStatus.FAILED.value
+            
+        # Default to PENDING if mixed states
+        return OperationStatus.PENDING.value
+
+    async def sync_items_to_operation_status(
+        self,
+        tool_operation_id: str,
+        operation_status: str
+    ) -> None:
+        """Sync all items to match operation status"""
+        status_to_state_map = {
+            OperationStatus.APPROVED.value: ToolOperationState.EXECUTING.value,
+            OperationStatus.SCHEDULED.value: ToolOperationState.EXECUTING.value,
+            OperationStatus.EXECUTED.value: ToolOperationState.COMPLETED.value,
+            OperationStatus.REJECTED.value: ToolOperationState.CANCELLED.value,
+            OperationStatus.FAILED.value: ToolOperationState.ERROR.value
+        }
+        
+        if operation_status in status_to_state_map:
+            new_state = status_to_state_map[operation_status]
+            await self.db.tool_items.update_many(
+                {"tool_operation_id": tool_operation_id},
+                {
+                    "$set": {
+                        "state": new_state,
+                        "last_updated": datetime.now(UTC)
+                    }
+                }
+            )

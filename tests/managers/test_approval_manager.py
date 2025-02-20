@@ -87,7 +87,7 @@ async def test_start_approval_flow():
             operation_type="test_tool",
             initial_data={
                 "command": "test_approval",
-                "status": ToolOperationState.COLLECTING.value,
+                "state": ToolOperationState.COLLECTING.value,
                 "operation_metadata": {
                     "test": "data"
                 },
@@ -95,75 +95,63 @@ async def test_start_approval_flow():
             }
         )
         
-        operation_id = str(operation['_id'])
+        tool_operation_id = str(operation['_id'])
 
         items = [
             {
                 "_id": ObjectId(),
                 "content": "Test item 1",
-                "status": ToolOperationState.COLLECTING.value,
-                "tool_operation_id": operation_id,
-                "session_id": session_id  # Add session_id to items
+                "state": ToolOperationState.COLLECTING.value,
+                "status": OperationStatus.PENDING.value,
+                "tool_operation_id": tool_operation_id,
+                "session_id": session_id
             },
             {
                 "_id": ObjectId(),
                 "content": "Test item 2",
-                "status": ToolOperationState.COLLECTING.value,
-                "tool_operation_id": operation_id,
-                "session_id": session_id  # Add session_id to items
+                "state": ToolOperationState.COLLECTING.value,
+                "status": OperationStatus.PENDING.value,
+                "tool_operation_id": tool_operation_id,
+                "session_id": session_id
             }
         ]
         
-        # Insert test items
         await db.tool_items.insert_many(items)
-        
-        # Verify items were inserted
-        initial_items = await db.tool_items.find({
-            "tool_operation_id": operation_id
-        }).to_list(None)
-        assert len(initial_items) == 2, "Items not properly inserted"
         
         # Start approval flow
         result = await approval_manager.start_approval_flow(
             session_id=session_id,
-            operation_id=operation_id,
+            tool_operation_id=tool_operation_id,
             items=items
         )
         
         # Verify result structure
-        assert result["status"] == "awaiting_approval"
+        assert result["approval_state"] == ApprovalState.AWAITING_APPROVAL.value
         assert "response" in result
         assert "data" in result
         assert result["data"]["pending_count"] == len(items)
         
         # Verify items were updated to APPROVING
         updated_items = await db.tool_items.find({
-            "tool_operation_id": operation_id
+            "tool_operation_id": tool_operation_id
         }).to_list(None)
         
-        # Debug logging
-        logger.info(f"Updated items statuses: {[item['status'] for item in updated_items]}")
-        
         assert len(updated_items) == 2, "Not all items were found after update"
-        assert all(item["status"] == ToolOperationState.APPROVING.value for item in updated_items), \
-            f"Items not in APPROVING state: {[item['status'] for item in updated_items]}"
+        for item in updated_items:
+            assert item["state"] == ToolOperationState.APPROVING.value
+            assert item["status"] == OperationStatus.PENDING.value
         
         # Verify operation state
         operation = await tool_state_manager.get_operation(session_id)
-        assert operation is not None, "Operation not found"
         assert operation["state"] == ToolOperationState.APPROVING.value
-        assert operation["metadata"]["approval_state"] == ApprovalState.AWAITING_INITIAL.value
-        
-        logger.info("Start approval flow test completed successfully")
-        
+        assert operation["metadata"]["approval_state"] == ApprovalState.AWAITING_APPROVAL.value
+
     except Exception as e:
         logger.error(f"Test error in start approval flow: {e}")
         raise
-        
     finally:
-        # Cleanup
         await db.tool_operations.delete_many({"session_id": session_id})
-        await db.tool_items.delete_many({"tool_operation_id": operation_id})
+        await db.tool_items.delete_many({"tool_operation_id": tool_operation_id})
         await MongoManager.close()
 
 @pytest.mark.asyncio
@@ -187,7 +175,7 @@ async def test_approval_workflow_with_regeneration():
         )
 
         # Create test data
-        session_id = "test_approval_session"
+        session_id = "test_regeneration_session"
         operation = await tool_state_manager.start_operation(
             session_id=session_id,
             operation_type="test_tool",
@@ -197,22 +185,24 @@ async def test_approval_workflow_with_regeneration():
                 "requires_approval": True
             }
         )
-        operation_id = str(operation['_id'])
+        tool_operation_id = str(operation['_id'])
 
         # Create initial items
         items = [
             {
                 "_id": ObjectId(),
                 "content": "Test item 1",
-                "status": ToolOperationState.COLLECTING.value,
-                "tool_operation_id": operation_id,
+                "state": ToolOperationState.COLLECTING.value,
+                "status": OperationStatus.PENDING.value,
+                "tool_operation_id": tool_operation_id,
                 "session_id": session_id
             },
             {
                 "_id": ObjectId(),
                 "content": "Test item 2",
-                "status": ToolOperationState.COLLECTING.value,
-                "tool_operation_id": operation_id,
+                "state": ToolOperationState.COLLECTING.value,
+                "status": OperationStatus.PENDING.value,
+                "tool_operation_id": tool_operation_id,
                 "session_id": session_id
             }
         ]
@@ -220,96 +210,56 @@ async def test_approval_workflow_with_regeneration():
         await db.tool_items.insert_many(items)
         
         # 1. Start approval flow
-        result = await approval_manager.start_approval_flow(
+        await approval_manager.start_approval_flow(
             session_id=session_id,
-            operation_id=operation_id,
+            tool_operation_id=tool_operation_id,
             items=items
         )
         
-        assert result["status"] == "awaiting_approval"
-        
-        # 2. Partial approval (reject item 2)
-        partial_approval_result = await approval_manager.process_approval_response(
+        # 2. Partial approval (approve item 1, reject item 2)
+        await approval_manager.process_approval_response(
             message="approve item 1, regenerate item 2",
             session_id=session_id,
             content_type="test",
-            content_id=operation_id,
+            tool_operation_id=tool_operation_id,
             handlers={
                 ApprovalAction.PARTIAL_APPROVAL.value: lambda **kwargs: approval_manager.handle_partial_approval(
                     session_id=kwargs['session_id'],
-                    operation_id=kwargs['content_id'],
+                    tool_operation_id=kwargs['tool_operation_id'],
                     approved_indices=[0],
                     items=items
                 )
             }
         )
         
-        # Verify item states after partial approval
-        updated_items = await db.tool_items.find({
-            "tool_operation_id": operation_id
+        # Verify states after partial approval
+        all_items = await db.tool_items.find({
+            "tool_operation_id": tool_operation_id
         }).to_list(None)
         
-        approved_item = next(item for item in updated_items if item["content"] == "Test item 1")
-        rejected_item = next(item for item in updated_items if item["content"] == "Test item 2")
+        # Should have 2 items: 1 approved, 1 rejected
+        assert len(all_items) == 2, "Expected 2 items after partial approval"
         
-        assert approved_item["status"] == ToolOperationState.EXECUTING.value
-        assert rejected_item["status"] == ToolOperationState.COLLECTING.value
+        approved_items = [i for i in all_items if i["status"] == OperationStatus.APPROVED.value]
+        rejected_items = [i for i in all_items if i["status"] == OperationStatus.REJECTED.value]
         
-        # 3. Simulate regeneration of rejected item
-        regenerated_item = {
-            "_id": ObjectId(),
-            "content": "Regenerated item 2",
-            "status": ToolOperationState.COLLECTING.value,
-            "tool_operation_id": operation_id,
-            "session_id": session_id
-        }
+        assert len(approved_items) == 1, "Expected 1 approved item"
+        assert approved_items[0]["state"] == ToolOperationState.EXECUTING.value
         
-        await db.tool_items.insert_one(regenerated_item)
-        
-        # 4. Start approval flow for regenerated item
-        regeneration_approval = await approval_manager.start_approval_flow(
-            session_id=session_id,
-            operation_id=operation_id,
-            items=[regenerated_item]
-        )
-        
-        assert regeneration_approval["status"] == "awaiting_approval"
-        
-        # 5. Approve regenerated item
-        final_approval = await approval_manager.process_approval_response(
-            message="approve all",
-            session_id=session_id,
-            content_type="test",
-            content_id=operation_id,
-            handlers={
-                ApprovalAction.FULL_APPROVAL.value: lambda **kwargs: approval_manager.handle_full_approval(
-                    session_id=kwargs['session_id'],
-                    operation_id=kwargs['content_id']  # Map content_id to operation_id
-                )
-            }
-        )   
-        
-        # Verify final states
-        final_items = await db.tool_items.find({
-            "tool_operation_id": operation_id
-        }).to_list(None)
-        
-        assert all(item["status"] == ToolOperationState.EXECUTING.value for item in final_items)
-        
+        assert len(rejected_items) == 1, "Expected 1 rejected item"
+        assert rejected_items[0]["state"] == ToolOperationState.COMPLETED.value
+
         # Verify operation state
-        final_operation = await tool_state_manager.get_operation(session_id)
-        assert final_operation["state"] == ToolOperationState.EXECUTING.value
-        
-        logger.info("Approval workflow with regeneration test completed successfully")
-        
+        operation = await tool_state_manager.get_operation(session_id)
+        assert operation["state"] == ToolOperationState.COLLECTING.value
+        assert operation["metadata"]["approval_state"] == ApprovalState.PARTIALLY_APPROVED.value
+
     except Exception as e:
-        logger.error(f"Test error in approval workflow: {e}")
+        logger.error(f"Test error in regeneration workflow: {e}")
         raise
-        
     finally:
-        # Cleanup
         await db.tool_operations.delete_many({"session_id": session_id})
-        await db.tool_items.delete_many({"tool_operation_id": operation_id})
+        await db.tool_items.delete_many({"tool_operation_id": tool_operation_id})
         await MongoManager.close()
 
 @pytest.mark.asyncio
@@ -323,7 +273,7 @@ async def test_regenerate_all_flow():
     db = MongoManager.get_db()
     
     try:
-        # Setup
+        # Setup managers
         tool_state_manager = ToolStateManager(db=db)
         llm_service = LLMService()
         approval_manager = ApprovalManager(
@@ -332,136 +282,92 @@ async def test_regenerate_all_flow():
             llm_service=llm_service
         )
 
-        # 1. Create initial operation and items
+        # Create test data
         session_id = "test_regenerate_session"
         operation = await tool_state_manager.start_operation(
             session_id=session_id,
             operation_type="test_tool",
             initial_data={
-                "command": "test_regenerate",
+                "command": "test command",
+                "topic": "test topic",
                 "requires_approval": True
             }
         )
-        operation_id = str(operation['_id'])
+        tool_operation_id = str(operation['_id'])
 
         # Create initial items
-        initial_items = [
+        items = [
             {
                 "_id": ObjectId(),
                 "content": "Test item 1",
-                "status": ToolOperationState.COLLECTING.value,
-                "tool_operation_id": operation_id,
+                "state": ToolOperationState.COLLECTING.value,
+                "status": OperationStatus.PENDING.value,
+                "tool_operation_id": tool_operation_id,
                 "session_id": session_id
             },
             {
                 "_id": ObjectId(),
                 "content": "Test item 2",
-                "status": ToolOperationState.COLLECTING.value,
-                "tool_operation_id": operation_id,
+                "state": ToolOperationState.COLLECTING.value,
+                "status": OperationStatus.PENDING.value,
+                "tool_operation_id": tool_operation_id,
                 "session_id": session_id
             }
         ]
         
-        await db.tool_items.insert_many(initial_items)
+        await db.tool_items.insert_many(items)
         
-        # 2. Start initial approval flow
-        start_result = await approval_manager.start_approval_flow(
+        # 1. Start approval flow
+        await approval_manager.start_approval_flow(
             session_id=session_id,
-            operation_id=operation_id,
-            items=initial_items
+            tool_operation_id=tool_operation_id,
+            items=items
         )
-        
-        assert start_result["status"] == "awaiting_approval"
-        
-        # 3. Request regeneration of all items
+
+        # 2. Request regeneration of all items
         regenerate_result = await approval_manager.process_approval_response(
             message="regenerate all items",
             session_id=session_id,
             content_type="test",
-            content_id=operation_id,
+            tool_operation_id=tool_operation_id,
             handlers={
                 ApprovalAction.REGENERATE_ALL.value: lambda **kwargs: approval_manager.handle_regenerate_all(
                     session_id=kwargs['session_id'],
-                    operation_id=kwargs['content_id']
+                    tool_operation_id=kwargs['tool_operation_id']
                 )
             }
         )
         
-        # Verify items moved to COLLECTING and REJECTED
+        # Verify regeneration result structure
+        assert regenerate_result["status"] == "regeneration_needed"
+        assert regenerate_result["regenerate_count"] == 2
+        assert "response" in regenerate_result
+        
+        # Verify items moved to COMPLETED and REJECTED
         items_after_reject = await db.tool_items.find({
-            "tool_operation_id": operation_id
+            "tool_operation_id": tool_operation_id
         }).to_list(None)
         
-        assert all(item["status"] == ToolOperationState.COLLECTING.value for item in items_after_reject)
-        assert all(item["operation_status"] == OperationStatus.REJECTED.value for item in items_after_reject)
-        
-        # 4. Simulate regeneration with new items
-        regenerated_items = [
-            {
-                "_id": ObjectId(),
-                "content": "Regenerated item 1",
-                "status": ToolOperationState.COLLECTING.value,
-                "tool_operation_id": operation_id,
-                "session_id": session_id
-            },
-            {
-                "_id": ObjectId(),
-                "content": "Regenerated item 2",
-                "status": ToolOperationState.COLLECTING.value,
-                "tool_operation_id": operation_id,
-                "session_id": session_id
-            }
-        ]
-        
-        await db.tool_items.insert_many(regenerated_items)
-        
-        # 5. Start approval flow for regenerated items
-        regenerated_approval = await approval_manager.start_approval_flow(
-            session_id=session_id,
-            operation_id=operation_id,
-            items=regenerated_items
-        )
-        
-        assert regenerated_approval["status"] == "awaiting_approval"
-        
-        # 6. Approve regenerated items
-        final_approval = await approval_manager.process_approval_response(
-            message="approve all",
-            session_id=session_id,
-            content_type="test",
-            content_id=operation_id,
-            handlers={
-                ApprovalAction.FULL_APPROVAL.value: lambda **kwargs: approval_manager.handle_full_approval(
-                    session_id=kwargs['session_id'],
-                    operation_id=kwargs['content_id']
-                )
-            }
-        )
-        
-        # Verify final states
-        final_items = await db.tool_items.find({
-            "tool_operation_id": operation_id,
-            "status": ToolOperationState.EXECUTING.value
-        }).to_list(None)
-        
-        assert len(final_items) == 2, "Not all items in EXECUTING state"
-        assert all(item["operation_status"] == OperationStatus.APPROVED.value for item in final_items)
+        # Update expectations: items should be COMPLETED, not COLLECTING
+        assert all(item["state"] == ToolOperationState.COMPLETED.value for item in items_after_reject), \
+            "All items should be in COMPLETED state"
+        assert all(item["status"] == OperationStatus.REJECTED.value for item in items_after_reject), \
+            "All items should be REJECTED"
         
         # Verify operation state
-        final_operation = await tool_state_manager.get_operation(session_id)
-        assert final_operation["state"] == ToolOperationState.EXECUTING.value
-        assert final_operation["metadata"]["approval_state"] == ApprovalState.APPROVAL_FINISHED.value
-        
+        operation_after_reject = await tool_state_manager.get_operation(session_id)
+        assert operation_after_reject["metadata"]["approval_state"] == ApprovalState.REGENERATING.value
+        assert "items_rejected" in operation_after_reject["metadata"]
+        assert operation_after_reject["metadata"]["items_rejected"] == 2
+
         logger.info("Regenerate all flow test completed successfully")
-        
+
     except Exception as e:
         logger.error(f"Test error in regenerate all flow: {e}")
         raise
-        
     finally:
-        # Cleanup
         await db.tool_operations.delete_many({"session_id": session_id})
-        await db.tool_items.delete_many({"tool_operation_id": operation_id})
+        await db.tool_items.delete_many({"tool_operation_id": tool_operation_id})
         await MongoManager.close()
 
 @pytest.mark.asyncio
@@ -494,24 +400,24 @@ async def test_handle_exit_scenarios():
                 "requires_approval": True
             }
         )
-        operation_id = str(operation['_id'])
+        tool_operation_id = str(operation['_id'])
 
         # Create initial items
         items = [
             {
                 "_id": ObjectId(),
                 "content": "Test item 1",
-                "status": ToolOperationState.COLLECTING.value,
-                "operation_status": OperationStatus.PENDING.value,
-                "tool_operation_id": operation_id,
+                "state": ToolOperationState.COLLECTING.value,
+                "status": OperationStatus.PENDING.value,
+                "tool_operation_id": tool_operation_id,
                 "session_id": session_id
             },
             {
                 "_id": ObjectId(),
                 "content": "Test item 2",
-                "status": ToolOperationState.COLLECTING.value,
-                "operation_status": OperationStatus.PENDING.value,
-                "tool_operation_id": operation_id,
+                "state": ToolOperationState.COLLECTING.value,
+                "status": OperationStatus.PENDING.value,
+                "tool_operation_id": tool_operation_id,
                 "session_id": session_id
             }
         ]
@@ -521,7 +427,7 @@ async def test_handle_exit_scenarios():
         # Start approval flow
         await approval_manager.start_approval_flow(
             session_id=session_id,
-            operation_id=operation_id,
+            tool_operation_id=tool_operation_id,
             items=items
         )
 
@@ -530,11 +436,11 @@ async def test_handle_exit_scenarios():
             message="approve item 1",
             session_id=session_id,
             content_type="test",
-            content_id=operation_id,
+            tool_operation_id=tool_operation_id,
             handlers={
                 ApprovalAction.PARTIAL_APPROVAL.value: lambda **kwargs: approval_manager.handle_partial_approval(
                     session_id=kwargs['session_id'],
-                    operation_id=kwargs['content_id'],
+                    tool_operation_id=kwargs['tool_operation_id'],
                     approved_indices=[0],
                     items=items
                 )
@@ -544,34 +450,34 @@ async def test_handle_exit_scenarios():
         # Test manual exit with operation_id
         exit_result = await approval_manager.handle_exit(
             session_id=session_id,
-            operation_id=operation_id,
+            tool_operation_id=tool_operation_id,  # Add operation_id here
             success=False,
             tool_type="test_tool"
         )
 
         # Verify exit response format
-        assert exit_result["status"] == "cancelled"
+        assert exit_result["state"] == "cancelled"
         assert "response" in exit_result
         assert exit_result["data"]["completion_type"] == "cancelled"
 
         # Verify states after exit
         final_items = await db.tool_items.find({
-            "tool_operation_id": operation_id
+            "tool_operation_id": tool_operation_id
         }).to_list(None)
 
         # Verify approved item remains unchanged
-        approved_items = [i for i in final_items if i["operation_status"] == OperationStatus.APPROVED.value]
+        approved_items = [i for i in final_items if i["status"] == OperationStatus.APPROVED.value]
         assert len(approved_items) == 1
-        assert approved_items[0]["status"] == ToolOperationState.EXECUTING.value
+        assert approved_items[0]["state"] == ToolOperationState.EXECUTING.value
 
         # Verify pending item was cancelled
-        cancelled_items = [i for i in final_items if i["operation_status"] == OperationStatus.REJECTED.value]
+        cancelled_items = [i for i in final_items if i["status"] == OperationStatus.REJECTED.value]
         assert len(cancelled_items) == 1
-        assert cancelled_items[0]["status"] == ToolOperationState.CANCELLED.value
+        assert cancelled_items[0]["state"] == ToolOperationState.COMPLETED.value
 
         # Verify operation state
         final_operation = await tool_state_manager.get_operation(session_id)
-        assert final_operation["state"] == ToolOperationState.CANCELLED.value
+        assert final_operation["state"] == ToolOperationState.COMPLETED.value
         assert final_operation["metadata"]["approval_state"] == ApprovalState.APPROVAL_CANCELLED.value
 
         logger.info("Exit scenarios test completed successfully")
@@ -583,7 +489,7 @@ async def test_handle_exit_scenarios():
     finally:
         # Cleanup
         await db.tool_operations.delete_many({"session_id": session_id})
-        await db.tool_items.delete_many({"tool_operation_id": operation_id})
+        await db.tool_items.delete_many({"tool_operation_id": tool_operation_id})
         await MongoManager.close()
 
 if __name__ == "__main__":

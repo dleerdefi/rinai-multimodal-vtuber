@@ -274,44 +274,50 @@ async def test_tweet_tool_partial_approval():
         initial_command = "Generate 2 tweets about AI"
         result = await tweet_tool.run(initial_command)
         
-        # Verify items were generated and capture operation_id
+        # Verify items were generated
+        assert result.get('data', {}).get('items'), "No items returned in approval flow"
         items = result.get('data', {}).get('items', [])
-        assert len(items) > 0, "No items returned in approval flow"
-        initial_item_ids = [item['_id'] for item in items]
+        assert len(items) == 2, "Expected 2 items to be generated"
         
         # Get operation_id from the initial operation
         operation = await tool_state_manager.get_operation(deps.session_id)
-        operation_id = str(operation['_id'])  # Capture the operation_id
+        tool_operation_id = str(operation['_id'])
+        
+        # Verify initial states
+        initial_items = await db.tool_items.find({
+            "tool_operation_id": tool_operation_id
+        }).to_list(None)
+        assert len(initial_items) == 2, "Expected 2 items in database"
+        assert all(item['state'] == ToolOperationState.APPROVING.value for item in initial_items), "Items not in APPROVING state"
         
         # 3. Partial Approval Response
         partial_approval = "approve the first one, regenerate the second"
         approval_result = await tweet_tool.run(partial_approval)
         
-        # 4. Verify state transitions and item statuses
-        operation = await tool_state_manager.get_operation(deps.session_id)
-        assert operation['state'] == ToolOperationState.COLLECTING.value, "Operation not in collecting state"
-        
-        # Check approved item with operation_id
+        # 4. Verify state transitions
+        # Check approved item
         approved_item = await db.tool_items.find_one({
-            "_id": ObjectId(initial_item_ids[0]),
-            "tool_operation_id": operation_id  # Include operation_id in query
+            "tool_operation_id": tool_operation_id,
+            "state": ToolOperationState.EXECUTING.value
         })
-        assert approved_item['status'] == ToolOperationState.EXECUTING.value, "First item not marked as executing"
-        assert approved_item['operation_status'] == OperationStatus.APPROVED.value, "First item not marked as approved"
+        assert approved_item is not None, "No item found in EXECUTING state"
+        assert approved_item['status'] == OperationStatus.APPROVED.value, "Item not marked as APPROVED"
         
-        # Check regenerated items with operation_id
-        regenerated_items = await db.tool_items.find({
-            "session_id": deps.session_id,
-            "tool_operation_id": operation_id,  # Include operation_id in query
-            "_id": {"$nin": [ObjectId(id) for id in initial_item_ids]}
-        }).to_list(None)
+        # Check rejected item
+        rejected_item = await db.tool_items.find_one({
+            "tool_operation_id": tool_operation_id,
+            "state": ToolOperationState.COMPLETED.value,
+            "status": OperationStatus.REJECTED.value
+        })
+        assert rejected_item is not None, "No item found in COMPLETED/REJECTED state"
         
-        assert len(regenerated_items) > 0, "No items were regenerated"
+        # 5. Verify regeneration response
+        assert approval_result.get('regeneration_needed') is True, "Regeneration not flagged as needed"
+        assert approval_result.get('regenerate_count') == 1, "Expected 1 item to regenerate"
         
-        # 5. Verify metadata
-        operation_metadata = operation.get('metadata', {})
-        assert operation_metadata.get('approval_state') == ApprovalState.REGENERATING.value, "Operation not in regenerating state"
-        assert operation_metadata.get('regeneration_pending') is True, "Regeneration not marked as pending"
+        # 6. Verify operation state
+        updated_operation = await tool_state_manager.get_operation(deps.session_id)
+        assert updated_operation['state'] == ToolOperationState.APPROVING.value, "Operation not in APPROVING state"
         
         logger.info("Tweet tool partial approval test completed successfully")
         

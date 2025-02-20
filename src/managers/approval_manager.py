@@ -57,60 +57,54 @@ class ApprovalManager:
         ApprovalState.APPROVAL_CANCELLED: ToolOperationState.CANCELLED
     }
 
-    async def start_approval_flow(self, session_id: str, operation_id: str, items: List[Dict]) -> Dict:
+    async def start_approval_flow(self, session_id: str, tool_operation_id: str, items: List[Dict]) -> Dict:
         """Initialize approval flow with proper state and metadata"""
         try:
             logger.info(f"Starting approval flow for {len(items)} items")
             
-            # First, update all items to PENDING status while keeping state as COLLECTING
+            # Update items to APPROVING state
             await self.db.tool_items.update_many(
                 {
-                    "tool_operation_id": operation_id,
-                    "status": ToolOperationState.COLLECTING.value
+                    "tool_operation_id": tool_operation_id,
+                    "state": ToolOperationState.COLLECTING.value
                 },
                 {"$set": {
-                    "status": ToolOperationState.APPROVING.value,
-                    "metadata.approval_started_at": datetime.now(UTC).isoformat()
+                    "state": ToolOperationState.APPROVING.value,
+                    "status": OperationStatus.PENDING.value,
+                    "metadata": {
+                        "approval_started_at": datetime.now(UTC).isoformat()
+                    }
                 }}
             )
 
-            # Update operation metadata while keeping state as COLLECTING
+            # Update operation state first
             await self.tool_state_manager.update_operation(
                 session_id=session_id,
-                operation_id=operation_id,
-                state=ToolOperationState.APPROVING.value, 
-                step="awaiting_approval",
+                tool_operation_id=tool_operation_id,
+                state=ToolOperationState.APPROVING.value,  # Important: Set to APPROVING
                 metadata={
                     "approval_state": ApprovalState.AWAITING_APPROVAL.value,
-                    "awaiting_approval": True,
                     "pending_items": [str(item.get('_id')) for item in items],
-                    "approved_items": [],
-                    "rejected_items": [],
-                    "initial_generation": True,
-                    "total_items": len(items),
-                    "approval_started_at": datetime.now(UTC).isoformat()
+                    "total_items": len(items)
                 }
             )
             
-            # Format items for review
-            formatted_response = self.analyzer.format_items_for_review(items)
-            logger.info("Generated formatted response for review")
+            formatted_items = self.analyzer.format_items_for_review(items)
             
             return {
-                "status": "awaiting_approval",
-                "response": formatted_response,
-                "requires_tts": True,
+                "approval_status": "awaiting_approval",
+                "approval_state": ApprovalState.AWAITING_APPROVAL.value,
+                "response": f"Here are the items for your review:\n\n{formatted_items}",
                 "data": {
-                    "items": items,
-                    "operation_id": operation_id,
+                    "items": items,  # Move items into data
+                    "formatted_items": formatted_items,
                     "pending_count": len(items),
-                    "approved_count": 0,
-                    "rejected_count": 0
+                    "tool_operation_id": tool_operation_id
                 }
             }
 
         except Exception as e:
-            logger.error(f"Error in start_approval_flow: {e}")
+            logger.error(f"Error starting approval flow: {e}")
             return self.analyzer.create_error_response(str(e))
 
     async def process_approval_response(
@@ -118,26 +112,26 @@ class ApprovalManager:
         message: str,
         session_id: str,
         content_type: str,
-        content_id: str,
+        tool_operation_id: str,
         handlers: Dict[str, Callable]
     ) -> Dict:
         """Process user's response during approval flow"""
         try:
-            # Get current items for this operation using content_id
+            # Get current items for this operation using tool_operation_id
             items = await self.db.tool_items.find({
-                "tool_operation_id": content_id,
-                "status": ToolOperationState.APPROVING.value,
-                "operation_status": {"$ne": OperationStatus.REJECTED.value}
+                "tool_operation_id": tool_operation_id,
+                "state": ToolOperationState.APPROVING.value,
+                "status": {"$ne": OperationStatus.REJECTED.value}
             }).to_list(None)
 
             if not items:
-                logger.error(f"No items found for approval in operation {content_id}")
+                logger.error(f"No items found for approval in operation {tool_operation_id}")
                 return self.analyzer.create_error_response("No items found for approval")
 
             # Get current operation state
-            operation = await self.tool_state_manager.get_operation_by_id(content_id)
+            operation = await self.tool_state_manager.get_operation_by_id(tool_operation_id)
             if not operation:
-                logger.error(f"Operation {content_id} not found")
+                logger.error(f"Operation {tool_operation_id} not found")
                 return self.analyzer.create_error_response("Operation not found")
 
             # Analyze the response with the current items
@@ -150,309 +144,322 @@ class ApprovalManager:
             action = self._map_to_approval_action(analysis)
             
             if action == ApprovalAction.ERROR:
+                # Keep operation in AWAITING_APPROVAL state
+                await self.tool_state_manager.update_operation(
+                    session_id=session_id,
+                    tool_operation_id=tool_operation_id,
+                    state=ToolOperationState.APPROVING.value,
+                    metadata={
+                        "approval_state": ApprovalState.AWAITING_APPROVAL.value,
+                        "last_response_at": datetime.now(UTC).isoformat(),
+                        "error": "Could not determine action from response"
+                    }
+                )
                 return self.analyzer.create_error_response("Could not determine action from response")
             
             if action == ApprovalAction.AWAITING_INPUT:
+                # Keep operation in AWAITING_APPROVAL state
+                await self.tool_state_manager.update_operation(
+                    session_id=session_id,
+                    tool_operation_id=tool_operation_id,
+                    state=ToolOperationState.APPROVING.value,
+                    metadata={
+                        "approval_state": ApprovalState.AWAITING_APPROVAL.value,
+                        "last_response_at": datetime.now(UTC).isoformat(),
+                        "awaiting_input": True
+                    }
+                )
                 return self.analyzer.create_awaiting_response()
             
+            # For valid actions (FULL_APPROVAL, PARTIAL_APPROVAL, REGENERATE_ALL)
             # Get the appropriate handler
             handler = handlers.get(action.value)
             if not handler:
                 logger.error(f"No handler found for action {action}")
+                # Keep operation in AWAITING_APPROVAL state
+                await self.tool_state_manager.update_operation(
+                    session_id=session_id,
+                    tool_operation_id=tool_operation_id,
+                    state=ToolOperationState.APPROVING.value,
+                    metadata={
+                        "approval_state": ApprovalState.AWAITING_APPROVAL.value,
+                        "last_response_at": datetime.now(UTC).isoformat(),
+                        "error": f"No handler for action {action}"
+                    }
+                )
                 return self.analyzer.create_error_response(f"No handler for action {action}")
             
             # Call the handler with the analysis
+            # Each handler is responsible for:
+            # - FULL_APPROVAL: All items -> EXECUTING state
+            # - PARTIAL_APPROVAL: Approved -> EXECUTING, Rejected -> new items in COLLECTING
+            # - REGENERATE_ALL: All items -> new items in COLLECTING
             return await handler(
-                content_id=content_id,
+                tool_operation_id=tool_operation_id,
                 session_id=session_id,
                 analysis=analysis
             )
 
         except Exception as e:
             logger.error(f"Error processing approval response: {e}")
-            return self.analyzer.create_error_response(str(e))
-
-    async def handle_full_approval(
-        self,
-        session_id: str,
-        operation_id: str,
-        **kwargs
-    ) -> Dict:
-        """Handle full approval of all items"""
-        try:
-            logger.info("Handling full approval")
-            
-            # First get all items in APPROVING state that haven't been rejected
-            items = await self.db.tool_items.find({
-                "tool_operation_id": operation_id,
-                "status": ToolOperationState.APPROVING.value,
-                "operation_status": {"$ne": OperationStatus.REJECTED.value}  # Exclude previously rejected items
-            }).to_list(None)
-            
-            if not items:
-                logger.warning("No items found in APPROVING state")
-                return {
-                    "status": "error",
-                    "message": "No items found for approval"
-                }
-            
-            # Update only non-rejected items to EXECUTING state
-            await self.db.tool_items.update_many(
-                {
-                    "tool_operation_id": operation_id,
-                    "status": ToolOperationState.APPROVING.value,
-                    "operation_status": {"$ne": OperationStatus.REJECTED.value}  # Exclude previously rejected items
-                },
-                {"$set": {
-                    "status": ToolOperationState.EXECUTING.value,
-                    "operation_status": OperationStatus.APPROVED.value,
-                    "metadata.approved_at": datetime.now(UTC).isoformat()
-                }}
-            )
-            
-            # Update operation state to EXECUTING
+            # Keep operation in AWAITING_APPROVAL state on error
             await self.tool_state_manager.update_operation(
                 session_id=session_id,
-                operation_id=operation_id,
-                state=ToolOperationState.EXECUTING.value,
-                step="executing",
+                tool_operation_id=tool_operation_id,
+                state=ToolOperationState.APPROVING.value,
                 metadata={
-                    "approval_state": ApprovalState.APPROVAL_FINISHED.value,
-                    "approved_items": [str(item.get('_id')) for item in items],
-                    "rejected_items": [],
-                    "approval_completed_at": datetime.now(UTC).isoformat()
+                    "approval_state": ApprovalState.AWAITING_APPROVAL.value,
+                    "last_response_at": datetime.now(UTC).isoformat(),
+                    "error": str(e)
                 }
             )
+            return self.analyzer.create_error_response(str(e))
+
+    async def handle_full_approval(self, session_id: str, tool_operation_id: str, **kwargs) -> Dict:
+        """Handle full approval of all items"""
+        try:
+            # Update all pending items to EXECUTING state and APPROVED status
+            await self.db.tool_items.update_many(
+                {
+                    "tool_operation_id": tool_operation_id,
+                    "state": ToolOperationState.APPROVING.value
+                },
+                {
+                    "$set": {
+                        "state": ToolOperationState.EXECUTING.value,
+                        "status": OperationStatus.APPROVED.value,
+                        "last_updated": datetime.now(UTC)
+                    }
+                }
+            )
+
+            # Let ToolStateManager determine if ALL items are approved and update operation accordingly
+            await self.tool_state_manager.update_operation_state(tool_operation_id)
             
+            # Update approval workflow metadata only
+            await self.tool_state_manager.update_operation(
+                session_id=session_id,
+                tool_operation_id=tool_operation_id,
+                metadata={
+                    "approval_state": ApprovalState.APPROVAL_FINISHED.value,
+                    "last_updated": datetime.now(UTC).isoformat()
+                }
+            )
+
             return {
                 "status": "approved",
-                "message": "All items approved",
-                "approved_count": len(items)
+                "message": "All items approved"
             }
-            
+
         except Exception as e:
-            logger.error(f"Error in full approval: {e}")
-            raise
+            logger.error(f"Error in handle_full_approval: {e}")
+            return self.analyzer.create_error_response(str(e))
 
     async def handle_partial_approval(
         self,
         session_id: str,
-        operation_id: str,
+        tool_operation_id: str,
         approved_indices: List[int],
-        items: List[Dict],
-        **kwargs
+        items: List[Dict]
     ) -> Dict:
         """Handle partial approval of items"""
         try:
-            logger.info(f"Handling partial approval for {len(approved_indices)} items")
+            logger.info(f"Processing partial approval for operation {tool_operation_id}")
+            logger.info(f"Approved indices: {approved_indices}")
             
-            # Update approved items to EXECUTING state and APPROVED status
-            if approved_indices:
-                approved_item_ids = [str(items[idx].get('_id')) for idx in approved_indices]
-                await self.db.tool_items.update_many(
-                    {
-                        "_id": {"$in": [ObjectId(id) for id in approved_item_ids]},
-                        "tool_operation_id": operation_id
-                    },
-                    {"$set": {
-                        "status": ToolOperationState.EXECUTING.value,
-                        "operation_status": OperationStatus.APPROVED.value,
-                        "metadata.approved_at": datetime.now(UTC).isoformat()
-                    }}
-                )
-                logger.info(f"Updated {len(approved_item_ids)} items to EXECUTING state and APPROVED status")
-            
-            # Update rejected items back to COLLECTING state and PENDING status
-            rejected_indices = [i for i in range(len(items)) if i not in approved_indices]
-            if rejected_indices:
-                rejected_item_ids = [str(items[idx].get('_id')) for idx in rejected_indices]
-                await self.db.tool_items.update_many(
-                    {
-                        "_id": {"$in": [ObjectId(id) for id in rejected_item_ids]},
-                        "tool_operation_id": operation_id
-                    },
-                    {"$set": {
-                        "status": ToolOperationState.COLLECTING.value,
-                        "operation_status": OperationStatus.PENDING.value,
-                        "metadata.rejected_at": datetime.now(UTC).isoformat(),
-                        "metadata.regeneration_pending": True
-                    }}
-                )
-                logger.info(f"Updated {len(rejected_item_ids)} items to COLLECTING state and PENDING status")
+            # Get all items for this operation
+            current_items = await self.db.tool_items.find({
+                "tool_operation_id": tool_operation_id,
+                "state": ToolOperationState.APPROVING.value
+            }).to_list(None)
 
-                # If there are rejected items, transition operation to COLLECTING
-                await self.tool_state_manager.update_operation(
-                    session_id=session_id,
-                    operation_id=operation_id,
-                    state=ToolOperationState.COLLECTING.value,
-                    step="regenerating",
-                    metadata={
-                        "approval_state": ApprovalState.REGENERATING.value,
-                        "approved_items": [str(items[idx].get('_id')) for idx in approved_indices],
-                        "rejected_items": [str(items[idx].get('_id')) for idx in rejected_indices],
-                        "regeneration_pending": True,
-                        "partial_approval_at": datetime.now(UTC).isoformat()
-                    }
-                )
-            else:
-                # If all items approved, transition to EXECUTING
-                await self.tool_state_manager.update_operation(
-                    session_id=session_id,
-                    operation_id=operation_id,
-                    state=ToolOperationState.EXECUTING.value,
-                    step="executing",
-                    metadata={
-                        "approval_state": ApprovalState.APPROVAL_FINISHED.value,
-                        "approved_items": [str(items[idx].get('_id')) for idx in approved_indices],
-                        "rejected_items": [],
-                        "approval_completed_at": datetime.now(UTC).isoformat()
-                    }
-                )
-            
+            if not current_items:
+                logger.error("No items found for partial approval")
+                return self.analyzer.create_error_response("No items found for approval")
+
+            # Track items for different states
+            approved_items = []
+            rejected_items = []
+            regeneration_needed = []
+
+            for idx, item in enumerate(current_items):
+                item_id = str(item['_id'])
+                if idx in approved_indices:
+                    logger.info(f"Approving item {item_id}")
+                    await self.db.tool_items.update_one(
+                        {"_id": item['_id']},
+                        {"$set": {
+                            "state": ToolOperationState.EXECUTING.value,
+                            "status": OperationStatus.APPROVED.value,
+                            "metadata": {
+                                **item.get("metadata", {}),
+                                "approved_at": datetime.now(UTC).isoformat()
+                            }
+                        }}
+                    )
+                    approved_items.append(item_id)
+                else:
+                    logger.info(f"Rejecting item {item_id} for regeneration")
+                    await self.db.tool_items.update_one(
+                        {"_id": item['_id']},
+                        {"$set": {
+                            "state": ToolOperationState.COMPLETED.value,  # Changed from CANCELLED
+                            "status": OperationStatus.REJECTED.value,
+                            "metadata": {
+                                **item.get("metadata", {}),
+                                "rejected_at": datetime.now(UTC).isoformat()
+                            }
+                        }}
+                    )
+                    rejected_items.append(item_id)
+                    regeneration_needed.append(idx)
+
+            # Only update operation metadata, let tool handle regeneration
+            await self.tool_state_manager.update_operation(
+                session_id=session_id,
+                tool_operation_id=tool_operation_id,
+                metadata={
+                    "approval_state": ApprovalState.PARTIALLY_APPROVED.value,
+                    "approved_items": approved_items,
+                    "rejected_items": rejected_items,
+                    "last_updated": datetime.now(UTC).isoformat()
+                }
+            )
+
+            logger.info(f"Partial approval complete. Approved: {len(approved_items)}, Rejected: {len(rejected_items)}")
             return {
                 "status": "partial_approval",
-                "approved_count": len(approved_indices),
-                "rejected_count": len(rejected_indices),
-                "regeneration_needed": len(rejected_indices) > 0
+                "approved_count": len(approved_items),
+                "regenerate_count": len(rejected_items),
+                "regeneration_needed": True,
+                "response": f"Approved {len(approved_items)} items. {len(rejected_items)} items need regeneration.",
+                "data": {
+                    "approved_items": approved_items,
+                    "rejected_items": rejected_items,
+                    "completion_type": "partial"
+                }
             }
-            
+
         except Exception as e:
-            logger.error(f"Error in partial approval: {e}")
-            raise
+            logger.error(f"Error in handle_partial_approval: {e}")
+            return self.analyzer.create_error_response(str(e))
 
     async def handle_regenerate_all(
         self,
         session_id: str,
-        operation_id: str,
+        tool_operation_id: str,
         **kwargs
     ) -> Dict:
-        """Handle regeneration request for all items"""
+        """Handle regeneration of all items"""
         try:
-            logger.info("Handling regenerate all request")
-            
-            # Get all items in APPROVING state
-            items = await self.db.tool_items.find({
-                "tool_operation_id": operation_id,
-                "status": ToolOperationState.APPROVING.value
+            # Get all current items
+            current_items = await self.db.tool_items.find({
+                "tool_operation_id": tool_operation_id,
+                "state": ToolOperationState.APPROVING.value
             }).to_list(None)
-            
-            if not items:
-                logger.warning("No items found in APPROVING state")
-                return {
-                    "status": "error",
-                    "message": "No items found for regeneration"
-                }
-            
-            # Update all items to COLLECTING state and REJECTED status
-            item_ids = [str(item.get('_id')) for item in items]
+
+            if not current_items:
+                logger.error("No items found for regeneration")
+                return self.analyzer.create_error_response("No items found")
+
+            logger.info(f"Marking {len(current_items)} items for regeneration")
+
+            # Mark all items as rejected and COMPLETED (not COLLECTING)
             await self.db.tool_items.update_many(
                 {
-                    "_id": {"$in": [ObjectId(id) for id in item_ids]},
-                    "tool_operation_id": operation_id
+                    "tool_operation_id": tool_operation_id,
+                    "state": ToolOperationState.APPROVING.value
                 },
                 {"$set": {
-                    "status": ToolOperationState.COLLECTING.value,
-                    "operation_status": OperationStatus.REJECTED.value,
-                    "metadata.rejected_at": datetime.now(UTC).isoformat(),
-                    "metadata.regeneration_pending": True
+                    "state": ToolOperationState.COMPLETED.value,  # Changed from COLLECTING
+                    "status": OperationStatus.REJECTED.value,
+                    "metadata": {
+                        "rejected_at": datetime.now(UTC).isoformat(),
+                        "rejection_reason": "regenerate_all requested"
+                    }
                 }}
             )
-            logger.info(f"Updated {len(item_ids)} items to COLLECTING state and REJECTED status")
 
-            # Update operation to COLLECTING state
+            # Update operation metadata
             await self.tool_state_manager.update_operation(
                 session_id=session_id,
-                operation_id=operation_id,
-                state=ToolOperationState.COLLECTING.value,
-                step="regenerating",
+                tool_operation_id=tool_operation_id,
                 metadata={
                     "approval_state": ApprovalState.REGENERATING.value,
-                    "rejected_items": item_ids,
-                    "regeneration_pending": True,
+                    "last_action": "regenerate_all",
+                    "items_rejected": len(current_items),
                     "regeneration_requested_at": datetime.now(UTC).isoformat()
                 }
             )
-            
+
             return {
-                "status": "regenerating",
-                "regenerate_count": len(items),
-                "message": f"Regenerating {len(items)} items"
+                "status": "regeneration_needed",
+                "regenerate_count": len(current_items),
+                "response": f"All {len(current_items)} items will be regenerated.",
+                "data": {
+                    "completion_type": "regenerate_all",
+                    "items_to_regenerate": len(current_items)
+                }
             }
-            
+
         except Exception as e:
-            logger.error(f"Error in regeneration request: {e}")
-            raise
+            logger.error(f"Error in handle_regenerate_all: {e}")
+            return self.analyzer.create_error_response(str(e))
 
     async def handle_exit(
         self,
         session_id: str,
-        operation_id: str,  # Add operation_id parameter
-        success: bool = False,
-        tool_type: str = None
+        tool_operation_id: str,
+        success: bool,
+        tool_type: str
     ) -> Dict:
-        """Handle exit from approval workflow"""
+        """Handle exit from approval flow"""
         try:
-            logger.info(f"Handling exit for operation {operation_id}")
+            logger.info(f"Handling exit for operation {tool_operation_id}")
             
-            # Remove the operation lookup since we now have operation_id
-            # operation = await self.tool_state_manager.get_operation(session_id)
-            # operation_id = str(operation['_id'])
-
-            # Get all items for this operation
-            items = await self.db.tool_items.find({
-                "tool_operation_id": operation_id
+            # Get current items
+            current_items = await self.db.tool_items.find({
+                "tool_operation_id": tool_operation_id,
+                "state": ToolOperationState.APPROVING.value
             }).to_list(None)
 
-            if not success:
-                # Find items still in approval workflow
-                pending_items = [item for item in items if (
-                    item.get("status") in [
-                        ToolOperationState.COLLECTING.value,
-                        ToolOperationState.APPROVING.value
-                    ] and
-                    item.get("operation_status") == OperationStatus.PENDING.value
-                )]
-
-                if pending_items:
-                    # Cancel pending items
-                    pending_item_ids = [str(item.get('_id')) for item in pending_items]
-                    await self.db.tool_items.update_many(
-                        {
-                            "_id": {"$in": [ObjectId(id) for id in pending_item_ids]},
-                            "tool_operation_id": operation_id
-                        },
-                        {"$set": {
-                            "status": ToolOperationState.CANCELLED.value,
-                            "operation_status": OperationStatus.REJECTED.value,
-                            "metadata.cancelled_at": datetime.now(UTC).isoformat(),
-                            "metadata.approval_state": ApprovalState.APPROVAL_CANCELLED.value
-                        }}
-                    )
-                    
-                    logger.info(f"Cancelled {len(pending_items)} pending items")
-
-                    # Update operation approval state before ending
-                    await self.tool_state_manager.update_operation(
-                        session_id=session_id,
-                        operation_id=operation_id,
-                        metadata={
-                            "approval_state": ApprovalState.APPROVAL_CANCELLED.value,
-                            "cancelled_at": datetime.now(UTC).isoformat()
+            if current_items:
+                logger.info(f"Found {len(current_items)} pending items to cancel")
+                # Cancel any remaining items
+                await self.db.tool_items.update_many(
+                    {
+                        "tool_operation_id": tool_operation_id,
+                        "state": ToolOperationState.APPROVING.value
+                    },
+                    {"$set": {
+                        "state": ToolOperationState.CANCELLED.value,
+                        "status": OperationStatus.REJECTED.value,
+                        "metadata": {
+                            "cancelled_at": datetime.now(UTC).isoformat(),
+                            "cancel_reason": "Operation exited"
                         }
-                    )
+                    }}
+                )
+                logger.info(f"Cancelled {len(current_items)} pending items")
 
-                    # End operation (this handles the state transition)
-                    await self.tool_state_manager.end_operation(
-                        session_id=session_id,
-                        operation_id=operation_id,
-                        status=OperationStatus.REJECTED,
-                        reason="User cancelled operation"
-                    )
-                    
-                    return self.analyzer.create_exit_response(success, tool_type)
+            # Update operation state
+            await self.tool_state_manager.update_operation(
+                session_id=session_id,
+                tool_operation_id=tool_operation_id,
+                state=ToolOperationState.CANCELLED.value,
+                metadata={
+                    "approval_state": ApprovalState.APPROVAL_CANCELLED.value,
+                    "exit_success": success,
+                    "exit_time": datetime.now(UTC).isoformat()
+                }
+            )
+
+            exit_response = self.analyzer.create_exit_response(success, tool_type)
+            exit_response["state"] = "cancelled"  # Add missing state key
+            return exit_response
 
         except Exception as e:
-            logger.error(f"Error handling exit: {e}")
+            logger.error(f"Error in handle_exit: {e}")
             return self.analyzer.create_error_response(str(e))
 
     async def _get_tool_exit_details(self, tool_type: str) -> Dict:

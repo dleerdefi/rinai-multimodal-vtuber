@@ -79,25 +79,17 @@ class ScheduledOperation(TypedDict):
     tool_operation_id: Optional[str]  # Link to tool operation that created this
     content_type: str  # Maps to ContentType
     status: str  # Maps to OperationStatus
-
-    # Generic scheduling parameters
     count: int  # Number of items to schedule (tweets, posts, etc)
     schedule_type: Literal["one_time", "multiple", "recurring"]  # Type of schedule
     schedule_time: str  # When to execute
     approval_required: bool  # Whether approval is needed
-    
-    # Content management
     content: Dict[str, Any]  # The actual content to be executed
     pending_items: List[str]  # IDs of items pending approval
     approved_items: List[str]  # IDs of approved items
     rejected_items: List[str]  # IDs of rejected items
-    
-    # Timing
     created_at: datetime
     scheduled_time: Optional[datetime]
     executed_time: Optional[datetime]
-    
-    # Metadata
     metadata: Dict[str, Any]
     retry_count: int
     last_error: Optional[str]
@@ -140,7 +132,7 @@ class OperationMetadata(TypedDict):
 
 class ToolExecution(TypedDict):
     """Individual tool execution record"""
-    operation_id: str           # Reference to tool_operations
+    tool_operation_id: str           # Reference to tool_operations
     session_id: str
     tool_type: str             # Maps to ToolType
     state: str                 # Maps to ToolOperationState
@@ -158,26 +150,18 @@ class ToolItem(TypedDict):
     workflow_id: Optional[str]
     tool_operation_id: str
     content_type: str
+    state: str
     status: str
-    
-    # Content management
     content: ToolItemContent
     parameters: ToolItemParams
     metadata: ToolItemMetadata
     api_response: Optional[ToolItemResponse]
-    
-    # Timing
     created_at: datetime
     scheduled_time: Optional[datetime]
     executed_time: Optional[datetime]
     posted_time: Optional[datetime]
-    
-    # Operation tracking
     schedule_id: str
-    operation_id: str
     execution_id: Optional[str]
-    
-    # Error handling
     retry_count: int
     last_error: Optional[str]
 
@@ -327,7 +311,7 @@ class RinDB:
             await self.tool_operations.create_index([("last_updated", 1)])
             
             # Tool executions tracking
-            await self.tool_executions.create_index([("operation_id", 1)])
+            await self.tool_executions.create_index([("tool_operation_id", 1)])
             await self.tool_executions.create_index([("session_id", 1)])
             await self.tool_executions.create_index([("state", 1)])
             await self.tool_executions.create_index([("created_at", 1)])
@@ -336,24 +320,23 @@ class RinDB:
             await self.tool_items.create_index([("session_id", 1)])
             await self.tool_items.create_index([("content_type", 1)])
             await self.tool_items.create_index([("status", 1)])
+            await self.tool_items.create_index([("state", 1)])
             await self.tool_items.create_index([("schedule_id", 1)])
-            await self.tool_items.create_index([("operation_id", 1)])
+            await self.tool_items.create_index([("tool_operation_id", 1)])
+
+            # Temporal indexes
             await self.tool_items.create_index([("created_at", 1)])
             await self.tool_items.create_index([("scheduled_time", 1)])
             await self.tool_items.create_index([("posted_time", 1)])
-            
+
             # Compound indexes for common queries
             await self.tool_items.create_index([
-                ("status", 1),
-                ("scheduled_time", 1)
+                ("tool_operation_id", 1),
+                ("state", 1)
             ])
             await self.tool_items.create_index([
-                ("content_type", 1),
+                ("tool_operation_id", 1),
                 ("status", 1)
-            ])
-            await self.tool_items.create_index([
-                ("session_id", 1),
-                ("content_type", 1)
             ])
             
             # Scheduled operations indexes
@@ -577,29 +560,29 @@ class RinDB:
             logger.error(f"Error getting operation state: {e}")
             return None
 
-    async def get_scheduled_operation(self, operation_id: str) -> Optional[Dict]:
+    async def get_scheduled_operation(self, tool_operation_id: str) -> Optional[Dict]:
         """Get scheduled operation by ID"""
         try:
             # First try direct ObjectId lookup
-            if ObjectId.is_valid(operation_id):
-                schedule = await self.scheduled_operations.find_one({"_id": ObjectId(operation_id)})
+            if ObjectId.is_valid(tool_operation_id):
+                schedule = await self.scheduled_operations.find_one({"_id": ObjectId(tool_operation_id)})
                 if schedule:
-                    logger.info(f"Found schedule by ObjectId: {operation_id}")
+                    logger.info(f"Found schedule by ObjectId: {tool_operation_id}")
                     return schedule
 
             # Try session_id or tool_operation_id lookup
             schedule = await self.scheduled_operations.find_one({
                 "$or": [
-                    {"session_id": operation_id},
-                    {"tool_operation_id": operation_id}
+                    {"session_id": tool_operation_id},
+                    {"tool_operation_id": tool_operation_id}
                 ]
             })
             
             if schedule:
-                logger.info(f"Found schedule by session/operation ID: {operation_id}")
+                logger.info(f"Found schedule by session/operation ID: {tool_operation_id}")
                 return schedule
             
-            logger.warning(f"No schedule found for ID: {operation_id}")
+            logger.warning(f"No schedule found for ID: {tool_operation_id}")
             return None
 
         except Exception as e:
