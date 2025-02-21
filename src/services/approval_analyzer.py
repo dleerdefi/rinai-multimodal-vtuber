@@ -116,13 +116,18 @@ There are {len(current_items)} items to analyze. Return ONLY valid JSON in this 
         Current response: "{user_response}"
         """
 
-    def create_error_analysis(self, error_message: str) -> Dict:
-        """Create error analysis response"""
+    def create_error_analysis(self, error_message: str, is_retryable: bool = True) -> Dict:
+        """Create error analysis response with retry information"""
         return {
             "action": "error",
             "approved_indices": [],
             "regenerate_indices": [],
-            "feedback": f"Error analyzing response: {error_message}"
+            "feedback": f"Error analyzing response: {error_message}",
+            "is_retryable": is_retryable,
+            "metadata": {
+                "error_time": datetime.now(UTC).isoformat(),
+                "error_type": "retryable" if is_retryable else "terminal"
+            }
         }
 
     def create_response(
@@ -142,9 +147,22 @@ There are {len(current_items)} items to analyze. Return ONLY valid JSON in this 
             response["data"] = data
         return response
 
-    def create_error_response(self, message: str) -> Dict:
-        """Create an error response"""
-        return self.create_response("error", message)
+    def create_error_response(
+        self, 
+        message: str, 
+        is_retryable: bool = True,
+        retry_count: Optional[int] = None
+    ) -> Dict:
+        """Create an error response with retry information"""
+        return self.create_response(
+            "error",
+            message,
+            data={
+                "is_retryable": is_retryable,
+                "retry_count": retry_count,
+                "error_time": datetime.now(UTC).isoformat()
+            }
+        )
 
     def create_awaiting_response(self) -> Dict:
         """Create an awaiting input response"""

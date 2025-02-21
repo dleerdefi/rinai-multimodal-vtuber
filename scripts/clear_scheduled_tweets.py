@@ -14,7 +14,8 @@ from src.db.mongo_manager import MongoManager
 from src.db.db_schema import (
     ToolOperationState,
     OperationStatus,
-    ContentType
+    ContentType,
+    ToolType
 )
 import json
 
@@ -45,16 +46,28 @@ async def clear_all_scheduled_operations():
         await MongoManager.initialize(mongo_uri)
         db = MongoManager.get_db()
         
+        # Diagnostic: Print a sample tool operation to see structure
+        sample_op = await db.tool_operations.find_one({})
+        if sample_op:
+            console.print("[cyan]Sample tool operation structure:[/]")
+            console.print(sample_op)
+        
         # Clear ALL scheduled operations related to tweets
         scheduled_ops_result = await db.scheduled_operations.delete_many({
             "content_type": ContentType.TWEET.value
         })
         
-        # Clear ALL tool operations related to Twitter
+        # Clear ALL tool operations related to Twitter with expanded query
         tool_ops_result = await db.tool_operations.delete_many({
             "$or": [
-                {"tool_type": "twitter"},
-                {"content_type": ContentType.TWEET.value}
+                {"metadata.content_type": ContentType.TWEET.value},
+                {"metadata.tool_type": ToolType.TWITTER.value},
+                {"tool_type": ToolType.TWITTER.value},  # Direct field match
+                {"content_type": ContentType.TWEET.value},  # Direct field match
+                {"input_data.content_type": ContentType.TWEET.value},
+                {"input_data.tool_type": ToolType.TWITTER.value},
+                {"output_data.content_type": ContentType.TWEET.value},
+                {"output_data.tool_type": ToolType.TWITTER.value}
             ]
         })
         
@@ -62,16 +75,16 @@ async def clear_all_scheduled_operations():
         tool_items_result = await db.tool_items.delete_many({
             "$or": [
                 {"content_type": ContentType.TWEET.value},
-                {"tool_type": "twitter"},
-                {"metadata.tool_type": "twitter"}
+                {"metadata.content_type": ContentType.TWEET.value},
+                {"metadata.tool_type": ToolType.TWITTER.value}
             ]
         })
         
         # Clear ALL tool executions related to Twitter
         tool_exec_result = await db.tool_executions.delete_many({
             "$or": [
-                {"tool_type": "twitter"},
-                {"content_type": ContentType.TWEET.value}
+                {"metadata.content_type": ContentType.TWEET.value},
+                {"metadata.tool_type": ToolType.TWITTER.value}
             ]
         })
         
@@ -84,9 +97,18 @@ async def clear_all_scheduled_operations():
         # Print current collection counts for verification
         counts = {
             "scheduled_operations": await db.scheduled_operations.count_documents({"content_type": ContentType.TWEET.value}),
-            "tool_operations": await db.tool_operations.count_documents({"tool_type": "twitter"}),
-            "tool_items": await db.tool_items.count_documents({"content_type": ContentType.TWEET.value}),
-            "tool_executions": await db.tool_executions.count_documents({"tool_type": "twitter"})
+            "tool_operations": await db.tool_operations.count_documents({
+                "$or": [
+                    {"metadata.content_type": ContentType.TWEET.value},
+                    {"metadata.tool_type": ToolType.TWITTER.value}
+                ]
+            }),
+            "tool_items": await db.tool_items.count_documents({
+                "content_type": ContentType.TWEET.value
+            }),
+            "tool_executions": await db.tool_executions.count_documents({
+                "metadata.tool_type": ToolType.TWITTER.value
+            })
         }
         
         console.print("\n[bold cyan]Cleanup Summary:[/]")
@@ -107,6 +129,17 @@ async def clear_all_scheduled_operations():
             for collection, result in legacy_results.items():
                 if result.deleted_count > 0:
                     console.print(f"[yellow]- Deleted {result.deleted_count} items from {collection}")
+        
+        # Additional diagnostic after deletion
+        remaining_ops = await db.tool_operations.find({}).to_list(None)
+        if remaining_ops:
+            console.print(f"\n[yellow]Sample of remaining operations ({len(remaining_ops)}):[/]")
+            for op in remaining_ops[:3]:  # Show first 3 as samples
+                console.print(f"ID: {op['_id']}")
+                console.print(f"Type: {op.get('tool_type')}")
+                console.print(f"Content: {op.get('content_type')}")
+                console.print(f"Metadata: {op.get('metadata', {})}")
+                console.print("---")
         
     except Exception as e:
         console.print(f"[bold red]Error clearing scheduled operations: {e}")

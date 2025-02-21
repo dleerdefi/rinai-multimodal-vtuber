@@ -24,7 +24,7 @@ from src.managers.approval_manager import ApprovalManager
 from src.services.llm_service import LLMService
 from src.tools.base import AgentDependencies
 from src.db.mongo_manager import MongoManager
-from src.db.db_schema import ContentType, ToolOperationState, OperationStatus
+from src.db.db_schema import ContentType, ToolOperationState, OperationStatus, ScheduleState
 
 # Set up logging
 logger = logging.getLogger(__name__)
@@ -228,7 +228,11 @@ async def test_tweet_scheduling_workflow():
             assert item["state"] == ToolOperationState.EXECUTING.value
             assert item["status"] == OperationStatus.APPROVED.value
 
-        # Now try schedule activation
+        # Verify schedule state after initialization
+        schedule = await db.get_scheduled_operation(analysis_result["schedule_id"])
+        assert schedule["schedule_state"] == ScheduleState.PENDING.value
+        
+        # After approval, activate schedule
         schedule_result = await schedule_manager.activate_schedule(
             tool_operation_id=analysis_result["tool_operation_id"],
             schedule_info=operation["metadata"]["schedule_info"],
@@ -236,10 +240,26 @@ async def test_tweet_scheduling_workflow():
         )
         assert schedule_result is True
 
-        # Verify final states
-        final_operation = await tool_state_manager.get_operation_by_id(analysis_result["tool_operation_id"])
-        assert final_operation["state"] == ToolOperationState.EXECUTING.value  # Still executing until all tweets posted
+        # Verify schedule transitions through states
+        schedule = await db.get_scheduled_operation(analysis_result["schedule_id"])
+        assert schedule["schedule_state"] == ScheduleState.ACTIVE.value
+        assert len(schedule["state_history"]) >= 3  # PENDING -> ACTIVATING -> ACTIVE
         
+        # Verify state history contains correct transitions
+        state_history = schedule["state_history"]
+        assert state_history[0]["state"] == ScheduleState.PENDING.value
+        assert state_history[1]["state"] == ScheduleState.ACTIVATING.value
+        assert state_history[2]["state"] == ScheduleState.ACTIVE.value
+
+        # Test pause/resume functionality
+        await schedule_manager.pause_schedule(analysis_result["schedule_id"])
+        schedule = await db.get_scheduled_operation(analysis_result["schedule_id"])
+        assert schedule["schedule_state"] == ScheduleState.PAUSED.value
+
+        await schedule_manager.resume_schedule(analysis_result["schedule_id"])
+        schedule = await db.get_scheduled_operation(analysis_result["schedule_id"])
+        assert schedule["schedule_state"] == ScheduleState.ACTIVE.value
+
         # Verify scheduled items
         scheduled_items = await db.tool_items.find({
             "tool_operation_id": analysis_result["tool_operation_id"]
@@ -251,7 +271,12 @@ async def test_tweet_scheduling_workflow():
             assert "scheduled_time" in item["metadata"]
             scheduled_time = datetime.fromisoformat(item["metadata"]["scheduled_time"].replace('Z', '+00:00'))
             assert scheduled_time > datetime.now(UTC)
-        
+
+        # Test schedule cancellation
+        await schedule_manager.cancel_schedule(analysis_result["schedule_id"])
+        schedule = await db.get_scheduled_operation(analysis_result["schedule_id"])
+        assert schedule["schedule_state"] == ScheduleState.CANCELLED.value
+
         logger.info("Tweet scheduling flow test completed successfully")
         
     except Exception as e:

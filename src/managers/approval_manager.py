@@ -10,7 +10,8 @@ from src.db.db_schema import (
     ToolOperationState, 
     OperationStatus,
     ContentType,
-    ToolType
+    ToolType,
+    ApprovalState
 )
 from src.managers.tool_state_manager import ToolStateManager
 from src.services.llm_service import LLMService, ModelType
@@ -28,14 +29,6 @@ class ApprovalAction(Enum):
     AWAITING_INPUT = "awaiting_input"
     ERROR = "error"
     EXIT = "exit"
-
-class ApprovalState(Enum):
-    """Sub-states during the approval workflow"""
-    AWAITING_INITIAL = "awaiting_initial"
-    AWAITING_APPROVAL = "awaiting_approval"
-    REGENERATING = "regenerating"
-    APPROVAL_FINISHED = "approval_finished"
-    APPROVAL_CANCELLED = "approval_cancelled"
 
 class ApprovalManager:
     def __init__(self, tool_state_manager: ToolStateManager, db: RinDB, llm_service: LLMService, schedule_manager: ScheduleManager):

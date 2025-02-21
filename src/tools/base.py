@@ -159,12 +159,57 @@ class CalendarToolParameters(BaseModel):
         description="End time for event fetch (ISO format)"
     )
 
+class ToolParameters(BaseModel):
+    """Base parameters for all tools"""
+    schedule_time: Optional[datetime] = Field(default=None)
+    retry_policy: Optional[Dict] = Field(default=None)
+    execution_window: Optional[Dict] = Field(default=None)
+    custom_params: Dict[str, Any] = Field(default_factory=dict)
+
+class TwitterParameters(ToolParameters):
+    """Twitter-specific tool parameters - matches TwitterParams TypedDict"""
+    custom_params: Dict[str, Any] = Field(
+        default_factory=dict,
+        description="Twitter API and content parameters"
+    )
+
+    class Config:
+        schema_extra = {
+            "example": {
+                "custom_params": {
+                    # API Parameters
+                    "account_id": "default",
+                    "media_files": [],
+                    "poll_options": [],
+                    "poll_duration": None,
+                    "reply_settings": None,
+                    "quote_tweet_id": None,
+                    
+                    # Content Parameters
+                    "thread_structure": [],
+                    "mentions": [],
+                    "hashtags": [],
+                    "urls": [],
+                    
+                    # Targeting Parameters
+                    "audience_targeting": {},
+                    "content_category": None,
+                    "sensitivity_level": None,
+                    
+                    # Engagement Parameters
+                    "estimated_engagement": None,
+                    "visibility_settings": {}
+                }
+            }
+        }
+
 class ToolOperation(BaseModel):
     """Model for tool operations"""
     session_id: str
     tool_type: str
     state: str
     step: str
+    parameters: ToolParameters  # Updated to use new parameters model
     input_data: Dict[str, Any] = Field(default_factory=dict)
     output_data: Dict[str, Any] = Field(default_factory=dict)
     metadata: Dict[str, Any] = Field(default_factory=dict)

@@ -39,12 +39,30 @@ class OperationStatus(Enum):
 
 class ToolOperationState(Enum):
     INACTIVE = "inactive"
-    COLLECTING = "collecting"     # Tool is generating/collecting items
-    APPROVING = "approving"       # Items are being reviewed
-    EXECUTING = "executing"       # Approved items are being executed
-    COMPLETED = "completed"       # Operation is finished
-    ERROR = "error"              # Operation encountered error
-    CANCELLED = "cancelled"      # Operation was cancelled
+    COLLECTING = "collecting"
+    APPROVING = "approving"
+    EXECUTING = "executing"
+    COMPLETED = "completed"
+    ERROR = "error"
+    CANCELLED = "cancelled"
+
+class ApprovalState(Enum):
+    """Sub-states during the approval workflow"""
+    AWAITING_INITIAL = "awaiting_initial"
+    AWAITING_APPROVAL = "awaiting_approval"
+    REGENERATING = "regenerating"
+    APPROVAL_FINISHED = "approval_finished"
+    APPROVAL_CANCELLED = "approval_cancelled"
+
+class ScheduleState(Enum):
+    """Sub-states during the scheduling workflow"""
+    PENDING = "pending"
+    ACTIVATING = "activating"
+    ACTIVE = "active"
+    PAUSED = "paused"
+    COMPLETED = "completed"
+    CANCELLED = "cancelled"
+    ERROR = "error"
 
 class ContentType(str, Enum):
     """Types of content that can be produced"""
@@ -93,6 +111,10 @@ class ScheduledOperation(TypedDict):
     metadata: Dict[str, Any]
     retry_count: int
     last_error: Optional[str]
+    schedule_id: str
+    schedule_state: str  # ScheduleState value
+    schedule_info: Dict
+    state_history: List[Dict[str, Union[str, datetime]]]  # List of state changes
 
 class ToolItemContent(TypedDict):
     """Base content structure for all tools"""
@@ -106,6 +128,7 @@ class ToolItemParams(TypedDict):
     schedule_time: Optional[datetime]
     retry_policy: Optional[Dict]
     execution_window: Optional[Dict]
+    custom_params: Dict[str, Any]
 
 class ToolItemMetadata(TypedDict):
     """Base metadata for all tools"""
@@ -189,12 +212,40 @@ class TwitterContent(ToolItemContent):
 
 class TwitterParams(ToolItemParams):
     """Twitter-specific parameters"""
-    account_id: Optional[str]
-    media_files: Optional[List[str]]
-    poll_options: Optional[List[str]]
-    poll_duration: Optional[int]
-    reply_settings: Optional[str]
-    quote_tweet_id: Optional[str]
+    custom_params: Dict[str, Any] = {
+        # API Parameters
+        "account_id": Optional[str],
+        "media_files": Optional[List[str]],
+        "poll_options": Optional[List[str]],
+        "poll_duration": Optional[int],
+        "reply_settings": Optional[str],
+        "quote_tweet_id": Optional[str],
+        
+        # Content Parameters
+        "thread_structure": Optional[List[str]],
+        "mentions": Optional[List[str]],
+        "hashtags": Optional[List[str]],
+        "urls": Optional[List[str]],
+        
+        # Targeting Parameters
+        "audience_targeting": Optional[Dict],
+        "content_category": Optional[str],
+        "sensitivity_level": Optional[str],
+        
+        # Engagement Parameters
+        "estimated_engagement": Optional[str],
+        "visibility_settings": Optional[Dict]
+    }
+
+class CalendarParams(ToolItemParams):
+    """Calendar-specific parameters"""
+    custom_params: Dict[str, Any] = {
+        "event_duration": Optional[int],
+        "attendees": Optional[List[str]],
+        "location": Optional[str],
+        "reminder_minutes": Optional[int],
+        "calendar_id": Optional[str]
+    }
 
 class TwitterMetadata(ToolItemMetadata):
     """Twitter-specific metadata"""
@@ -264,6 +315,15 @@ class RinDB:
             # Setup indexes
             await self._setup_indexes()
             self._initialized = True
+            
+            # Add index for scheduled operations
+            await self.scheduled_operations.create_index([
+                ("schedule_state", 1),
+                ("content_type", 1)
+            ])
+            await self.scheduled_operations.create_index([
+                ("tool_operation_id", 1)
+            ], unique=True)
             
             return True
             
@@ -589,48 +649,77 @@ class RinDB:
             logger.error(f"Error getting scheduled operation: {e}")
             return None
 
-    async def create_scheduled_operation(self, 
-                                session_id: str,
-                                tool_operation_id: str,
-                                content_type: str,
-                                count: int,
-                                schedule_type: str,
-                                schedule_time: str,
-                                content: Dict,
-                                metadata: Optional[Dict] = None) -> str:
-        """Create new scheduled operation with proper schema"""
+    async def create_scheduled_operation(
+        self,
+        tool_operation_id: str,
+        content_type: str,
+        schedule_info: Dict,
+    ) -> str:
+        """Create new scheduled operation"""
+        operation = ScheduledOperation(
+            schedule_id=str(ObjectId()),
+            tool_operation_id=tool_operation_id,
+            content_type=content_type,
+            schedule_state=ScheduleState.PENDING.value,
+            schedule_info=schedule_info,
+            created_at=datetime.now(UTC),
+            last_updated=datetime.now(UTC),
+            state_history=[{
+                "state": ScheduleState.PENDING.value,
+                "timestamp": datetime.now(UTC).isoformat(),
+                "reason": "Schedule initialized"
+            }],
+            metadata={}
+        )
+        result = await self.scheduled_operations.insert_one(operation)
+        return str(result.inserted_id)
+
+    async def update_schedule_state(
+        self,
+        schedule_id: str,
+        state: ScheduleState,
+        reason: str,
+        metadata: Optional[Dict] = None
+    ) -> bool:
+        """Update schedule state with history tracking"""
         try:
-            operation = {
-                "session_id": session_id,
-                "tool_operation_id": tool_operation_id,
-                "content_type": content_type,
-                "status": OperationStatus.PENDING.value,
-                "count": count,
-                "schedule_type": schedule_type,
-                "schedule_time": schedule_time,
-                "approval_required": True,
-                "content": content,
-                "pending_items": [],
-                "approved_items": [],
-                "rejected_items": [],
-                "created_at": datetime.now(UTC),
-                "metadata": {
-                    **(metadata or {}),
-                    "content_type": content_type,
-                    "created_at": datetime.now(UTC).isoformat()
-                },
-                "retry_count": 0
+            # Prepare update operations separately
+            set_data = {
+                "schedule_state": state.value,
+                "last_updated": datetime.now(UTC)
+            }
+            
+            if metadata:
+                set_data["metadata"] = metadata
+
+            # Create the update operation
+            update_ops = {
+                "$set": set_data,
+                "$push": {
+                    "state_history": {
+                        "state": state.value,
+                        "timestamp": datetime.now(UTC).isoformat(),
+                        "reason": reason
+                    }
+                }
             }
 
-            result = await self.scheduled_operations.insert_one(operation)
-            logger.info(f"Created scheduled operation: {result.inserted_id}")
+            result = await self.scheduled_operations.update_one(
+                {"_id": ObjectId(schedule_id)},
+                update_ops
+            )
             
-            # Return the created schedule
-            return str(result.inserted_id)
+            success = result.modified_count > 0
+            if success:
+                logger.info(f"Updated schedule {schedule_id} state to {state.value}")
+            else:
+                logger.warning(f"No schedule updated for ID: {schedule_id}")
+                
+            return success
 
         except Exception as e:
-            logger.error(f"Error creating scheduled operation: {e}")
-            raise
+            logger.error(f"Error updating schedule state: {e}")
+            return False
 
     async def delete_all_scheduled_tweets(self):
         """Delete all tweet schedules and their associated tweets"""
@@ -661,6 +750,7 @@ class RinDB:
     async def update_scheduled_operation(
         self,
         schedule_id: str,
+        state: Optional[str] = None,
         status: Optional[str] = None,
         pending_item_ids: Optional[List[str]] = None,
         approved_item_ids: Optional[List[str]] = None,
@@ -668,10 +758,14 @@ class RinDB:
         schedule_info: Optional[Dict] = None,
         metadata: Optional[Dict] = None
     ) -> bool:
-        """Update scheduled operation with new data"""
+        """Update scheduled operation state and metadata"""
         try:
-            update_data = {"last_updated": datetime.now(UTC)}
+            update_data = {}
+            update_ops = {}  # Separate dict for $push operations
             
+            if state:
+                update_data["schedule_state"] = state
+                
             if status:
                 update_data["status"] = status
                 
@@ -688,17 +782,26 @@ class RinDB:
                 update_data["schedule_info"] = schedule_info
                 
             if metadata:
-                update_data["metadata"] = {
-                    "$set": {
-                        **update_data.get("metadata", {}),
-                        **metadata,
-                        "last_modified": datetime.now(UTC).isoformat()
+                # Handle state history as a push operation
+                if "state_history" in metadata:
+                    update_ops["$push"] = {
+                        "state_history": metadata.pop("state_history")
                     }
+                # Update remaining metadata
+                update_data["metadata"] = {
+                    **update_data.get("metadata", {}),
+                    **metadata,
+                    "last_modified": datetime.now(UTC).isoformat()
                 }
+
+            # Combine updates if needed
+            final_update = {"$set": update_data}
+            if update_ops:
+                final_update.update(update_ops)
 
             result = await self.scheduled_operations.update_one(
                 {"_id": ObjectId(schedule_id) if ObjectId.is_valid(schedule_id) else schedule_id},
-                {"$set": update_data}
+                final_update
             )
             
             success = result.modified_count > 0
@@ -710,5 +813,5 @@ class RinDB:
             return success
 
         except Exception as e:
-            logger.error(f"Error updating scheduled operation: {e}")
+            logger.error(f"Error updating schedule state: {e}", exc_info=True)
             return False

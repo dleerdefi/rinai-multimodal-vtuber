@@ -83,7 +83,10 @@ class ToolStateManager:
                         "step": "analyzing",
                         "timestamp": datetime.now(UTC).isoformat()
                     }],
-                    "item_states": {}
+                    "item_states": {},
+                    "requires_scheduling": True,
+                    "content_type": initial_data.get("content_type"),
+                    "generation_phase": "initializing"
                 },
                 "created_at": datetime.now(UTC),
                 "last_updated": datetime.now(UTC)
@@ -102,15 +105,17 @@ class ToolStateManager:
     async def update_operation(
         self,
         session_id: str,
-        tool_operation_id: str,  # Now required
-        state: str = None,
-        step: str = None,
-        metadata: Dict = None,
-        content_updates: Dict = None
+        tool_operation_id: str,
+        state: Optional[str] = None,
+        step: Optional[str] = None,
+        content_updates: Optional[Dict] = None,
+        metadata: Optional[Dict] = None,
+        input_data: Optional[Dict] = None,
+        output_data: Optional[Dict] = None
     ) -> bool:
-        """Update tool operation state with operation ID"""
+        """Update tool operation with new data"""
         try:
-            # Fetch current operation by ID and session
+            # Validate operation exists and belongs to session
             current_op = await self.db.tool_operations.find_one({
                 "_id": ObjectId(tool_operation_id),
                 "session_id": session_id
@@ -120,9 +125,9 @@ class ToolStateManager:
                 logger.error(f"No operation found for ID {tool_operation_id} and session {session_id}")
                 return False
 
-            # Build update data
             update_data = {"last_updated": datetime.now(UTC)}
             
+            # Validate state transition if state is being updated
             if state:
                 current_state = current_op.get("state")
                 if not self._is_valid_transition(current_state, state):
@@ -135,7 +140,7 @@ class ToolStateManager:
                 
             if step:
                 update_data["step"] = step
-
+                
             if content_updates:
                 # Merge with existing output_data
                 existing_output = current_op.get("output_data", {})
@@ -143,7 +148,7 @@ class ToolStateManager:
                     **existing_output,
                     **content_updates
                 }
-
+                
             if metadata:
                 # Merge with existing metadata
                 existing_metadata = current_op.get("metadata", {})
@@ -153,14 +158,40 @@ class ToolStateManager:
                     "last_modified": datetime.now(UTC).isoformat()
                 }
 
+            if input_data:
+                # Merge with existing input_data
+                existing_input = current_op.get("input_data", {})
+                update_data["input_data"] = {
+                    **existing_input,
+                    **input_data
+                }
+
+            if output_data:
+                # Merge with existing output_data if not already updated
+                if "output_data" not in update_data:
+                    existing_output = current_op.get("output_data", {})
+                    update_data["output_data"] = {
+                        **existing_output,
+                        **output_data
+                    }
+                
             # Update operation by ID
             result = await self.db.tool_operations.find_one_and_update(
-                {"_id": ObjectId(tool_operation_id)},
+                {
+                    "_id": ObjectId(tool_operation_id),
+                    "session_id": session_id
+                },
                 {"$set": update_data},
                 return_document=True
             )
             
-            return bool(result)
+            success = bool(result)
+            if success:
+                logger.info(f"Updated operation {tool_operation_id}")
+            else:
+                logger.warning(f"No operation updated for ID: {tool_operation_id}")
+                
+            return success
 
         except Exception as e:
             logger.error(f"Error updating operation: {e}")
@@ -227,27 +258,23 @@ class ToolStateManager:
 
     def _is_valid_transition(self, current_state: str, new_state: str) -> bool:
         """Check if state transition is valid"""
-        try:
-            # Normalize states to lowercase for comparison
-            current = current_state.lower() if current_state else 'inactive'
-            new = new_state.lower() if new_state else 'inactive'
-            
-            # Get valid transitions for current state
-            valid_transitions = self.valid_transitions.get(current, [])
-            
-            if new not in valid_transitions:
-                logger.warning(
-                    f"Invalid state transition attempted: {current} -> {new}. "
-                    f"Valid transitions are: {valid_transitions}"
-                )
-                return False
-            
-            logger.info(f"Valid state transition: {current} -> {new}")
+        if current_state == new_state:
             return True
         
-        except Exception as e:
-            logger.error(f"Error checking state transition: {e}")
+        if current_state not in self.valid_transitions:
+            logger.error(f"Invalid current state: {current_state}")
             return False
+        
+        valid_next_states = self.valid_transitions[current_state]
+        is_valid = new_state in valid_next_states
+        
+        if not is_valid:
+            logger.warning(
+                f"Invalid state transition from {current_state} to {new_state}. "
+                f"Valid transitions are: {valid_next_states}"
+            )
+        
+        return is_valid
 
     def _get_step_for_state(self, state: ToolOperationState) -> str:
         """Get appropriate step name for state"""
@@ -605,3 +632,31 @@ class ToolStateManager:
         except Exception as e:
             logger.error(f"Error creating regeneration items: {e}")
             raise
+
+    async def create_operation(
+        self,
+        session_id: str,
+        tool_type: str,
+        state: str,
+        step: str = None,
+        metadata: Dict = None
+    ) -> Dict:
+        """Create new tool operation"""
+        operation_data = {
+            "session_id": session_id,
+            "tool_type": tool_type,
+            "state": state,
+            "step": step,
+            "created_at": datetime.now(UTC),
+            "metadata": metadata or {}
+        }
+        
+        result = await self.db.set_tool_operation_state(
+            session_id=session_id,
+            operation_data=operation_data
+        )
+        
+        if not result:
+            raise ValueError(f"Failed to create operation for session {session_id}")
+        
+        return result

@@ -2,6 +2,7 @@ import requests
 import json
 import logging
 from typing import Optional, Dict
+from datetime import datetime, UTC
 
 logger = logging.getLogger(__name__)
 
@@ -98,3 +99,32 @@ class TwitterAgentClient:
         except Exception as e:
             logger.error(f"Follow user failed: {str(e)}")
             return {"error": str(e), "success": False}
+
+    async def execute(self, operation: Dict) -> Dict:
+        """Execute a tweet operation"""
+        try:
+            content = operation.get('content', {}).get('raw_content')
+            params = operation.get('parameters', {}).get('custom_params', {})
+            
+            if not content:
+                raise ValueError("No content provided for tweet")
+            
+            # Send tweet using the provided parameters
+            response = await self.send_tweet(content=content, params=params)
+            
+            if response.get("success"):
+                return {
+                    "success": True,
+                    "tweet_id": response.get('id'),
+                    "timestamp": datetime.now(UTC).isoformat(),
+                    "response": response
+                }
+            else:
+                raise Exception(f"Tweet failed: {response.get('error')}")
+            
+        except Exception as e:
+            logger.error(f"Failed to execute tweet: {e}")
+            return {
+                "success": False,
+                "error": str(e)
+            }

@@ -32,7 +32,8 @@ from src.db.db_schema import (
     ToolItemMetadata,
     ToolItemResponse,
     TweetGenerationResponse,
-    TwitterCommandAnalysis
+    TwitterCommandAnalysis,
+    ScheduleState
 )
 from src.utils.json_parser import parse_strict_json
 from src.managers.approval_manager import ApprovalManager, ApprovalAction, ApprovalState
@@ -150,6 +151,18 @@ class TwitterTool(BaseTool):
         try:
             logger.info(f"Starting command analysis for: {command}")
             
+            # Start operation through manager
+            operation = await self.tool_state_manager.start_operation(
+                session_id=self.deps.session_id,
+                operation_type=ToolType.TWITTER.value,
+                initial_data={
+                    "command": command,
+                    "requires_approval": True,
+                    "content_type": ContentType.TWEET.value
+                }
+            )
+            tool_operation_id = str(operation['_id'])
+            
             # Get LLM analysis
             prompt = f"""You are a Twitter action analyzer. Determine the specific Twitter action needed.
 
@@ -239,63 +252,39 @@ Example response format:
                 logger.error(f"Error processing LLM response: {e}")
                 raise
                 
-            # Create schedule first
-            schedule_id = str(ObjectId())
+            # Create schedule
+            schedule_id = await self.schedule_manager.initialize_schedule(
+                tool_operation_id=tool_operation_id,
+                schedule_info={
+                    "schedule_type": params.get("schedule_type"),
+                    "schedule_time": params.get("schedule_time"),
+                    "total_items": params["item_count"],
+                    **{k: v for k, v in params.items() if k not in ["topic", "item_count"]}
+                },
+                content_type=ContentType.TWEET.value,
+                session_id=self.deps.session_id
+            )
             
-            # Create tool operation with proper links
-            tool_operation = {
-                "session_id": self.deps.session_id,
-                "tool_type": ToolType.TWITTER.value,
-                "state": ToolOperationState.COLLECTING.value,
-                "step": "analyzing",
-                "created_at": datetime.now(UTC),
-                "last_updated": datetime.now(UTC),
-                "input_data": {
-                    "command": command,
-                    "schedule_id": schedule_id,  # Link to schedule
+            # Update operation with command info only
+            await self.tool_state_manager.update_operation(
+                session_id=self.deps.session_id,
+                tool_operation_id=tool_operation_id,
+                input_data={
                     "command_info": {
                         "topic": params["topic"],
                         "item_count": params["item_count"],
                         "schedule_type": params.get("schedule_type"),
                         "schedule_time": params.get("schedule_time")
-                    }
-                },
-                "output_data": {
-                    "pending_items": [],
-                    "approved_items": [],
-                    "rejected_items": [],
-                    "schedule_id": schedule_id,
-                    "status": OperationStatus.PENDING.value
-                },
-                "metadata": {
-                    "content_type": ContentType.TWEET.value,
-                    "generation_phase": "initializing",
-                    "requires_scheduling": True,
-                    "schedule_info": {
-                        "schedule_id": schedule_id,
-                        "schedule_type": params.get("schedule_type"),
-                        "schedule_time": params.get("schedule_time"),
-                        "total_items": params["item_count"],
-                        # Any additional scheduling parameters from LLM analysis
-                        **{k: v for k, v in params.items() if k not in ["topic", "item_count"]}
                     },
-                    "state_history": [{
-                        "state": ToolOperationState.COLLECTING.value,
-                        "timestamp": datetime.now(UTC).isoformat()
-                    }]
+                    "schedule_id": schedule_id
                 }
-            }
-            
-            operation = await self.db.tool_operations.insert_one(tool_operation)
-            tool_operation_id = str(operation.inserted_id)
+            )
             
             return {
                 "schedule_id": schedule_id,
                 "tool_operation_id": tool_operation_id,
                 "topic": params["topic"],
-                "item_count": params["item_count"],
-                "initial_state": ToolOperationState.COLLECTING.value,  # Pass initial state
-                "initial_status": OperationStatus.PENDING.value       # Pass initial status
+                "item_count": params["item_count"]
             }
 
         except Exception as e:
@@ -553,4 +542,3 @@ Format the response as JSON:
         except Exception as e:
             logger.error(f"Error regenerating tweets: {e}")
             return self.approval_manager._create_error_response(str(e))
-
