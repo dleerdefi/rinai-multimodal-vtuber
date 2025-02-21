@@ -6,19 +6,14 @@ from bson.objectid import ObjectId
 import json
 from src.db.db_schema import (
     RinDB, 
-    ToolOperation, 
-    ToolOperationState, 
-    OperationStatus,
-    ContentType,
-    ToolType,
-    ApprovalState
+    ToolOperation
 )
 from src.managers.tool_state_manager import ToolStateManager
 from src.services.llm_service import LLMService, ModelType
 from pymongo import MongoClient
 from src.services.approval_analyzer import ApprovalAnalyzer
 from src.managers.schedule_manager import ScheduleManager
-
+from src.db.enums import OperationStatus, ToolOperationState, ApprovalState
 logger = logging.getLogger(__name__)
 
 class ApprovalAction(Enum):

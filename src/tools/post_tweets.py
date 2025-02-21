@@ -17,10 +17,6 @@ from src.services.llm_service import LLMService, ModelType
 from src.db.mongo_manager import MongoManager
 from src.db.db_schema import (
     ScheduledOperation,
-    OperationStatus,
-    ContentType,
-    ToolType,
-    ToolOperationState,
     OperationMetadata,
     ToolItem,
     TwitterContent,
@@ -33,8 +29,8 @@ from src.db.db_schema import (
     ToolItemResponse,
     TweetGenerationResponse,
     TwitterCommandAnalysis,
-    ScheduleState
 )
+from src.db.enums import OperationStatus, ToolOperationState, ScheduleState, ContentType, ToolType
 from src.utils.json_parser import parse_strict_json
 from src.managers.approval_manager import ApprovalManager, ApprovalAction, ApprovalState
 from src.managers.schedule_manager import ScheduleManager
@@ -151,14 +147,18 @@ class TwitterTool(BaseTool):
         try:
             logger.info(f"Starting command analysis for: {command}")
             
-            # Start operation through manager
+            # Start operation through manager with registry settings
             operation = await self.tool_state_manager.start_operation(
                 session_id=self.deps.session_id,
                 operation_type=ToolType.TWITTER.value,
                 initial_data={
                     "command": command,
-                    "requires_approval": True,
-                    "content_type": ContentType.TWEET.value
+                    "content_type": self.registry.content_type.value,
+                    "tool_registry": {
+                        "requires_approval": self.registry.requires_approval,
+                        "requires_scheduling": self.registry.requires_scheduling,
+                        "content_type": self.registry.content_type.value
+                    }
                 }
             )
             tool_operation_id = str(operation['_id'])
@@ -261,11 +261,11 @@ Example response format:
                     "total_items": params["item_count"],
                     **{k: v for k, v in params.items() if k not in ["topic", "item_count"]}
                 },
-                content_type=ContentType.TWEET.value,
+                content_type=self.registry.content_type.value,
                 session_id=self.deps.session_id
             )
             
-            # Update operation with command info only
+            # Update operation with command info and schedule info
             await self.tool_state_manager.update_operation(
                 session_id=self.deps.session_id,
                 tool_operation_id=tool_operation_id,
@@ -276,6 +276,10 @@ Example response format:
                         "schedule_type": params.get("schedule_type"),
                         "schedule_time": params.get("schedule_time")
                     },
+                    "schedule_id": schedule_id
+                },
+                metadata={
+                    "schedule_state": ScheduleState.PENDING.value,
                     "schedule_id": schedule_id
                 }
             )

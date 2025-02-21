@@ -3,7 +3,7 @@ import json
 import logging
 from typing import Dict, List, Any, Optional
 from src.services.llm_service import LLMService, ModelType
-from src.db.db_schema import OperationStatus
+from src.db.enums import OperationStatus
 
 logger = logging.getLogger(__name__)
 

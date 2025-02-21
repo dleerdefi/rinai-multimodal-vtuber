@@ -24,7 +24,7 @@ from src.managers.approval_manager import ApprovalManager
 from src.services.llm_service import LLMService
 from src.tools.base import AgentDependencies
 from src.db.mongo_manager import MongoManager
-from src.db.db_schema import ContentType, ToolOperationState, OperationStatus, ScheduleState
+from src.db.enums import ToolOperationState, OperationStatus, ScheduleState, ContentType
 
 # Set up logging
 logger = logging.getLogger(__name__)

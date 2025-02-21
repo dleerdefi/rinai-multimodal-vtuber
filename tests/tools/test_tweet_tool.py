@@ -21,9 +21,10 @@ from src.tools.post_tweets import TwitterTool
 from src.tools.base import AgentDependencies
 from src.managers.tool_state_manager import ToolStateManager
 from src.services.llm_service import LLMService
-from src.managers.approval_manager import ApprovalManager, ApprovalState, ApprovalAction
+from src.managers.approval_manager import ApprovalManager
 from src.db.mongo_manager import MongoManager
-from src.db.db_schema import ToolOperationState, OperationStatus
+from src.db.enums import ToolOperationState, OperationStatus, ApprovalState
+from src.db.db_schema import ToolOperation
 
 # Set up logging
 logger = logging.getLogger(__name__)

@@ -3,7 +3,8 @@ import logging
 from datetime import datetime, UTC
 from motor.motor_asyncio import AsyncIOMotorClient
 from src.clients.twitter_client import TwitterAgentClient
-from src.db.db_schema import OperationStatus, ContentType, RinDB, ToolOperationState
+from src.db.db_schema import ContentType, RinDB
+from src.db.enums import OperationStatus, ToolOperationState
 from src.managers.tool_state_manager import ToolStateManager
 from bson.objectid import ObjectId
 from typing import Dict
@@ -61,55 +62,65 @@ class ScheduleService:
                 await asyncio.sleep(60)  # Wait before retry
 
     async def _handle_scheduled_operation(self, operation: Dict):
-        """Handle scheduled operation execution"""
+        """Handle a scheduled operation that's due for execution"""
         try:
-            tool_operation_id = str(operation['_id'])
-
-            # Get items due for execution
-            current_time = datetime.now(UTC)
-            due_items = await self.db.tool_items.find({
-                "tool_operation_id": tool_operation_id,
-                "status": OperationStatus.SCHEDULED.value,
-                "metadata.scheduled_time": {"$lte": current_time.isoformat()}
-            }).to_list(None)
-
-            if not due_items:
+            # Get the tool client for execution
+            tool = self._get_tool_for_content_type(operation.get('content_type'))
+            if not tool:
+                logger.error(f"No tool found for content type: {operation.get('content_type')}")
                 return
 
-            # Execute each due item
-            for item in due_items:
-                try:
-                    tool = self._get_tool_for_content(item['metadata']['content_type'])
-                    if not tool:
-                        continue
+            # Get the scheduled items for this operation
+            items = await self.db.tool_items.find({
+                "tool_operation_id": operation['_id'],
+                "status": OperationStatus.SCHEDULED.value
+            }).to_list(None)
 
-                    result = await tool.execute_scheduled_operation(item)
+            for item in items:
+                try:
+                    scheduled_time = datetime.fromisoformat(
+                        item.get('metadata', {}).get('scheduled_time').replace('Z', '+00:00')
+                    )
                     
-                    if result.get('success'):
-                        # Update item status
-                        await self.db.tool_items.update_one(
-                            {"_id": item["_id"]},
-                            {"$set": {
-                                "status": OperationStatus.EXECUTED.value,
-                                "metadata": {
-                                    **item.get("metadata", {}),
-                                    "executed_at": current_time.isoformat(),
-                                    "execution_result": result
+                    # Check if it's time to execute this item
+                    if scheduled_time <= datetime.now(UTC):
+                        # Execute the item
+                        result = await tool.execute({
+                            'content': {
+                                'raw_content': item.get('content', {}).get('raw_content')
+                            },
+                            'parameters': {
+                                'custom_params': {
+                                    'account_id': item.get('parameters', {}).get('account_id', 'default'),
+                                    'media_files': item.get('parameters', {}).get('media_files', []),
+                                    'poll_options': item.get('parameters', {}).get('poll_options', []),
+                                    'poll_duration': item.get('parameters', {}).get('poll_duration')
                                 }
-                            }}
-                        )
+                            }
+                        })
+
+                        if result.get('success'):
+                            # Update item status to executed
+                            await self.db.tool_items.update_one(
+                                {"_id": item['_id']},
+                                {
+                                    "$set": {
+                                        "status": OperationStatus.EXECUTED.value,
+                                        "metadata.execution_result": result,
+                                        "metadata.executed_at": datetime.now(UTC).isoformat()
+                                    }
+                                }
+                            )
+                            logger.info(f"Successfully executed scheduled item {item['_id']}")
+                        else:
+                            await self._handle_execution_error(operation, f"Execution failed: {result.get('error')}")
 
                 except Exception as e:
-                    logger.error(f"Error executing item {item['_id']}: {e}")
+                    logger.error(f"Error executing scheduled item {item['_id']}: {e}")
                     continue
 
             # Check if all items are executed
-            is_complete = await self.schedule_manager.check_schedule_completion(tool_operation_id)
-            if is_complete:
-                await self.tool_state_manager.update_operation_state(
-                    tool_operation_id=tool_operation_id,
-                    state=ToolOperationState.COMPLETED
-                )
+            await self._check_schedule_completion(operation.get('metadata', {}).get('schedule_id'))
 
         except Exception as e:
             logger.error(f"Error handling scheduled operation: {e}")

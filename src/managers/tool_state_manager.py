@@ -1,10 +1,14 @@
-from enum import Enum
 from typing import Dict, Optional, Any, List
 from datetime import datetime, UTC
 import logging
-from src.db.db_schema import RinDB, ToolOperation, ToolOperationState, OperationStatus
-from src.utils.trigger_detector import TriggerDetector
 from bson.objectid import ObjectId
+from src.db.enums import (
+    OperationStatus,
+    ToolOperationState,
+    ScheduleState
+)
+from src.db.db_schema import RinDB, ToolOperation
+from src.utils.trigger_detector import TriggerDetector
 
 logger = logging.getLogger(__name__)
 
@@ -56,7 +60,15 @@ class ToolStateManager:
         """Start any tool operation with a unique ID"""
         try:
             tool_operation_id = str(ObjectId())
-            requires_approval = initial_data.get("requires_approval", True)
+            initial_data = initial_data or {}
+            
+            # Get tool registry settings if available
+            tool_registry = initial_data.get("tool_registry", {})
+            
+            # Set defaults from registry or fallback to provided values
+            requires_approval = tool_registry.get("requires_approval", initial_data.get("requires_approval", True))
+            requires_scheduling = tool_registry.get("requires_scheduling", initial_data.get("requires_scheduling", False))
+            content_type = tool_registry.get("content_type", initial_data.get("content_type"))
             
             operation_data = {
                 "_id": ObjectId(tool_operation_id),
@@ -67,7 +79,8 @@ class ToolStateManager:
                 "input_data": {
                     "command": initial_data.get("command"),
                     "status": initial_data.get("status"),
-                    "operation_metadata": initial_data.get("operation_metadata", {})
+                    "operation_metadata": initial_data.get("operation_metadata", {}),
+                    "schedule_info": initial_data.get("schedule_info")
                 },
                 "output_data": {
                     "status": OperationStatus.PENDING.value,
@@ -75,7 +88,8 @@ class ToolStateManager:
                     "requires_approval": requires_approval,
                     "pending_items": [],
                     "approved_items": [],
-                    "rejected_items": []
+                    "rejected_items": [],
+                    "schedule_id": None
                 },
                 "metadata": {
                     "state_history": [{
@@ -84,9 +98,10 @@ class ToolStateManager:
                         "timestamp": datetime.now(UTC).isoformat()
                     }],
                     "item_states": {},
-                    "requires_scheduling": True,
-                    "content_type": initial_data.get("content_type"),
-                    "generation_phase": "initializing"
+                    "requires_scheduling": requires_scheduling,
+                    "content_type": content_type,
+                    "generation_phase": "initializing",
+                    "schedule_state": ScheduleState.PENDING.value if requires_scheduling else None
                 },
                 "created_at": datetime.now(UTC),
                 "last_updated": datetime.now(UTC)
@@ -95,12 +110,13 @@ class ToolStateManager:
             # Create new operation
             result = await self.db.tool_operations.insert_one(operation_data)
             operation_data['_id'] = result.inserted_id
+            
             logger.info(f"Started {operation_type} operation {tool_operation_id} for session {session_id}")
             return operation_data
 
         except Exception as e:
             logger.error(f"Error starting operation: {e}")
-            return None
+            raise
 
     async def update_operation(
         self,
@@ -137,6 +153,21 @@ class ToolStateManager:
                     )
                     return False
                 update_data["state"] = state
+                
+                # Handle schedule state updates if this is a scheduled operation
+                if current_op.get("metadata", {}).get("requires_scheduling"):
+                    schedule_id = current_op.get("output_data", {}).get("schedule_id")
+                    if schedule_id:
+                        if state == ToolOperationState.COMPLETED.value:
+                            await self.db.update_schedule_state(
+                                schedule_id=schedule_id,
+                                state=ScheduleState.ACTIVE.value
+                            )
+                        elif state in [ToolOperationState.CANCELLED.value, ToolOperationState.ERROR.value]:
+                            await self.db.update_schedule_state(
+                                schedule_id=schedule_id,
+                                state=ScheduleState.CANCELLED.value if state == ToolOperationState.CANCELLED.value else ScheduleState.ERROR.value
+                            )
                 
             if step:
                 update_data["step"] = step
@@ -175,23 +206,16 @@ class ToolStateManager:
                         **output_data
                     }
                 
-            # Update operation by ID
-            result = await self.db.tool_operations.find_one_and_update(
+            # Update operation
+            result = await self.db.tool_operations.update_one(
                 {
                     "_id": ObjectId(tool_operation_id),
                     "session_id": session_id
                 },
-                {"$set": update_data},
-                return_document=True
+                {"$set": update_data}
             )
             
-            success = bool(result)
-            if success:
-                logger.info(f"Updated operation {tool_operation_id}")
-            else:
-                logger.warning(f"No operation updated for ID: {tool_operation_id}")
-                
-            return success
+            return result.modified_count > 0
 
         except Exception as e:
             logger.error(f"Error updating operation: {e}")
@@ -204,53 +228,51 @@ class ToolStateManager:
     async def end_operation(
         self,
         session_id: str,
-        tool_operation_id: str,  # Now required
-        status: OperationStatus,
-        reason: str = None,
-        api_response: Dict = None,
-        requires_approval: bool = True,
-        is_scheduled: bool = False,
-        metadata: Dict = None
+        success: bool = True,
+        api_response: Optional[Dict] = None
     ) -> bool:
-        """End operation with proper state transition"""
+        """End tool operation and cleanup"""
         try:
-            current_op = await self.db.tool_operations.find_one({
-                "_id": ObjectId(tool_operation_id),
-                "session_id": session_id
-            })
-            
-            if not current_op:
+            # Get current operation
+            operation = await self.get_operation(session_id)
+            if not operation:
+                logger.warning(f"No active operation found for session {session_id}")
                 return False
 
-            current_state = current_op.get("state")
-            final_state = self._get_final_state(current_state, status)
+            tool_operation_id = str(operation["_id"])
+            is_scheduled = operation.get("metadata", {}).get("requires_scheduling", False)
+            schedule_id = operation.get("output_data", {}).get("schedule_id")
 
-            # Update operation with final state
-            operation_data = {
-                "state": final_state,
-                "step": self._get_step_for_state(final_state),
-                "output_data": {
-                    **(current_op.get("output_data", {})),
-                    "status": status.value,
-                    "api_response": api_response
-                },
-                "metadata": {
-                    **(current_op.get("metadata", {})),
-                    "end_time": datetime.now(UTC).isoformat(),
-                    "end_reason": reason,
-                    "final_status": status.value,
-                    "requires_approval": requires_approval,
-                    "is_scheduled": is_scheduled
-                },
-                "last_updated": datetime.now(UTC)
-            }
-
-            return await self.update_operation(
+            # Determine final state
+            final_state = ToolOperationState.COMPLETED.value if success else ToolOperationState.ERROR.value
+            
+            # Update operation state
+            update_result = await self.update_operation(
                 session_id=session_id,
                 tool_operation_id=tool_operation_id,
                 state=final_state,
-                metadata=operation_data.get("metadata", {})
+                output_data={
+                    "status": OperationStatus.SCHEDULED.value if is_scheduled else OperationStatus.EXECUTED.value,
+                    "api_response": api_response
+                },
+                metadata={
+                    "completion_time": datetime.now(UTC).isoformat(),
+                    "final_status": "success" if success else "error"
+                }
             )
+
+            # For scheduled operations, ensure schedule is properly activated
+            if is_scheduled and success and schedule_id:
+                await self.db.update_schedule_state(
+                    schedule_id=schedule_id,
+                    state=ScheduleState.ACTIVE.value,
+                    metadata={
+                        "activation_time": datetime.now(UTC).isoformat(),
+                        "tool_operation_id": tool_operation_id
+                    }
+                )
+
+            return update_result
 
         except Exception as e:
             logger.error(f"Error ending operation: {e}")
@@ -390,85 +412,79 @@ class ToolStateManager:
             logger.error(f"Error getting operation items: {e}")
             return []
 
-    async def update_operation_state(
-        self,
-        tool_operation_id: str,
-        item_updates: Optional[List[Dict]] = None
-    ) -> bool:
-        """Update operation status based on aggregate item states and scheduling"""
+    async def update_operation_state(self, tool_operation_id: str, item_updates: Optional[List[Dict]] = None) -> bool:
+        """Update operation state based on item states and scheduling requirements"""
         try:
             operation = await self.get_operation_by_id(tool_operation_id)
             if not operation:
+                logger.error(f"No operation found for ID {tool_operation_id}")
                 return False
 
             # Get all items if no updates provided
             items = item_updates or await self.get_operation_items(tool_operation_id)
-            
-            # Get scheduling info from operation metadata
             is_scheduled_operation = operation.get('metadata', {}).get('requires_scheduling', False)
-            expected_item_count = operation.get('metadata', {}).get('expected_item_count', len(items))
-            
-            # Count items by state and status
-            executing_items = [i for i in items if i['state'] == ToolOperationState.EXECUTING.value]
-            completed_items = [i for i in items if i['state'] == ToolOperationState.COMPLETED.value]
-            scheduled_items = [i for i in items if i['status'] == OperationStatus.SCHEDULED.value]
-            executed_items = [i for i in items if i['status'] == OperationStatus.EXECUTED.value]
-            
-            # Determine item state completeness
-            all_items_approved = len(executing_items) == expected_item_count
-            all_items_scheduled = is_scheduled_operation and len(scheduled_items) == expected_item_count
-            all_items_executed = is_scheduled_operation and len(executed_items) == expected_item_count
-            
-            # Determine new operation state based on scheduling requirements
-            if is_scheduled_operation:
-                if all_items_executed:
-                    new_state = ToolOperationState.COMPLETED.value
-                elif all_items_scheduled:
-                    new_state = ToolOperationState.EXECUTING.value
-                elif all_items_approved:
-                    # Items approved but not yet scheduled
-                    new_state = ToolOperationState.APPROVING.value
-                else:
-                    # Still in approval/scheduling process
-                    return True
-            else:
-                # Non-scheduled operation logic
-                if all_items_approved:
-                    new_state = ToolOperationState.EXECUTING.value
-                elif len(executing_items) + len(completed_items) == expected_item_count:
-                    new_state = ToolOperationState.COMPLETED.value
-                else:
-                    return True
+            current_state = operation.get('state')
 
-            # Update operation state with detailed metadata
-            await self.db.tool_operations.update_one(
-                {"_id": ObjectId(tool_operation_id)},
-                {
-                    "$set": {
-                        "state": new_state,
-                        "metadata": {
-                            **(operation.get('metadata', {})),
-                            "item_summary": {
+            # Count items by state
+            items_by_state = {
+                'collecting': [i for i in items if i['state'] == ToolOperationState.COLLECTING.value],
+                'approving': [i for i in items if i['state'] == ToolOperationState.APPROVING.value],
+                'executing': [i for i in items if i['state'] == ToolOperationState.EXECUTING.value],
+                'completed': [i for i in items if i['state'] == ToolOperationState.COMPLETED.value]
+            }
+
+            # Count items by status
+            items_by_status = {
+                'pending': [i for i in items if i['status'] == OperationStatus.PENDING.value],
+                'approved': [i for i in items if i['status'] == OperationStatus.APPROVED.value],
+                'scheduled': [i for i in items if i['status'] == OperationStatus.SCHEDULED.value],
+                'executed': [i for i in items if i['status'] == OperationStatus.EXECUTED.value]
+            }
+
+            new_state = current_state
+            expected_item_count = operation.get('metadata', {}).get('expected_item_count', len(items))
+
+            # Determine new state based on operation type and item states
+            if is_scheduled_operation:
+                if len(items_by_status['executed']) == expected_item_count:
+                    new_state = ToolOperationState.COMPLETED.value
+                elif len(items_by_status['scheduled']) == expected_item_count:
+                    new_state = ToolOperationState.EXECUTING.value  # Schedule is active
+                elif len(items_by_status['approved']) == expected_item_count:
+                    # All items approved but not yet scheduled
+                    new_state = ToolOperationState.APPROVING.value
+            else:
+                # Non-scheduled operation state progression
+                if len(items_by_state['completed']) == expected_item_count:
+                    new_state = ToolOperationState.COMPLETED.value
+                elif len(items_by_state['executing']) == expected_item_count:
+                    new_state = ToolOperationState.EXECUTING.value
+
+            # Only update if state has changed
+            if new_state != current_state:
+                await self.db.tool_operations.update_one(
+                    {"_id": ObjectId(tool_operation_id)},
+                    {
+                        "$set": {
+                            "state": new_state,
+                            "metadata.item_summary": {
                                 "total_items": expected_item_count,
-                                "executing_count": len(executing_items),
-                                "completed_count": len(completed_items),
-                                "scheduled_count": len(scheduled_items),
-                                "executed_count": len(executed_items),
+                                "by_state": {state: len(items) for state, items in items_by_state.items()},
+                                "by_status": {status: len(items) for status, items in items_by_status.items()},
                                 "requires_scheduling": is_scheduled_operation,
                                 "last_state_update": datetime.now(UTC).isoformat()
                             }
-                        },
-                        "last_updated": datetime.now(UTC)
+                        }
                     }
-                }
-            )
-            
-            logger.info(
-                f"Operation {tool_operation_id} state updated to {new_state}. "
-                f"Items: {len(executing_items)} executing, {len(scheduled_items)} scheduled, "
-                f"{len(executed_items)} executed"
-            )
-            
+                )
+                
+                logger.info(
+                    f"Operation {tool_operation_id} state updated: {current_state} -> {new_state}. "
+                    f"Scheduled: {len(items_by_status['scheduled'])}, "
+                    f"Executed: {len(items_by_status['executed'])}, "
+                    f"Total: {expected_item_count}"
+                )
+
             return True
 
         except Exception as e:

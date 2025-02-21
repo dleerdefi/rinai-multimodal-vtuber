@@ -3,12 +3,10 @@ from datetime import datetime, UTC, timedelta
 import logging
 from src.db.db_schema import (
     RinDB,
-    ToolOperationState,
-    OperationStatus,
     ContentType,
     ToolItem,
-    ScheduleState
 )
+from src.db.enums import OperationStatus, ToolOperationState, ScheduleState
 from src.managers.tool_state_manager import ToolStateManager
 from bson.objectid import ObjectId
 from enum import Enum

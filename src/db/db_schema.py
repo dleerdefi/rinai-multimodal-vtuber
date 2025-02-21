@@ -4,6 +4,14 @@ import logging
 import uuid
 from bson.objectid import ObjectId
 from motor.motor_asyncio import AsyncIOMotorClient
+from src.db.enums import (
+    OperationStatus,
+    ToolOperationState,
+    ScheduleState,
+    ApprovalState,
+    ContentType,
+    ToolType
+)
 from enum import Enum
 from pydantic import BaseModel
 
@@ -28,41 +36,6 @@ class ContextConfiguration(TypedDict):
     latest_summary: Optional[dict]  # The most recent summary message
     active_message_ids: List[str]   # IDs of messages in current context
     last_updated: datetime
-
-class OperationStatus(Enum):
-    PENDING = "pending"          # Item is waiting for action
-    APPROVED = "approved"        # Item has been approved
-    REJECTED = "rejected"        # Item was rejected
-    SCHEDULED = "scheduled"      # Item is scheduled for execution
-    EXECUTED = "executed"        # Item has been executed
-    FAILED = "failed"           # Item execution failed
-
-class ToolOperationState(Enum):
-    INACTIVE = "inactive"
-    COLLECTING = "collecting"
-    APPROVING = "approving"
-    EXECUTING = "executing"
-    COMPLETED = "completed"
-    ERROR = "error"
-    CANCELLED = "cancelled"
-
-class ApprovalState(Enum):
-    """Sub-states during the approval workflow"""
-    AWAITING_INITIAL = "awaiting_initial"
-    AWAITING_APPROVAL = "awaiting_approval"
-    REGENERATING = "regenerating"
-    APPROVAL_FINISHED = "approval_finished"
-    APPROVAL_CANCELLED = "approval_cancelled"
-
-class ScheduleState(Enum):
-    """Sub-states during the scheduling workflow"""
-    PENDING = "pending"
-    ACTIVATING = "activating"
-    ACTIVE = "active"
-    PAUSED = "paused"
-    COMPLETED = "completed"
-    CANCELLED = "cancelled"
-    ERROR = "error"
 
 class ContentType(str, Enum):
     """Types of content that can be produced"""
@@ -273,6 +246,18 @@ class TwitterCommandAnalysis(BaseModel):
 
 class TweetGenerationResponse(BaseModel):
     items: List[Dict[str, Any]]
+
+class AgentState(Enum):
+    NORMAL_CHAT = "normal_chat"
+    TOOL_OPERATION = "tool_operation"
+
+class AgentStateManager:
+    def __init__(self, tool_state_manager, orchestrator, trigger_detector):
+        self.current_state = AgentState.NORMAL_CHAT
+        self.tool_state_manager = tool_state_manager
+        self.orchestrator = orchestrator
+        self.trigger_detector = trigger_detector
+        self.active_operation = None
 
 class RinDB:
     def __init__(self, client: AsyncIOMotorClient):

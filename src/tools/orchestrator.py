@@ -161,25 +161,7 @@ class Orchestrator:
                 operation = await self.tool_state_manager.get_operation_state(deps.session_id)
                 logger.info(f"[ORCHESTRATOR] Current operation: {operation}")
 
-            # 2. Check for global exit commands first
-            if self._is_exit_command(command) and operation:
-                tool = self.tools.get(operation.get("tool_type"))
-                if tool and hasattr(tool, "approval_manager"):
-                    result = await tool.approval_manager.handle_exit(
-                        session_id=deps.session_id,
-                        success=False,
-                        tool_type=tool.name
-                    )
-                    return AgentResult(
-                        response=result.get("response"),
-                        data={
-                            "tool_type": tool.name,
-                            "status": "cancelled",
-                            "completion_type": "user_exit"
-                        }
-                    )
-
-            # 3. Resolve tool (either from existing operation or new command)
+            # 2. Resolve tool (either from existing operation or new command)
             tool = None
             if operation:
                 tool = self.tools.get(operation.get("tool_type"))
@@ -200,13 +182,24 @@ class Orchestrator:
                     data={"status": "error"}
                 )
 
-            # 4. Execute tool
+            # 3. Execute tool
             result = await tool.run(command)
 
-            # 5. Process result based on status
+            # 4. Handle scheduled operations
+            if result.get("status") == "scheduled":
+                return AgentResult(
+                    response=result.get("response"),
+                    data={
+                        "tool_type": tool.name,
+                        "status": "completed",
+                        "completion_type": "scheduled",
+                        "schedule_id": result.get("data", {}).get("schedule_id")
+                    }
+                )
+
+            # 5. Process normal result based on status
             status = result.get("status")
             if status in ["completed", "cancelled", "error"]:
-                # Tool operation is ending
                 return AgentResult(
                     response=result.get("response"),
                     data={
@@ -231,25 +224,6 @@ class Orchestrator:
 
         except Exception as e:
             logger.error(f"Error in orchestrator: {e}")
-            # Try to get tool type for proper exit handling
-            tool_type = operation.get("tool_type") if operation else None
-            if tool_type and deps and deps.session_id:
-                tool = self.tools.get(tool_type)
-                if tool and hasattr(tool, "approval_manager"):
-                    result = await tool.approval_manager.handle_exit(
-                        session_id=deps.session_id,
-                        success=False,
-                        tool_type=tool_type
-                    )
-                    return AgentResult(
-                        response=result.get("response"),
-                        data={
-                            "tool_type": tool_type,
-                            "status": "error",
-                            "error": str(e)
-                        }
-                    )
-            
             return AgentResult(
                 response="I encountered an error processing your request.",
                 data={"status": "error", "error": str(e)}

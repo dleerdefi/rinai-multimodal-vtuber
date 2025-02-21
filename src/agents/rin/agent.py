@@ -35,6 +35,8 @@ from src.managers.tool_state_manager import ToolStateManager, ToolOperationState
 from src.tools.base import AgentDependencies
 from src.db.mongo_manager import MongoManager
 from src.services.schedule_service import ScheduleService
+from src.managers.agent_state_manager import AgentStateManager
+from src.db.db_schema import AgentState
 
 class RinAgent:
     def __init__(self, mongo_uri: str):
@@ -75,6 +77,13 @@ class RinAgent:
         
         # Initialize tool_state_manager with schedule service
         self.tool_state_manager = None  # Will be initialized in initialize()
+        
+        # Initialize state manager
+        self.state_manager = AgentStateManager(
+            tool_state_manager=self.tool_state_manager,
+            orchestrator=self.orchestrator,
+            trigger_detector=self.trigger_detector
+        )
         
     async def initialize(self):
         """Initialize async components."""
@@ -118,6 +127,26 @@ class RinAgent:
             logger.error(f"Error initializing RinAgent: {e}")
             raise
         
+    async def process_message(self, message: str, author: str) -> Dict:
+        """Process incoming message based on current state"""
+        try:
+            result = await self.state_manager.handle_message(
+                message=message,
+                session_id=self.current_session_id
+            )
+
+            if result.get("state") == "normal_chat":
+                return await self._generate_response(message, author)
+            
+            return result
+
+        except Exception as e:
+            logger.error(f"Error processing message: {e}")
+            return {
+                "error": str(e),
+                "requires_tts": True
+            }
+
     # Message entry point
     async def get_response(self, session_id: str, message: str, role: str = "user", interaction_type: str = "local_agent") -> str:
         """Main entry point for message processing"""
@@ -127,11 +156,9 @@ class RinAgent:
             # 1. Check for active tool operation first
             operation = await self.tool_state_manager.get_operation(session_id)
             logger.info(f"[AGENT] Active operation check: {bool(operation)}")
-            if operation:
-                logger.info(f"[AGENT] Operation state: {operation.get('state')}")
-                logger.info(f"[AGENT] Operation type: {operation.get('tool_type')}")
-
+            
             if operation and operation.get('state') not in [ToolOperationState.INACTIVE.value, ToolOperationState.CANCELLED.value]:
+                # Continue existing tool operation
                 logger.info("[AGENT] Continuing existing tool operation")
                 result = await self.orchestrator.process_command(
                     command=message,
@@ -141,14 +168,13 @@ class RinAgent:
                         context={"operation": operation}
                     )
                 )
-                logger.info(f"[AGENT] Tool operation result: {result.data.get('status')}")
                 
-                # Store tool interaction in context
+                # Store tool interaction
                 await self.context_manager.store_interaction(
                     session_id=session_id,
                     user_message=message,
                     assistant_response=result.response,
-                    interaction_type=interaction_type,
+                    interaction_type="tool_operation",
                     metadata={
                         'tool_operation': operation.get('tool_type'),
                         'tool_step': operation.get('step'),
@@ -157,12 +183,13 @@ class RinAgent:
                 )
                 
                 if result.data.get("status") in ["completed", "cancelled"]:
-                    # Tool operation finished - clean up and return final response
+                    # Tool operation finished - clean up and return to normal chat
                     await self.tool_state_manager.end_operation(
                         session_id=session_id,
                         success=result.data.get("status") == "completed",
                         api_response=result.data
                     )
+                    self.state = AgentState.NORMAL_CHAT
                 return result.response
 
             # 2. Initialize session if needed
@@ -186,26 +213,44 @@ class RinAgent:
             use_memory = self.trigger_detector.should_use_memory(message)
             
             # 4. Handle tool operations
-            tool_results = None
             if use_tools:
                 tool_type = self.trigger_detector.get_specific_tool_type(message)
-                if tool_type == "twitter":
-                    # Start multi-turn tool operation
+                if tool_type:
+                    # Start tool operation
                     await self.tool_state_manager.start_operation(
                         session_id=session_id,
                         operation_type=tool_type,
                         initial_data={"message": message}
                     )
-                    # Redirect to tool operation flow
-                    return await self.get_response(session_id, message, role, interaction_type)
-                else:
-                    # Single-turn tool - get immediate results
-                    tool_results = await self.orchestrator.process_command(
+                    
+                    # Process through orchestrator
+                    result = await self.orchestrator.process_command(
                         command=message,
-                        deps=AgentDependencies(session_id=session_id)
+                        deps=AgentDependencies(
+                            session_id=session_id,
+                            user_id=role,
+                            context={}
+                        )
                     )
-                    tool_results = tool_results.data.get("tool_results")
-                    logger.info(f"Tool results obtained: {bool(tool_results)}")
+                    
+                    # Handle scheduled operations
+                    if result.data.get("completion_type") == "scheduled":
+                        # Store interaction with schedule metadata
+                        await self.context_manager.store_interaction(
+                            session_id=session_id,
+                            user_message=message,
+                            assistant_response=result.response,
+                            interaction_type="scheduled_operation",
+                            metadata={
+                                'tool_type': tool_type,
+                                'schedule_id': result.data.get("schedule_id"),
+                                'status': "scheduled"
+                            }
+                        )
+                        return result.response
+                    
+                    # Continue with tool operation
+                    return await self.get_response(session_id, message, role, interaction_type)
 
             # 5. Get memory/RAG guidance if needed
             rag_guidance = None
@@ -222,7 +267,7 @@ class RinAgent:
                 message, 
                 self.sessions[session_id], 
                 session_id,
-                tool_results=tool_results,
+                tool_results=None,
                 rag_guidance=rag_guidance,
                 role=role,
                 interaction_type=interaction_type
@@ -246,7 +291,6 @@ class RinAgent:
                 metadata={
                     'formatted_for_tts': True,
                     'role': role,
-                    'tool_results': bool(tool_results),
                     'memory_used': bool(rag_guidance)
                 }
             )
