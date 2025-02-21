@@ -7,6 +7,7 @@ from src.db.db_schema import OperationStatus, ContentType, RinDB, ToolOperationS
 from src.managers.tool_state_manager import ToolStateManager
 from bson.objectid import ObjectId
 from typing import Dict
+from src.managers.schedule_manager import ScheduleManager
 
 logger = logging.getLogger(__name__)
 
@@ -15,7 +16,11 @@ class ScheduleService:
         self.mongo_client = AsyncIOMotorClient(mongo_uri)
         self.db = RinDB(self.mongo_client)
         self.tool_state_manager = ToolStateManager(db=self.db)
-        self.orchestrator = orchestrator  # Store orchestrator reference
+        self.schedule_manager = ScheduleManager(
+            tool_state_manager=self.tool_state_manager,
+            db=self.db
+        )
+        self.orchestrator = orchestrator
         self.running = False
         self._task = None
 
@@ -58,45 +63,56 @@ class ScheduleService:
     async def _handle_scheduled_operation(self, operation: Dict):
         """Handle scheduled operation execution"""
         try:
-            # Verify operation is in PENDING state and approved
-            if (operation.get('state') != ToolOperationState.PENDING.value or 
-                operation.get('output_data', {}).get('status') != OperationStatus.APPROVED.value):
+            tool_operation_id = str(operation['_id'])
+
+            # Get items due for execution
+            current_time = datetime.now(UTC)
+            due_items = await self.db.tool_items.find({
+                "tool_operation_id": tool_operation_id,
+                "status": OperationStatus.SCHEDULED.value,
+                "metadata.scheduled_time": {"$lte": current_time.isoformat()}
+            }).to_list(None)
+
+            if not due_items:
                 return
 
-            # Update to executing state
-            await self.tool_state_manager.update_operation(
-                session_id=operation['session_id'],
-                state=ToolOperationState.EXECUTING,
-                step="executing_schedule",
-                content_status=OperationStatus.SCHEDULED,
-                metadata={
-                    "execution_started_at": datetime.now(UTC).isoformat()
-                }
-            )
+            # Execute each due item
+            for item in due_items:
+                try:
+                    tool = self._get_tool_for_content(item['metadata']['content_type'])
+                    if not tool:
+                        continue
 
-            # Get appropriate tool and execute
-            content_type = operation.get('metadata', {}).get('content_type')
-            tool = self._get_tool_for_content(content_type)
-            
-            if not tool:
-                raise ValueError(f"No tool found for content type: {content_type}")
-            
-            result = await tool.execute_scheduled_operation(operation)
-            
-            # Handle execution result
-            if result.get('success'):
-                await self.tool_state_manager.end_operation(
-                    session_id=operation['session_id'],
-                    success=True,
-                    api_response=result,
-                    reason="Schedule executed successfully"
+                    result = await tool.execute_scheduled_operation(item)
+                    
+                    if result.get('success'):
+                        # Update item status
+                        await self.db.tool_items.update_one(
+                            {"_id": item["_id"]},
+                            {"$set": {
+                                "status": OperationStatus.EXECUTED.value,
+                                "metadata": {
+                                    **item.get("metadata", {}),
+                                    "executed_at": current_time.isoformat(),
+                                    "execution_result": result
+                                }
+                            }}
+                        )
+
+                except Exception as e:
+                    logger.error(f"Error executing item {item['_id']}: {e}")
+                    continue
+
+            # Check if all items are executed
+            is_complete = await self.schedule_manager.check_schedule_completion(tool_operation_id)
+            if is_complete:
+                await self.tool_state_manager.update_operation_state(
+                    tool_operation_id=tool_operation_id,
+                    state=ToolOperationState.COMPLETED
                 )
-            else:
-                await self._handle_execution_error(operation, result.get('error', 'Unknown error'))
 
         except Exception as e:
-            logger.error(f"Error executing schedule: {e}")
-            await self._handle_execution_error(operation, str(e))
+            logger.error(f"Error handling scheduled operation: {e}")
 
     async def _execute_operation(self, operation: Dict):
         """Execute the operation using the appropriate tool"""

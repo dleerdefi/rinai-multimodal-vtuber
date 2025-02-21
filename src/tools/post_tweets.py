@@ -9,7 +9,8 @@ from src.tools.base import (
     AgentResult,
     AgentDependencies,
     CommandAnalysis,
-    ToolOperation
+    ToolOperation,
+    ToolRegistry
 )
 from src.managers.tool_state_manager import ToolStateManager
 from src.services.llm_service import LLMService, ModelType
@@ -35,19 +36,33 @@ from src.db.db_schema import (
 )
 from src.utils.json_parser import parse_strict_json
 from src.managers.approval_manager import ApprovalManager, ApprovalAction, ApprovalState
+from src.managers.schedule_manager import ScheduleManager
 
 logger = logging.getLogger(__name__)
 
 class TwitterTool(BaseTool):
     name = "twitter"
-    description = "Twitter scheduling and management tool"
-    version = "1.0.0"
+    description = "Posts and manages tweets"
+    version = "1.0"
+    registry = ToolRegistry(
+        content_type=ContentType.TWEET,
+        tool_type=ToolType.TWITTER,
+        requires_approval=True,
+        requires_scheduling=True,
+        required_clients=["twitter_client"],
+        required_managers=[
+            "tool_state_manager",
+            "approval_manager",
+            "schedule_manager"
+        ]
+    )
 
     def __init__(self, 
                  deps: Optional[AgentDependencies] = None, 
                  tool_state_manager: Optional[ToolStateManager] = None,
                  llm_service: Optional[LLMService] = None,
-                 approval_manager: Optional[ApprovalManager] = None):
+                 approval_manager: Optional[ApprovalManager] = None,
+                 schedule_manager: Optional[ScheduleManager] = None):
         """Initialize tweet tool with dependencies and services"""
         super().__init__()
         self.deps = deps or AgentDependencies()
@@ -59,6 +74,11 @@ class TwitterTool(BaseTool):
             llm_service=llm_service
         )
         self.db = tool_state_manager.db if tool_state_manager else None
+        self.schedule_manager = schedule_manager or ScheduleManager(
+            tool_state_manager=tool_state_manager,
+            db=self.db,
+            tool_registry={ContentType.TWEET.value: self}
+        )
 
     def can_handle(self, input_data: Any) -> bool:
         """Check if input can be handled by tweet tool"""
@@ -144,14 +164,17 @@ Available Twitter actions:
    - item_count: number of tweets to schedule
    - topic: what to tweet about
    - schedule_type: "one_time"
-   - schedule_time: when to post (default: spread over next 24 hours)
+   - schedule_time: when to post (specify "spread_24h" or specific time)
+   - interval_minutes: minutes between tweets (if spreading)
+   - start_time: when to start posting (ISO format, if specific time)
    - approval_required: true
 
 Instructions:
 - Return ONLY valid JSON matching the example format
-- Extract count, topic, and timing information from command
-- If no specific time mentioned, default to spreading tweets over next 24 hours
-- Include schedule_time in parameters
+- Extract count, topic, and ALL timing information from command
+- For spread_24h, calculate appropriate interval based on tweet count
+- For specific times, provide start_time in ISO format
+- Include ALL scheduling parameters
 
 Example response format:
 {{
@@ -163,11 +186,12 @@ Example response format:
             "topic": "artificial intelligence",
             "schedule_type": "one_time",
             "schedule_time": "spread_24h",
+            "interval_minutes": 288,  # Calculated for 5 tweets over 24h
             "approval_required": true
         }},
         "priority": 1
     }}],
-    "reasoning": "User requested scheduling multiple tweets about AI"
+    "reasoning": "User requested scheduling multiple tweets about AI spread over 24 hours"
 }}"""
 
             messages = [
@@ -246,6 +270,15 @@ Example response format:
                 "metadata": {
                     "content_type": ContentType.TWEET.value,
                     "generation_phase": "initializing",
+                    "requires_scheduling": True,
+                    "schedule_info": {
+                        "schedule_id": schedule_id,
+                        "schedule_type": params.get("schedule_type"),
+                        "schedule_time": params.get("schedule_time"),
+                        "total_items": params["item_count"],
+                        # Any additional scheduling parameters from LLM analysis
+                        **{k: v for k, v in params.items() if k not in ["topic", "item_count"]}
+                    },
                     "state_history": [{
                         "state": ToolOperationState.COLLECTING.value,
                         "timestamp": datetime.now(UTC).isoformat()
@@ -269,7 +302,7 @@ Example response format:
             logger.error(f"Error in Twitter command analysis: {e}", exc_info=True)
             raise
 
-    async def _generate_tweets(self, topic: str, count: int, schedule_id: str, tool_operation_id: str) -> Dict:
+    async def _generate_tweets(self, topic: str, count: int, schedule_id: str = None, tool_operation_id: str = None) -> Dict:
         """Generate tweet content and save as tool items"""
         try:
             logger.info(f"Starting tweet generation: {count} tweets about {topic}")
@@ -332,6 +365,13 @@ Format the response as JSON:
             )
             
             logger.info(f"Raw LLM response: {response}")
+            
+            # Strip markdown code blocks if present
+            response = response.strip()
+            if response.startswith('```') and response.endswith('```'):
+                # Remove the first line (```json) and the last line (```)
+                response = '\n'.join(response.split('\n')[1:-1])
+            
             generated_items = json.loads(response)
             logger.info(f"Parsed generated items: {generated_items}")
             
@@ -413,99 +453,33 @@ Format the response as JSON:
             logger.error(f"Error generating tweets: {e}", exc_info=True)
             raise
 
-    async def _activate_tweet_schedule(self, schedule_id: str, schedule_info: Dict) -> bool:
-        """Activate a tweet schedule after approval"""
+    async def execute_scheduled_operation(self, operation: Dict) -> Dict:
+        """Execute a scheduled tweet operation"""
         try:
-            # Get all approved items for this schedule
-            items = await self.db.get_tool_items_by_schedule(schedule_id)
-            approved_items = [i for i in items if i["status"] == OperationStatus.APPROVED.value]
-            
-            # Get or create start_time
-            start_time = schedule_info.get("start_time")
-            if not start_time:
-                start_time = datetime.now(UTC)
-                logger.info(f"No start_time found, using current time: {start_time}")
-            elif isinstance(start_time, str):
-                start_time = datetime.fromisoformat(start_time.replace('Z', '+00:00'))
-                logger.info(f"Parsed start_time from string: {start_time}")
-            
-            interval_minutes = schedule_info.get("interval_minutes", 2)
-            interval = timedelta(minutes=interval_minutes)
-            
-            logger.info(f"Scheduling {len(approved_items)} tweets starting at {start_time} with {interval_minutes} minute intervals")
-            
-            # Update each Tweet with its schedule time
-            for i, item in enumerate(approved_items):
-                scheduled_time = start_time + (interval * i)
-                # Update item status and store scheduled_time in metadata
-                await self.db.update_tool_item_status(
-                    item_id=str(item["_id"]),
-                    status=OperationStatus.SCHEDULED.value,
-                    metadata={
-                        "scheduled_time": scheduled_time.isoformat(),
-                        "schedule_index": i
-                    }
-                )
-                logger.info(f"Scheduled item {tweet['_id']} for {scheduled_time}")
-            
-            # Update schedule status with proper datetime handling
-            await self.db.update_scheduled_operation(
-                schedule_id=schedule_id,
-                status="scheduled",
-                schedule_info={
-                    **schedule_info,
-                    "start_time": start_time.isoformat(),
-                    "interval_minutes": interval_minutes,
-                    "last_updated": datetime.now(UTC).isoformat()
-                }
-            )
-            
-            logger.info(f"Successfully activated schedule {schedule_id}")
-            return True
-            
-        except Exception as e:
-            logger.error(f"Error activating tweet schedule: {e}", exc_info=True)
-            return False
+            content = operation.get('content', {}).get('formatted_content')
+            if not content:
+                raise ValueError("No content found for scheduled tweet")
 
-    async def _execute_tweet(self, tweet_data: Dict) -> Dict:
-        """Execute a single tweet using TwitterAgentClient"""
-        try:
-            # Send tweet using Twitter Client
-            result = await self.twitter_client.send_tweet(**tweet_data["twitter_api_params"])
-
-            # Update tweet status in database
-            await self.db.update_tool_item_status(
-                item_id=tweet_data["id"],
-                status=OperationStatus.EXECUTED.value,
-                twitter_response=result,
-                metadata={
-                    "content_type": ContentType.TWEET.value,
-                    "execution_time": datetime.now(UTC).isoformat(),
-                    "posted_tweet_id": result.get("id")
+            result = await self.twitter_client.send_tweet(
+                content=content,
+                params={
+                    'account_id': operation.get('metadata', {}).get('account_id', 'default'),
+                    'media_files': operation.get('metadata', {}).get('media_files', []),
+                    'poll_options': operation.get('metadata', {}).get('poll_options', [])
                 }
             )
             
             return {
-                "status": OperationStatus.EXECUTED.value,
-                "item_id": result.get("id"),
-                "timestamp": datetime.utcnow().isoformat()
+                'success': result.get('success', False),
+                'result': result,
+                'tweet_id': result.get('id')
             }
+            
         except Exception as e:
-            logger.error(f"Error posting tweet: {e}")
-            await self.db.update_tool_item_status(
-                item_id=tweet_data["id"],
-                status=OperationStatus.FAILED,
-                error=str(e),
-                metadata={
-                    "content_type": ContentType.TWEET.value,
-                    "last_error": str(e),
-                    "error_timestamp": datetime.now(UTC).isoformat()
-                }
-            )
+            logger.error(f"Error executing scheduled tweet: {e}")
             return {
-                "status": OperationStatus.FAILED.value,
-                "error": str(e),
-                "timestamp": datetime.utcnow().isoformat()
+                'success': False,
+                'error': str(e)
             }
 
     async def _get_db(self):
@@ -546,33 +520,6 @@ Format the response as JSON:
         except Exception as e:
             logger.error(f"Error handling approval error: {e}")
             return self.approval_manager._create_error_response(str(e))
-
-    async def execute_scheduled_operation(self, operation: Dict) -> Dict:
-        """Execute a scheduled tweet operation"""
-        try:
-            item_metadata = operation.get('metadata', {})
-            twitter_params = item_metadata.get('twitter_api_params', {})
-            
-            result = await self.twitter_client.send_tweet(
-                content=twitter_params.get('content'),
-                params={
-                    'account_id': twitter_params.get('account_id', 'default'),
-                    'media_files': twitter_params.get('media_files', []),
-                    'poll_options': twitter_params.get('poll_options', [])
-                }
-            )
-            
-            return {
-                'success': True,
-                'result': result,
-                'id': result.get('id')
-            }
-            
-        except Exception as e:
-            return {
-                'success': False,
-                'error': str(e)
-            }
 
     async def _regenerate_rejected_tweets(
         self,

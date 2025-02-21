@@ -80,7 +80,7 @@ class ScheduledOperation(TypedDict):
     content_type: str  # Maps to ContentType
     status: str  # Maps to OperationStatus
     count: int  # Number of items to schedule (tweets, posts, etc)
-    schedule_type: Literal["one_time", "multiple", "recurring"]  # Type of schedule
+    schedule_type: Literal["immediate", "one_time", "multiple", "recurring"]  # Type of schedule
     schedule_time: str  # When to execute
     approval_required: bool  # Whether approval is needed
     content: Dict[str, Any]  # The actual content to be executed

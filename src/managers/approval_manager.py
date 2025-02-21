@@ -16,6 +16,7 @@ from src.managers.tool_state_manager import ToolStateManager
 from src.services.llm_service import LLMService, ModelType
 from pymongo import MongoClient
 from src.services.approval_analyzer import ApprovalAnalyzer
+from src.managers.schedule_manager import ScheduleManager
 
 logger = logging.getLogger(__name__)
 
@@ -37,13 +38,14 @@ class ApprovalState(Enum):
     APPROVAL_CANCELLED = "approval_cancelled"
 
 class ApprovalManager:
-    def __init__(self, tool_state_manager: ToolStateManager, db: RinDB, llm_service: LLMService):
+    def __init__(self, tool_state_manager: ToolStateManager, db: RinDB, llm_service: LLMService, schedule_manager: ScheduleManager):
         """Initialize approval manager with required services"""
         logger.info("Initializing ApprovalManager...")
         self.tool_state_manager = tool_state_manager
         self.db = db
         self.llm_service = llm_service
         self.analyzer = ApprovalAnalyzer(llm_service)
+        self.schedule_manager = schedule_manager
         logger.info("ApprovalManager initialized successfully")
 
     # Mapping between Approval States and Tool States
@@ -298,15 +300,29 @@ class ApprovalManager:
                 }
             )
             
+            # Get operation to check if it's schedulable
+            is_schedulable = operation.get('metadata', {}).get('is_schedulable', False)
+            schedule_info = operation.get('input_data', {}).get('command_info', {}).get('schedule_info')
+
+            if is_schedulable and schedule_info:
+                # Trigger scheduling flow
+                schedule_success = await self.schedule_manager.activate_schedule(
+                    tool_operation_id=tool_operation_id,
+                    schedule_info=schedule_info,
+                    content_type=operation['metadata']['content_type']
+                )
+                if not schedule_success:
+                    return self._create_error_response("Failed to activate schedule")
+
             return {
-                "status": "ok",
+                "status": OperationStatus.APPROVED.value,
                 "state": ToolOperationState.EXECUTING.value,
                 "approval_state": ApprovalState.APPROVAL_FINISHED.value,
-                "message": (f"Approval complete. {len(executing_items)} items approved "
-                          f"({len(rejected_items)} previously rejected)"),
+                "message": "Items approved and scheduled for execution",
                 "data": {
                     "executing_items": executing_items,
-                    "rejected_items": rejected_items
+                    "rejected_items": rejected_items,
+                    "scheduled": is_schedulable
                 }
             }
             

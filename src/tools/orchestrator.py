@@ -1,5 +1,5 @@
 from pydantic import BaseModel, Field, ValidationError
-from typing import List, Dict, Optional, Any
+from typing import List, Dict, Optional, Any, Type
 import logging
 import asyncio
 import os
@@ -41,6 +41,7 @@ from src.services.schedule_service import ScheduleService
 # Manager imports
 from src.managers.tool_state_manager import ToolStateManager, ToolOperationState
 from src.db.mongo_manager import MongoManager
+from src.managers.schedule_manager import ScheduleManager
 
 # Utility imports
 from src.utils.trigger_detector import TriggerDetector
@@ -80,13 +81,21 @@ class Orchestrator:
             orchestrator=self
         )
         
+        # Initialize schedule manager before tools
+        self.schedule_manager = ScheduleManager(
+            tool_state_manager=self.tool_state_manager,
+            db=db,
+            tool_registry={}  # Will be populated during registration
+        )
+        
         # Initialize tools with their dependencies
         self.crypto_tool = CryptoTool(self._init_coingecko())
         self.perplexity_tool = PerplexityTool(self._init_perplexity())
         self.twitter_tool = TwitterTool(
             tool_state_manager=self.tool_state_manager,
             llm_service=self.llm_service,
-            deps=self.deps
+            deps=self.deps,
+            schedule_manager=self.schedule_manager  # Add schedule_manager
         )
         
         calendar_client = self._init_calendar()
@@ -247,8 +256,13 @@ class Orchestrator:
             )
 
     def register_tool(self, tool: BaseTool):
-        """Register a tool with the orchestrator"""
+        """Enhanced tool registration"""
         self.tools[tool.name] = tool
+        
+        # If tool has content_type, register it with schedule_manager
+        if hasattr(tool, 'content_type') and tool.content_type:
+            self.schedule_manager.tool_registry[tool.content_type.value] = tool
+            logger.info(f"Registered schedulable tool: {tool.name} for content type: {tool.content_type.value}")
 
     def _init_coingecko(self) -> Optional[CoinGeckoClient]:
         """Initialize CoinGecko client if configured"""
@@ -289,3 +303,28 @@ class Orchestrator:
         """Check if command is a global exit command"""
         exit_keywords = ["exit", "quit", "stop", "cancel", "done"]
         return any(keyword in command.lower() for keyword in exit_keywords)
+
+    def initialize_tool(self, tool_class: Type[BaseTool]) -> BaseTool:
+        """Initialize a tool with its required dependencies"""
+        registry = tool_class.get_registry()
+        
+        # Initialize required clients
+        clients = {}
+        if "twitter_client" in registry.required_clients:
+            clients["twitter_client"] = TwitterAgentClient()
+        
+        # Initialize required managers
+        managers = {}
+        if "approval_manager" in registry.required_managers:
+            managers["approval_manager"] = self.approval_manager
+        if "schedule_manager" in registry.required_managers:
+            managers["schedule_manager"] = self.schedule_manager
+        if "tool_state_manager" in registry.required_managers:
+            managers["tool_state_manager"] = self.tool_state_manager
+        
+        # Initialize tool with dependencies
+        return tool_class(
+            deps=self.deps,
+            **clients,
+            **managers
+        )

@@ -3,12 +3,23 @@ from typing import Dict, Any, List, Optional, Literal
 import asyncio
 from datetime import datetime, timedelta
 from pydantic import BaseModel, Field
+from src.db.db_schema import ContentType, ToolType
+
+class ToolRegistry(BaseModel):
+    """Tool registration configuration"""
+    content_type: ContentType
+    tool_type: ToolType
+    requires_approval: bool = True
+    requires_scheduling: bool = False
+    required_clients: List[str] = []
+    required_managers: List[str] = []
 
 class BaseTool(ABC):
     """Base class for all tools"""
     name: str
     description: str
     version: str
+    registry: ToolRegistry
     
     def __init__(self):
         self.cache = {}
@@ -37,6 +48,11 @@ class BaseTool(ABC):
             'timestamp': now
         }
         return data
+
+    @classmethod
+    def get_registry(cls) -> ToolRegistry:
+        """Get tool registration info"""
+        return cls.registry
 
 class ToolCommand(BaseModel):
     """Structure for tool commands"""
