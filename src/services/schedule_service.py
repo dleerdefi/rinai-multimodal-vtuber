@@ -4,11 +4,12 @@ from datetime import datetime, UTC
 from motor.motor_asyncio import AsyncIOMotorClient
 from src.clients.twitter_client import TwitterAgentClient
 from src.db.db_schema import ContentType, RinDB
-from src.db.enums import OperationStatus, ToolOperationState
+from src.db.enums import OperationStatus, ToolOperationState, ToolType
 from src.managers.tool_state_manager import ToolStateManager
+from src.managers.schedule_manager import ScheduleManager, SchedulableToolProtocol
+from src.tools.base import ToolRegistry
 from bson.objectid import ObjectId
-from typing import Dict
-from src.managers.schedule_manager import ScheduleManager
+from typing import Dict, Optional, Any
 
 logger = logging.getLogger(__name__)
 
@@ -17,11 +18,21 @@ class ScheduleService:
         self.mongo_client = AsyncIOMotorClient(mongo_uri)
         self.db = RinDB(self.mongo_client)
         self.tool_state_manager = ToolStateManager(db=self.db)
-        self.schedule_manager = ScheduleManager(
-            tool_state_manager=self.tool_state_manager,
-            db=self.db
+        
+        # Initialize Twitter client first
+        self.twitter_client = TwitterAgentClient()
+        
+        # Initialize tool registry with correct values
+        self.tool_registry = ToolRegistry(
+            content_type='tweet',   # ContentType.TWEET.value
+            tool_type='twitter'     # ToolType.TWITTER.value
         )
-        self.orchestrator = orchestrator
+        
+        # Store tools separately for lookup
+        self._tools = {
+            'twitter': self.twitter_client
+        }
+        
         self.running = False
         self._task = None
 
@@ -40,20 +51,23 @@ class ScheduleService:
         while self.running:
             try:
                 # Get operations ready for execution
-                due_operations = await self.db.get_scheduled_operations_for_execution(
-                    content_type=ContentType.TWEET.value,
+                due_operations = await self.db.get_scheduled_operation(
                     status=OperationStatus.SCHEDULED.value
                 )
                 
-                due_operations = [op for op in due_operations 
-                                if op.get('state') != ToolOperationState.CANCELLED.value]
+                # Ensure due_operations is a list
+                if due_operations and not isinstance(due_operations, list):
+                    due_operations = [due_operations]
                 
-                for operation in due_operations:
-                    try:
-                        await self._handle_scheduled_operation(operation)
-                    except Exception as e:
-                        logger.error(f"Error processing operation {operation['_id']}: {e}")
-                        continue
+                if due_operations:
+                    for operation in due_operations:
+                        if isinstance(operation, dict):  # Ensure operation is a dict
+                            if operation.get('state') != ToolOperationState.CANCELLED.value:
+                                try:
+                                    await self._handle_scheduled_operation(operation)
+                                except Exception as e:
+                                    logger.error(f"Error processing operation {operation.get('_id')}: {e}")
+                                    continue
                 
                 await asyncio.sleep(60)  # Check every minute
                 
@@ -65,7 +79,7 @@ class ScheduleService:
         """Handle a scheduled operation that's due for execution"""
         try:
             # Get the tool client for execution
-            tool = self._get_tool_for_content_type(operation.get('content_type'))
+            tool = self._get_tool_for_content(operation.get('content_type'))
             if not tool:
                 logger.error(f"No tool found for content type: {operation.get('content_type')}")
                 return
@@ -145,37 +159,34 @@ class ScheduleService:
             logger.error(f"Error executing operation: {e}")
             return {'success': False, 'error': str(e)}
 
-    def _get_tool_for_content(self, content_type: str):
-        """Get appropriate tool from orchestrator"""
-        if not self.orchestrator:
-            logger.error("No orchestrator available for tool lookup")
-            return None
+    def _get_tool_for_content(self, content_type: str) -> Optional[Any]:
+        """Get appropriate tool for content type"""
+        try:
+            if isinstance(content_type, ContentType):
+                content_type = content_type.value
             
-        # Map ContentType to tool name
-        tool_name_map = {
-            ContentType.TWEET.value: "twitter",
-            # Add other content types here
-        }
-        
-        tool_name = tool_name_map.get(content_type)
-        if not tool_name:
-            logger.warning(f"No tool mapping for content type: {content_type}")
+            if content_type == self.tool_registry.content_type:
+                return self._tools.get(self.tool_registry.tool_type)
             return None
-            
-        return self.orchestrator.tools.get(tool_name)
+        except Exception as e:
+            logger.error(f"Error getting tool for content type {content_type}: {e}")
+            return None
 
     async def _check_schedule_completion(self, schedule_id: str):
         """Check if all operations in a schedule are complete"""
         try:
-            schedule = await self.db.get_scheduled_operations({
-                "schedule_id": schedule_id,
-                "status": {"$ne": OperationStatus.EXECUTED.value}
-            })
+            # Use correct enum values
+            schedule = await self.db.get_scheduled_operation(
+                state=ToolOperationState.EXECUTING.value,  # Changed from OperationStatus
+                status={"$ne": OperationStatus.EXECUTED.value}
+            )
             
             if not schedule:
-                await self.db.update_schedule_status(
+                # All operations are complete
+                await self.db.update_schedule_state(
                     schedule_id=schedule_id,
-                    status=OperationStatus.COMPLETED.value
+                    state=OperationStatus.COMPLETED.value,
+                    reason="All operations completed"
                 )
                 logger.info(f"Schedule {schedule_id} completed")
 
@@ -208,3 +219,7 @@ class ScheduleService:
             except asyncio.CancelledError:
                 pass
         logger.info("Schedule service stopped")
+
+    def register_tool(self, tool_type: str, tool: SchedulableToolProtocol):
+        """Register a tool that can be scheduled"""
+        self.tool_registry[tool_type] = tool

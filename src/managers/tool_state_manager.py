@@ -28,27 +28,26 @@ class ToolStateManager:
         self.trigger_detector = TriggerDetector()  # Initialize the trigger detector
         logger.info("ToolStateManager initialized with database connection")
 
-        # Updated state transitions to allow COLLECTING -> APPROVING
+        # Define valid state transitions
         self.valid_transitions = {
             ToolOperationState.INACTIVE.value: [
                 ToolOperationState.COLLECTING.value
             ],
             ToolOperationState.COLLECTING.value: [
                 ToolOperationState.APPROVING.value,
-                ToolOperationState.ERROR.value,
-                ToolOperationState.CANCELLED.value
+                ToolOperationState.EXECUTING.value
             ],
             ToolOperationState.APPROVING.value: [
-                ToolOperationState.EXECUTING.value,  # For approved items
-                ToolOperationState.COLLECTING.value, # For items needing regeneration
-                ToolOperationState.ERROR.value,
+                ToolOperationState.EXECUTING.value,
                 ToolOperationState.CANCELLED.value
             ],
             ToolOperationState.EXECUTING.value: [
                 ToolOperationState.COMPLETED.value,
-                ToolOperationState.CANCELLED.value,
                 ToolOperationState.ERROR.value
-            ]
+            ],
+            ToolOperationState.COMPLETED.value: [],  # Terminal state
+            ToolOperationState.ERROR.value: [],      # Terminal state
+            ToolOperationState.CANCELLED.value: []   # Terminal state
         }
 
     async def start_operation(
@@ -231,28 +230,37 @@ class ToolStateManager:
         success: bool = True,
         api_response: Optional[Dict] = None
     ) -> bool:
-        """End tool operation and cleanup"""
+        """End tool operation with appropriate state/status based on operation type"""
         try:
-            # Get current operation
             operation = await self.get_operation(session_id)
             if not operation:
-                logger.warning(f"No active operation found for session {session_id}")
                 return False
 
-            tool_operation_id = str(operation["_id"])
-            is_scheduled = operation.get("metadata", {}).get("requires_scheduling", False)
-            schedule_id = operation.get("output_data", {}).get("schedule_id")
+            # Get operation characteristics
+            requires_approval = operation.get("metadata", {}).get("requires_approval", False)
+            requires_scheduling = operation.get("metadata", {}).get("requires_scheduling", False)
+            current_state = operation.get("state")
+            current_status = operation.get("status")
 
-            # Determine final state
-            final_state = ToolOperationState.COMPLETED.value if success else ToolOperationState.ERROR.value
-            
-            # Update operation state
-            update_result = await self.update_operation(
+            # Determine final states based on operation type and success
+            final_state = self._determine_final_state(
+                success=success,
+                current_state=current_state
+            )
+
+            final_status = self._determine_final_status(
+                success=success,
+                requires_scheduling=requires_scheduling,
+                current_status=current_status
+            )
+
+            # Update operation with final state/status
+            return await self.update_operation(
                 session_id=session_id,
-                tool_operation_id=tool_operation_id,
+                tool_operation_id=str(operation["_id"]),
                 state=final_state,
                 output_data={
-                    "status": OperationStatus.SCHEDULED.value if is_scheduled else OperationStatus.EXECUTED.value,
+                    "status": final_status,
                     "api_response": api_response
                 },
                 metadata={
@@ -261,22 +269,37 @@ class ToolStateManager:
                 }
             )
 
-            # For scheduled operations, ensure schedule is properly activated
-            if is_scheduled and success and schedule_id:
-                await self.db.update_schedule_state(
-                    schedule_id=schedule_id,
-                    state=ScheduleState.ACTIVE.value,
-                    metadata={
-                        "activation_time": datetime.now(UTC).isoformat(),
-                        "tool_operation_id": tool_operation_id
-                    }
-                )
-
-            return update_result
-
         except Exception as e:
             logger.error(f"Error ending operation: {e}")
             return False
+
+    def _determine_final_state(self, success: bool, current_state: str) -> str:
+        """Determine final ToolOperationState based on success and current state"""
+        if not success:
+            return ToolOperationState.ERROR.value
+            
+        if current_state == ToolOperationState.CANCELLED.value:
+            return ToolOperationState.CANCELLED.value
+            
+        return ToolOperationState.COMPLETED.value
+
+    def _determine_final_status(
+        self,
+        success: bool,
+        requires_scheduling: bool,
+        current_status: str
+    ) -> str:
+        """Determine final OperationStatus based on operation type and success"""
+        if not success:
+            return OperationStatus.FAILED.value
+            
+        if current_status == OperationStatus.REJECTED.value:
+            return OperationStatus.REJECTED.value
+            
+        if requires_scheduling:
+            return OperationStatus.SCHEDULED.value
+            
+        return OperationStatus.EXECUTED.value
 
     def _is_valid_transition(self, current_state: str, new_state: str) -> bool:
         """Check if state transition is valid"""
@@ -417,13 +440,33 @@ class ToolStateManager:
         try:
             operation = await self.get_operation_by_id(tool_operation_id)
             if not operation:
-                logger.error(f"No operation found for ID {tool_operation_id}")
                 return False
 
-            # Get all items if no updates provided
+            # Get operation characteristics
+            is_one_shot = not (
+                operation.get('metadata', {}).get('requires_approval', False) or 
+                operation.get('metadata', {}).get('requires_scheduling', False)
+            )
+            current_state = operation.get('state')
+
+            # For one-shot tools, transition directly to COMPLETED
+            if is_one_shot and current_state == ToolOperationState.COLLECTING.value:
+                new_state = ToolOperationState.COMPLETED.value
+                await self.db.tool_operations.update_one(
+                    {"_id": ObjectId(tool_operation_id)},
+                    {
+                        "$set": {
+                            "state": new_state,
+                            "status": OperationStatus.EXECUTED.value,
+                            "metadata.last_state_update": datetime.now(UTC).isoformat()
+                        }
+                    }
+                )
+                return True
+
+            # Regular state progression for non-one-shot tools
             items = item_updates or await self.get_operation_items(tool_operation_id)
             is_scheduled_operation = operation.get('metadata', {}).get('requires_scheduling', False)
-            current_state = operation.get('state')
 
             # Count items by state
             items_by_state = {

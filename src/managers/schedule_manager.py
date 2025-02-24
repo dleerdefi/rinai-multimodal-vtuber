@@ -10,6 +10,7 @@ from src.db.enums import OperationStatus, ToolOperationState, ScheduleState
 from src.managers.tool_state_manager import ToolStateManager
 from bson.objectid import ObjectId
 from enum import Enum
+from src.tools.base import ToolRegistry
 
 logger = logging.getLogger(__name__)
 
@@ -19,11 +20,13 @@ class SchedulableToolProtocol(Protocol):
 
 class ScheduleAction(Enum):
     """Actions that trigger schedule state transitions"""
-    ACTIVATE = "activate"
-    PAUSE = "pause"
-    RESUME = "resume"
-    CANCEL = "cancel"
-    ERROR = "error"
+    INITIALIZE = "initialize"     # PENDING -> PENDING
+    ACTIVATE = "activate"        # PENDING -> ACTIVATING -> ACTIVE
+    PAUSE = "pause"             # ACTIVE -> PAUSED
+    RESUME = "resume"           # PAUSED -> ACTIVE
+    CANCEL = "cancel"           # Any -> CANCELLED
+    ERROR = "error"             # Any -> ERROR
+    COMPLETE = "complete"        # EXECUTING -> COMPLETED
 
 class ScheduleManager:
     def __init__(self, 
@@ -33,15 +36,20 @@ class ScheduleManager:
         self.tool_state_manager = tool_state_manager
         self.db = db
         self.tool_registry = tool_registry
-        # Define valid state transitions
+        
+        # Define valid state transitions for Schedule
         self.state_transitions = {
+            (ScheduleState.PENDING, ScheduleAction.INITIALIZE): ScheduleState.PENDING,
             (ScheduleState.PENDING, ScheduleAction.ACTIVATE): ScheduleState.ACTIVATING,
-            (ScheduleState.ACTIVATING, ScheduleAction.ERROR): ScheduleState.ERROR,
+            (ScheduleState.ACTIVATING, ScheduleAction.ACTIVATE): ScheduleState.ACTIVE,
             (ScheduleState.ACTIVE, ScheduleAction.PAUSE): ScheduleState.PAUSED,
             (ScheduleState.PAUSED, ScheduleAction.RESUME): ScheduleState.ACTIVE,
-            (ScheduleState.PAUSED, ScheduleAction.CANCEL): ScheduleState.CANCELLED,
+            # Any state can transition to CANCELLED or ERROR
             (ScheduleState.ACTIVE, ScheduleAction.CANCEL): ScheduleState.CANCELLED,
-            (ScheduleState.ERROR, ScheduleAction.ACTIVATE): ScheduleState.ACTIVATING
+            (ScheduleState.PAUSED, ScheduleAction.CANCEL): ScheduleState.CANCELLED,
+            (ScheduleState.ACTIVE, ScheduleAction.ERROR): ScheduleState.ERROR,
+            (ScheduleState.ERROR, ScheduleAction.RESUME): ScheduleState.ACTIVE,
+            (ScheduleState.ACTIVE, ScheduleAction.COMPLETE): ScheduleState.COMPLETED
         }
 
     async def schedule_approved_items(
@@ -195,7 +203,7 @@ class ScheduleManager:
         content_type: str,
         session_id: Optional[str] = None
     ) -> str:
-        """Initialize a new schedule in PENDING state"""
+        """Initialize a new schedule in PENDING state with state tracking"""
         try:
             # Get operation to retrieve session_id if not provided
             if not session_id:
@@ -206,21 +214,32 @@ class ScheduleManager:
                 if not session_id:
                     raise ValueError(f"No session_id found for operation {tool_operation_id}")
 
-            # Use db_schema's create_scheduled_operation
+            # Create schedule using db_schema's method
             schedule_id = await self.db.create_scheduled_operation(
                 tool_operation_id=tool_operation_id,
                 content_type=content_type,
                 schedule_info=schedule_info
             )
 
-            # Update tool operation with schedule reference and info
+            # Track state transition
+            await self._transition_schedule_state(
+                schedule_id=schedule_id,
+                action=ScheduleAction.INITIALIZE,
+                reason="Schedule initialized with pending items",
+                metadata={
+                    "tool_operation_id": tool_operation_id,
+                    "content_type": content_type,
+                    "schedule_info": schedule_info
+                }
+            )
+
+            # Update tool operation with schedule reference
             await self.tool_state_manager.update_operation(
                 session_id=session_id,
                 tool_operation_id=tool_operation_id,
                 metadata={
                     "schedule_id": schedule_id,
-                    "schedule_state": ScheduleState.PENDING.value,
-                    "schedule_info": schedule_info
+                    "schedule_state": ScheduleState.PENDING.value
                 }
             )
 
@@ -233,130 +252,56 @@ class ScheduleManager:
     async def activate_schedule(
         self,
         tool_operation_id: str,
-        schedule_info: Dict,
-        content_type: str
+        schedule_id: str
     ) -> bool:
-        """Activate a schedule after items are approved"""
+        """Activate a schedule after items are ready for execution"""
         try:
-            # Get operation to retrieve schedule_id and session_id
-            operation = await self.tool_state_manager.get_operation_by_id(tool_operation_id)
-            if not operation:
-                logger.error(f"No operation found for ID {tool_operation_id}")
-                return False
+            # 1. Verify items are in EXECUTING state
+            items = await self.tool_state_manager.get_operation_items(
+                tool_operation_id=tool_operation_id,
+                state=ToolOperationState.EXECUTING.value,  # Items must be in EXECUTING state
+                status=[                                   # Status can be either:
+                    OperationStatus.APPROVED.value,        # - APPROVED (from approval flow)
+                    OperationStatus.PENDING.value          # - PENDING (from direct/one-shot flow)
+                ]
+            )
             
-            session_id = operation.get("session_id")
-            schedule_id = operation.get("metadata", {}).get("schedule_id")
-            
-            if not schedule_id:
-                logger.error(f"No schedule_id found for operation {tool_operation_id}")
+            if not items:
+                logger.error(f"No executable items found for operation {tool_operation_id}")
                 return False
 
-            # First update to ACTIVATING state
+            # 2. Update schedule state only
             await self.db.update_scheduled_operation(
                 schedule_id=schedule_id,
-                state=ScheduleState.ACTIVATING.value,
-                status=OperationStatus.PENDING.value,
-                metadata={
-                    "state_history": {
-                        "state": ScheduleState.ACTIVATING.value,
-                        "reason": "Items approved, activating schedule",
-                        "timestamp": datetime.now(UTC).isoformat()
-                    }
-                }
-            )
-
-            # Calculate scheduled times for items
-            items = await self.db.tool_items.find({
-                "tool_operation_id": tool_operation_id,
-                "status": OperationStatus.APPROVED.value
-            }).to_list(None)
-
-            interval_minutes = schedule_info.get("interval_minutes", 480)  # Default 8 hours
-            
-            # Start time should be at least 1 minute in the future
-            start_time = datetime.now(UTC) + timedelta(minutes=1)
-            
-            # Calculate all scheduled times first
-            scheduled_times = []
-            for i in range(len(items)):
-                scheduled_time = start_time + timedelta(minutes=i * interval_minutes)
-                scheduled_times.append(scheduled_time)
-            
-            # Verify all times are in the future
-            current_time = datetime.now(UTC)
-            if any(t <= current_time for t in scheduled_times):
-                time_shift = (current_time - min(scheduled_times)) + timedelta(minutes=1)
-                scheduled_times = [t + time_shift for t in scheduled_times]
-                start_time = start_time + time_shift
-
-            # Update each item with its scheduled time and execution metadata
-            for i, (item, scheduled_time) in enumerate(zip(items, scheduled_times)):
-                await self.db.tool_items.update_one(
-                    {"_id": item["_id"]},
-                    {
-                        "$set": {
-                            "status": OperationStatus.SCHEDULED.value,
-                            "state": ToolOperationState.EXECUTING.value,
-                            "metadata": {
-                                **item.get("metadata", {}),
-                                "scheduled_time": scheduled_time.isoformat(),
-                                "schedule_index": i,
-                                "interval_minutes": interval_minutes,
-                                "execution_status": "pending",
-                                "execution_attempts": 0,
-                                "max_retries": 3
-                            }
-                        }
-                    }
-                )
-
-            # Then update to ACTIVE state with execution metadata
-            schedule_result = await self.db.update_scheduled_operation(
-                schedule_id=schedule_id,
                 state=ScheduleState.ACTIVE.value,
-                status=OperationStatus.PENDING.value,
+                status=OperationStatus.SCHEDULED.value,
                 metadata={
                     "state_history": {
-                        "state": ScheduleState.ACTIVE.value,
-                        "reason": "Schedule activated and items scheduled for execution",
+                        "schedule_state": ScheduleState.ACTIVE.value,
+                        "reason": "Schedule activated for execution",
                         "timestamp": datetime.now(UTC).isoformat()
                     },
-                    "item_count": len(items),
-                    "interval_minutes": interval_minutes,
-                    "start_time": start_time.isoformat(),
-                    "scheduled_times": [t.isoformat() for t in scheduled_times],
                     "execution_status": {
                         "pending": len(items),
                         "completed": 0,
                         "failed": 0
-                    },
-                    "last_execution_check": datetime.now(UTC).isoformat()
-                }
-            )
-            
-            if not schedule_result:
-                logger.error(f"Failed to activate schedule {schedule_id}")
-                return False
-
-            # Update operation state to EXECUTING
-            await self.tool_state_manager.update_operation(
-                session_id=session_id,
-                tool_operation_id=tool_operation_id,
-                state=ToolOperationState.EXECUTING.value,
-                step="scheduling",
-                metadata={
-                    "schedule_state": ScheduleState.ACTIVE.value,
-                    "scheduled_items": len(items),
-                    "schedule_start": start_time.isoformat(),
-                    "execution_status": "active"
+                    }
                 }
             )
 
-            logger.info(f"Activated schedule {schedule_id} for operation {tool_operation_id}")
+            # 3. Update only item status (state remains EXECUTING)
+            await self.db.tool_items.update_many(
+                {
+                    "tool_operation_id": tool_operation_id,
+                    "_id": {"$in": [ObjectId(item["_id"]) for item in items]}
+                },
+                {"$set": {"status": OperationStatus.SCHEDULED.value}}
+            )
+
             return True
 
         except Exception as e:
-            logger.error(f"Error scheduling approved items: {e}")
+            logger.error(f"Error activating schedule: {e}")
             return False
 
     async def pause_schedule(self, schedule_id: str) -> bool:
@@ -452,27 +397,47 @@ class ScheduleManager:
             logger.error(f"Error in state transition: {e}")
             return False
 
-    async def check_schedule_completion(self, tool_operation_id: str) -> bool:
-        """Check if all scheduled items are executed"""
+    async def check_schedule_completion(self, schedule_id: str) -> bool:
+        """Check if all items in scheduled operation are completed"""
         try:
+            schedule = await self.db.get_scheduled_operation(schedule_id)
+            if not schedule:
+                return False
+
+            # Get all items for this schedule
             items = await self.db.tool_items.find({
-                "tool_operation_id": tool_operation_id
+                "schedule_id": schedule_id,
+                "state": ToolOperationState.COMPLETED.value  # Items should be in EXECUTING state
             }).to_list(None)
 
-            all_executed = all(
-                item["status"] == OperationStatus.EXECUTED.value
+            if not items:
+                logger.warning(f"No items found for schedule {schedule_id}")
+                return False
+
+            # Check if all items have completed their schedule
+            all_completed = all(
+                item.get("schedule_state") == ScheduleState.COMPLETED.value
                 for item in items
             )
 
-            if all_executed:
-                await self.tool_state_manager.update_operation_state(
-                    tool_operation_id=tool_operation_id,
+            if all_completed:
+                # Update schedule state to COMPLETED
+                await self._transition_schedule_state(
+                    schedule_id=schedule_id,
+                    action=ScheduleAction.COMPLETE,
+                    reason="All scheduled items completed execution",
                     metadata={
-                        "completion_time": datetime.now(UTC).isoformat()
+                        "completion_time": datetime.now(UTC).isoformat(),
+                        "total_items": len(items),
+                        "execution_summary": {
+                            "completed": len([i for i in items if i.get("schedule_state") == ScheduleState.COMPLETED.value]),
+                            "error": len([i for i in items if i.get("schedule_state") == ScheduleState.ERROR.value]),
+                            "cancelled": len([i for i in items if i.get("schedule_state") == ScheduleState.CANCELLED.value])
+                        }
                     }
                 )
 
-            return all_executed
+            return all_completed
 
         except Exception as e:
             logger.error(f"Error checking schedule completion: {e}")

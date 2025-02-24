@@ -41,7 +41,7 @@ class ApprovalManager:
         ApprovalState.AWAITING_INITIAL: ToolOperationState.APPROVING,
         ApprovalState.AWAITING_APPROVAL: ToolOperationState.APPROVING,
         ApprovalState.REGENERATING: ToolOperationState.COLLECTING,      # For rejected items
-        ApprovalState.APPROVAL_FINISHED: ToolOperationState.EXECUTING,  # For approved items
+        ApprovalState.APPROVAL_FINISHED: ToolOperationState.COMPLETED,  # For approved items
         ApprovalState.APPROVAL_CANCELLED: ToolOperationState.CANCELLED
     }
 
@@ -65,7 +65,6 @@ class ApprovalManager:
                 },
                 {"$set": {
                     "state": ToolOperationState.APPROVING.value,
-                    "status": OperationStatus.PENDING.value,
                     "metadata": {
                         "approval_started_at": datetime.now(UTC).isoformat()
                     }
@@ -220,7 +219,7 @@ class ApprovalManager:
     async def _update_rejected_items(self, tool_operation_id: str, regenerate_indices: List[int], items: List[Dict]):
         """Update rejected items to COMPLETED state"""
         rejected_ids = [items[idx]['_id'] for idx in regenerate_indices if 0 <= idx < len(items)]
-        logger.info(f"Updating {len(rejected_ids)} items to REJECTED/COMPLETED state")
+        logger.info(f"Updating {len(rejected_ids)} items to REJECTED/CANCELLED state")
         
         await self.db.tool_items.update_many(
             {
@@ -228,12 +227,12 @@ class ApprovalManager:
                 "_id": {"$in": rejected_ids}
             },
             {"$set": {
-                "state": ToolOperationState.COMPLETED.value,
+                "state": ToolOperationState.CANCELLED.value,
                 "status": OperationStatus.REJECTED.value,
                 "metadata.rejected_at": datetime.now(UTC).isoformat()
             }}
         )
-        logger.info(f"Successfully updated items {rejected_ids} to REJECTED/COMPLETED")
+        logger.info(f"Successfully updated items {rejected_ids} to REJECTED/CANCELLED")
 
     async def _handle_full_approval(
         self,
@@ -251,7 +250,7 @@ class ApprovalManager:
             if not operation:
                 raise ValueError(f"No operation found for ID {tool_operation_id}")
 
-            # 2. Update all current items to EXECUTING state
+            # 2. Update all current items to APPROVED state
             await self._update_approved_items(
                 tool_operation_id,
                 list(range(len(items))),  # All current items
@@ -264,24 +263,24 @@ class ApprovalManager:
             }).to_list(None)
             
             # Count items by state for metadata
-            executing_items = [i for i in all_items if i['state'] == ToolOperationState.EXECUTING.value]
+            approved_items = [i for i in all_items if i['status'] == OperationStatus.APPROVED.value]
             rejected_items = [i for i in all_items if i['status'] == OperationStatus.REJECTED.value]
             
-            logger.info(f"Operation summary - Executing: {len(executing_items)}, "
+            logger.info(f"Operation summary - Approved: {len(approved_items)}, "
                        f"Previously Rejected: {len(rejected_items)}")
 
             # 4. Update operation state with complete item tracking
             await self.tool_state_manager.update_operation(
                 session_id=session_id,
                 tool_operation_id=tool_operation_id,
-                state=ToolOperationState.EXECUTING.value,
+                state=ToolOperationState.COMPLETED.value,
                 metadata={
                     "approval_state": ApprovalState.APPROVAL_FINISHED.value,
                     "item_summary": {
                         "total_items_generated": len(all_items),
-                        "final_executing_count": len(executing_items),
+                        "final_approved_count": len(approved_items),
                         "total_rejected_count": len(rejected_items),
-                        "approved_item_ids": [str(i['_id']) for i in executing_items],
+                        "approved_item_ids": [str(i['_id']) for i in approved_items],
                         "rejected_item_ids": [str(i['_id']) for i in rejected_items],
                         "approval_completed_at": datetime.now(UTC).isoformat()
                     }
@@ -308,7 +307,7 @@ class ApprovalManager:
                 "approval_state": ApprovalState.APPROVAL_FINISHED.value,
                 "message": "Items approved and scheduled for execution",
                 "data": {
-                    "executing_items": executing_items,
+                    "approved_items": approved_items,
                     "rejected_items": rejected_items,
                     "scheduled": is_schedulable
                 }
@@ -348,13 +347,13 @@ class ApprovalManager:
 
             # Update approved items first
             if approved_indices:
-                logger.info(f"Updating {len(approved_indices)} items to EXECUTING state")
+                logger.info(f"Updating {len(approved_indices)} items to APPROVED status")
                 await self._update_approved_items(tool_operation_id, approved_indices, current_items)
                 approved_items = [current_items[idx] for idx in approved_indices if 0 <= idx < len(current_items)]
 
-            # Update rejected items - just mark them as COMPLETED/REJECTED
+            # Update rejected items - just mark them as CANCELLED/REJECTED
             if regenerate_indices:
-                logger.info(f"Updating {len(regenerate_indices)} items to COMPLETED state")
+                logger.info(f"Updating {len(regenerate_indices)} items to REJECTED status")
                 await self._update_rejected_items(tool_operation_id, regenerate_indices, current_items)
                 rejected_items = [current_items[idx] for idx in regenerate_indices if 0 <= idx < len(current_items)]
 
@@ -399,14 +398,14 @@ class ApprovalManager:
 
             logger.info(f"Marking {len(current_items)} items for regeneration")
 
-            # Mark all items as rejected and COMPLETED (not COLLECTING)
+            # Mark all items as rejected and cancelled (not COLLECTING)
             await self.db.tool_items.update_many(
                 {
                     "tool_operation_id": tool_operation_id,
                     "state": ToolOperationState.APPROVING.value
                 },
                 {"$set": {
-                    "state": ToolOperationState.COMPLETED.value,  # Changed from COLLECTING
+                    "state": ToolOperationState.CANCELLED.value,  # Changed from COLLECTING
                     "status": OperationStatus.REJECTED.value,
                     "metadata": {
                         "rejected_at": datetime.now(UTC).isoformat(),

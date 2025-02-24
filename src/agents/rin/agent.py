@@ -13,8 +13,8 @@ import sys
 import os
 import logging
 from pathlib import Path
-from typing import Dict, Optional, List, Any
-from datetime import datetime
+from typing import Dict, Optional, List, Any, Union
+from datetime import datetime, UTC
 import json
 
 # Configure logging
@@ -36,7 +36,7 @@ from src.tools.base import AgentDependencies
 from src.db.mongo_manager import MongoManager
 from src.services.schedule_service import ScheduleService
 from src.managers.agent_state_manager import AgentStateManager
-from src.db.db_schema import AgentState
+from src.db.enums import AgentState
 
 class RinAgent:
     def __init__(self, mongo_uri: str):
@@ -78,12 +78,8 @@ class RinAgent:
         # Initialize tool_state_manager with schedule service
         self.tool_state_manager = None  # Will be initialized in initialize()
         
-        # Initialize state manager
-        self.state_manager = AgentStateManager(
-            tool_state_manager=self.tool_state_manager,
-            orchestrator=self.orchestrator,
-            trigger_detector=self.trigger_detector
-        )
+        # Initialize state manager after other components
+        self.state_manager = None  # Will be initialized after tool_state_manager
         
     async def initialize(self):
         """Initialize async components."""
@@ -100,6 +96,13 @@ class RinAgent:
             self.tool_state_manager = ToolStateManager(
                 db=self.context_manager.db,
                 schedule_service=self.schedule_service
+            )
+            
+            # Now initialize state manager with proper dependencies
+            self.state_manager = AgentStateManager(
+                tool_state_manager=self.tool_state_manager,
+                orchestrator=self.orchestrator,
+                trigger_detector=self.trigger_detector
             )
             
             # Initialize GraphRAG with error handling
@@ -130,9 +133,9 @@ class RinAgent:
     async def process_message(self, message: str, author: str) -> Dict:
         """Process incoming message based on current state"""
         try:
-            result = await self.state_manager.handle_message(
+            result = await self.state_manager.handle_agent_state(
                 message=message,
-                session_id=self.current_session_id
+                session_id=self.session_id
             )
 
             if result.get("state") == "normal_chat":
@@ -153,154 +156,154 @@ class RinAgent:
         try:
             logger.info(f"[AGENT] Processing message for session {session_id}")
             
-            # 1. Check for active tool operation first
-            operation = await self.tool_state_manager.get_operation(session_id)
-            logger.info(f"[AGENT] Active operation check: {bool(operation)}")
-            
-            if operation and operation.get('state') not in [ToolOperationState.INACTIVE.value, ToolOperationState.CANCELLED.value]:
-                # Continue existing tool operation
-                logger.info("[AGENT] Continuing existing tool operation")
-                result = await self.orchestrator.process_command(
-                    command=message,
-                    deps=AgentDependencies(
-                        session_id=session_id,
-                        user_id=role,
-                        context={"operation": operation}
-                    )
-                )
-                
-                # Store tool interaction
-                await self.context_manager.store_interaction(
-                    session_id=session_id,
-                    user_message=message,
-                    assistant_response=result.response,
-                    interaction_type="tool_operation",
-                    metadata={
-                        'tool_operation': operation.get('tool_type'),
-                        'tool_step': operation.get('step'),
-                        'operation_status': result.data.get("status")
-                    }
-                )
-                
-                if result.data.get("status") in ["completed", "cancelled"]:
-                    # Tool operation finished - clean up and return to normal chat
-                    await self.tool_state_manager.end_operation(
-                        session_id=session_id,
-                        success=result.data.get("status") == "completed",
-                        api_response=result.data
-                    )
-                    self.state = AgentState.NORMAL_CHAT
-                return result.response
-
-            # 2. Initialize session if needed
+            # Initialize session if needed
             if session_id not in self.sessions:
-                logger.info("[CHECKPOINT 2] Loading/creating session")
+                await self.start_new_session(session_id)
+
+            # Let state manager handle the message first
+            try:
+                state_result = await self.state_manager.handle_agent_state(
+                    message=message,
+                    session_id=session_id
+                )
+                
+                if state_result.get("error"):
+                    logger.error(f"State manager error: {state_result['error']}")
+                    return "Gomen ne~ I had a little technical difficulty! (⌒_⌒;)"
+
+                # If we have a response from state manager, use it
+                if state_result.get("response"):
+                    # Store the interaction with state metadata
+                    await self._store_interaction(
+                        session_id=session_id,
+                        message=message,
+                        response=state_result["response"],
+                        metadata={
+                            'state': state_result.get('state'),
+                            'tool_type': state_result.get('tool_type')
+                        }
+                    )
+                    return state_result["response"]
+
+                # If no response but we're in TOOL_OPERATION, wait for tool result
+                if self.state_manager.current_state == AgentState.TOOL_OPERATION:
+                    logger.info("[AGENT] Waiting for tool operation result...")
+                    return "Processing your request..."
+
+            except Exception as e:
+                logger.error(f"Error in state management: {e}", exc_info=True)
+                return "Gomen ne~ I had a little technical difficulty! (⌒_⌒;)"
+
+            # Only proceed with normal chat if we're in NORMAL_CHAT state
+            if self.state_manager.current_state == AgentState.NORMAL_CHAT:
+                # Get conversation history
                 history = await self.context_manager.get_combined_context(session_id, message)
                 if history:
-                    logger.info(f"[CHECKPOINT 3] Found existing history with {len(history)} messages")
-                    self.sessions[session_id] = {
-                        'messages': history,
-                        'created_at': datetime.utcnow()
-                    }
-                else:
-                    logger.info("[CHECKPOINT 3] Creating new session")
-                    await self.start_new_session(session_id)
+                    self.sessions[session_id]['messages'] = history
 
-            logger.info("[CHECKPOINT 4] Preparing to generate response")
-
-            # 3. Check for special triggers
-            use_tools = self.trigger_detector.should_use_tools(message)
-            use_memory = self.trigger_detector.should_use_memory(message)
-            
-            # 4. Handle tool operations
-            if use_tools:
+            # Continue with normal chat flow only if no tool operation is active
+            if self.state_manager.current_state == AgentState.NORMAL_CHAT:
+                # 1. Check for tool triggers first
                 tool_type = self.trigger_detector.get_specific_tool_type(message)
                 if tool_type:
-                    # Start tool operation
-                    await self.tool_state_manager.start_operation(
-                        session_id=session_id,
-                        operation_type=tool_type,
-                        initial_data={"message": message}
-                    )
-                    
-                    # Process through orchestrator
-                    result = await self.orchestrator.process_command(
-                        command=message,
-                        deps=AgentDependencies(
+                    logger.info(f"[TOOLS] Detected tool type: {tool_type}")
+                    try:
+                        # Use handle_tool_operation instead of process_command
+                        result = await self.orchestrator.handle_tool_operation(
+                            message=message,
                             session_id=session_id,
-                            user_id=role,
-                            context={}
+                            tool_type=tool_type
                         )
-                    )
-                    
-                    # Handle scheduled operations
-                    if result.data.get("completion_type") == "scheduled":
-                        # Store interaction with schedule metadata
-                        await self.context_manager.store_interaction(
-                            session_id=session_id,
-                            user_message=message,
-                            assistant_response=result.response,
-                            interaction_type="scheduled_operation",
-                            metadata={
-                                'tool_type': tool_type,
-                                'schedule_id': result.data.get("schedule_id"),
-                                'status': "scheduled"
-                            }
-                        )
-                        return result.response
-                    
-                    # Continue with tool operation
-                    return await self.get_response(session_id, message, role, interaction_type)
+                        
+                        if result and isinstance(result, dict):
+                            response = result.get("response")
+                            if response:
+                                await self._store_interaction(
+                                    session_id=session_id,
+                                    message=message,
+                                    response=response,
+                                    metadata={
+                                        'tool_type': tool_type,
+                                        'operation_state': result.get('state')
+                                    }
+                                )
+                                return response
+                                
+                    except Exception as e:
+                        logger.error(f"[TOOLS] Error in tool operation: {e}")
+                        return "Gomen ne~ I had a little technical difficulty! (⌒_⌒;)"
+                
+                # 2. Check for memory/RAG triggers
+                use_memory = self.trigger_detector.should_use_memory(message)
+                rag_guidance = None
+                if use_memory and self.response_enricher:
+                    try:
+                        rag_guidance = await self.response_enricher.enrich_response(message)
+                        logger.info(f"Memory guidance received: {rag_guidance[:100]}...")
+                    except Exception as e:
+                        logger.warning(f"Memory lookup failed: {e}")
+                        rag_guidance = "Consider this a fresh conversation."
 
-            # 5. Get memory/RAG guidance if needed
-            rag_guidance = None
-            if use_memory and self.response_enricher:
-                try:
-                    rag_guidance = await self.response_enricher.enrich_response(message)
-                    logger.info(f"Memory guidance received: {rag_guidance[:100]}...")
-                except Exception as e:
-                    logger.warning(f"Memory lookup failed: {e}")
-                    rag_guidance = "Consider this a fresh conversation."
+                # 3. Generate final response
+                # If tool operation completed successfully, use its results
+                tool_results = result.get("tool_results") if result.get("status") == "completed" else None
+                
+                response = await self._generate_response(
+                    message=message,
+                    session=self.sessions[session_id],
+                    session_id=session_id,
+                    tool_results=tool_results,
+                    rag_guidance=rag_guidance,
+                    role=role,
+                    interaction_type=interaction_type
+                )
 
-            # Generate response with all available context
-            response = await self._generate_response(
-                message, 
-                self.sessions[session_id], 
-                session_id,
-                tool_results=None,
-                rag_guidance=rag_guidance,
-                role=role,
-                interaction_type=interaction_type
-            )
-            logger.info("[CHECKPOINT 5] Response generated")
-
-            # 7. Store interaction
-            message_pair = [
-                {'role': role, 'content': message, 'timestamp': datetime.utcnow()},
-                {'role': 'assistant', 'content': response, 'timestamp': datetime.utcnow()}
-            ]
-            
-            self.sessions[session_id]['messages'].extend(message_pair)
-            
-            # Store in database with proper metadata
-            await self.context_manager.store_interaction(
-                session_id=session_id,
-                user_message=message,
-                assistant_response=response,
-                interaction_type=interaction_type,
-                metadata={
-                    'formatted_for_tts': True,
-                    'role': role,
-                    'memory_used': bool(rag_guidance)
-                }
-            )
-            logger.info("[CHECKPOINT 6] Interaction stored")
-
-            return response
+                # 4. Store interaction
+                await self._store_interaction(session_id, message, response)
+                
+                return response
 
         except Exception as e:
             logger.error(f"[ERROR] Failed to generate response: {e}", exc_info=True)
-            return "Gomen ne~ I had a little technical difficulty! (⌒_⌒;)"
+            return "I encountered an error processing your request. Can I help you with something else?"
+
+    async def _store_interaction(self, session_id: str, message: str, response: Union[str, Dict], metadata: Optional[Dict] = None) -> None:
+        """Helper to store interactions consistently"""
+        try:
+            # Extract response text and metadata from dict response
+            if isinstance(response, dict):
+                response_text = response.get("response", "")
+                # Merge existing metadata with new metadata
+                combined_metadata = {
+                    'formatted_for_tts': True,
+                    'tool_type': response.get("tool_type"),
+                    'state': response.get("state"),
+                    'status': response.get("status")
+                }
+                if metadata:
+                    combined_metadata.update(metadata)
+            else:
+                response_text = response
+                combined_metadata = metadata if metadata else {'formatted_for_tts': True}
+
+            # Store in session
+            message_pair = [
+                {'role': 'user', 'content': message, 'timestamp': datetime.now(UTC)},
+                {'role': 'assistant', 'content': response_text, 'timestamp': datetime.now(UTC)}
+            ]
+            self.sessions[session_id]['messages'].extend(message_pair)
+
+            # Store in database via context manager
+            await self.context_manager.store_interaction(
+                session_id=session_id,
+                user_message=message,
+                assistant_response=response_text,
+                interaction_type="local_agent",
+                metadata=combined_metadata
+            )
+        except Exception as e:
+            logger.error(f"Failed to store interaction: {e}")
+            raise
 
     async def start_new_session(self, session_id: str) -> str:
         """Initialize a new chat session."""
@@ -342,9 +345,16 @@ class RinAgent:
         return cleaned.strip()
 
     # Response formatting and generation
-    async def _generate_response(self, message: str, session: Dict[str, Any], session_id: str, 
-                               tool_results: Optional[str] = None, rag_guidance: Optional[str] = None,
-                               role: str = "user", interaction_type: str = "local_agent") -> str:
+    async def _generate_response(
+        self, 
+        message: str, 
+        session: Dict[str, Any], 
+        session_id: str,
+        tool_results: Optional[str] = None, 
+        rag_guidance: Optional[str] = None,
+        role: str = "user", 
+        interaction_type: str = "local_agent"
+    ) -> str:
         try:
             # Get conversation context
             context = await self.context_manager.get_combined_context(session_id, message)

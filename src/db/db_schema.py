@@ -37,21 +37,6 @@ class ContextConfiguration(TypedDict):
     active_message_ids: List[str]   # IDs of messages in current context
     last_updated: datetime
 
-class ContentType(str, Enum):
-    """Types of content that can be produced"""
-    TWEET = "tweet"
-    CALENDAR = "calendar"
-    PROMPT = "system_prompt"
-    SEARCH_RESULT = "search_result"
-
-class ToolType(str, Enum):
-    """Types of tools available"""
-    TWEET_SCRAPER = "tweet_scraper"
-    PROMPT_ENGINEER = "prompt_engineer"
-    WEB_SEARCH = "web_search"
-    TWITTER = "twitter"
-    CALENDAR = "calendar"
-
 class WorkflowOperation(TypedDict):
     """Top-level workflow operation"""
     workflow_id: str
@@ -246,18 +231,6 @@ class TwitterCommandAnalysis(BaseModel):
 
 class TweetGenerationResponse(BaseModel):
     items: List[Dict[str, Any]]
-
-class AgentState(Enum):
-    NORMAL_CHAT = "normal_chat"
-    TOOL_OPERATION = "tool_operation"
-
-class AgentStateManager:
-    def __init__(self, tool_state_manager, orchestrator, trigger_detector):
-        self.current_state = AgentState.NORMAL_CHAT
-        self.tool_state_manager = tool_state_manager
-        self.orchestrator = orchestrator
-        self.trigger_detector = trigger_detector
-        self.active_operation = None
 
 class RinDB:
     def __init__(self, client: AsyncIOMotorClient):
@@ -605,29 +578,44 @@ class RinDB:
             logger.error(f"Error getting operation state: {e}")
             return None
 
-    async def get_scheduled_operation(self, tool_operation_id: str) -> Optional[Dict]:
-        """Get scheduled operation by ID"""
+    async def get_scheduled_operation(
+        self, 
+        tool_operation_id: Optional[str] = None,
+        status: Optional[str] = None,
+        state: Optional[str] = None
+    ) -> Optional[Dict]:
+        """Get scheduled operation by ID, status, or state"""
         try:
-            # First try direct ObjectId lookup
-            if ObjectId.is_valid(tool_operation_id):
-                schedule = await self.scheduled_operations.find_one({"_id": ObjectId(tool_operation_id)})
-                if schedule:
-                    logger.info(f"Found schedule by ObjectId: {tool_operation_id}")
-                    return schedule
-
-            # Try session_id or tool_operation_id lookup
-            schedule = await self.scheduled_operations.find_one({
-                "$or": [
-                    {"session_id": tool_operation_id},
-                    {"tool_operation_id": tool_operation_id}
-                ]
-            })
+            query = {}
+            
+            # Build query based on provided parameters
+            if tool_operation_id:
+                if ObjectId.is_valid(tool_operation_id):
+                    query["_id"] = ObjectId(tool_operation_id)
+                else:
+                    query["$or"] = [
+                        {"session_id": tool_operation_id},
+                        {"tool_operation_id": tool_operation_id}
+                    ]
+            
+            if status:
+                query["status"] = status
+                
+            if state:
+                query["state"] = state
+                
+            # Execute query
+            schedule = await self.scheduled_operations.find_one(query)
             
             if schedule:
-                logger.info(f"Found schedule by session/operation ID: {tool_operation_id}")
+                if tool_operation_id:
+                    if ObjectId.is_valid(tool_operation_id) and str(schedule['_id']) == tool_operation_id:
+                        logger.info(f"Found schedule by ObjectId: {tool_operation_id}")
+                    else:
+                        logger.info(f"Found schedule by session/operation ID: {tool_operation_id}")
                 return schedule
             
-            logger.warning(f"No schedule found for ID: {tool_operation_id}")
+            logger.warning(f"No schedule found for query: {query}")
             return None
 
         except Exception as e:

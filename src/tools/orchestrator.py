@@ -18,16 +18,12 @@ from src.tools.base import (
     WeatherToolParameters,
     CryptoToolParameters,
     SearchToolParameters,
-    CalendarToolParameters
+    CalendarToolParameters,
+    ToolRegistry
 )
 
-# Tool imports
-from src.tools.crypto_data import CryptoTool
+# Tool imports - only import TwitterTool for testing
 from src.tools.post_tweets import TwitterTool
-from src.tools.perplexity_search import PerplexityTool
-from src.tools.time_tools import TimeTool
-from src.tools.weather_tools import WeatherTool
-from src.tools.calendar_tool import CalendarTool
 
 # Client imports
 from src.clients.coingecko_client import CoinGeckoClient
@@ -42,6 +38,7 @@ from src.services.schedule_service import ScheduleService
 from src.managers.tool_state_manager import ToolStateManager, ToolOperationState
 from src.db.mongo_manager import MongoManager
 from src.managers.schedule_manager import ScheduleManager
+from src.managers.approval_manager import ApprovalManager
 
 # Utility imports
 from src.utils.trigger_detector import TriggerDetector
@@ -58,167 +55,128 @@ class Orchestrator:
     
     def __init__(self, deps: Optional[AgentDependencies] = None):
         """Initialize orchestrator with tools and dependencies"""
-        self.deps = deps
+        self.deps = deps or AgentDependencies(session_id="default")
         self.tools = {}
+        self.schedule_service = None  # Initialize as None
+        
+        # Initialize core services first
+        self.llm_service = LLMService({
+            "model_type": ModelType.GROQ_LLAMA_3_3_70B
+        })
+        self.trigger_detector = TriggerDetector()
         
         # Get database instance
         db = MongoManager.get_db()
         if not db:
-            raise ValueError("Database not initialized")
+            logger.warning("MongoDB not initialized, attempting to initialize...")
+            asyncio.create_task(MongoManager.initialize(os.getenv('MONGO_URI')))
+            db = MongoManager.get_db()
+            if not db:
+                raise ValueError("Failed to initialize MongoDB")
             
-        # Properly initialize ToolStateManager with db
+        # Initialize managers in correct order
         self.tool_state_manager = ToolStateManager(db=db)
-        self.trigger_detector = TriggerDetector()
         
-        # Initialize LLM service
-        self.llm_service = LLMService({
-            "model_type": ModelType.GROQ_LLAMA_3_3_70B
-        })
-        
-        # Initialize services
-        self.schedule_service = ScheduleService(
-            mongo_uri=os.getenv("MONGO_URI"),
-            orchestrator=self
-        )
-        
-        # Initialize schedule manager before tools
+        # Initialize schedule manager before approval manager
         self.schedule_manager = ScheduleManager(
             tool_state_manager=self.tool_state_manager,
             db=db,
-            tool_registry={}  # Will be populated during registration
+            tool_registry={}  # Will be populated during tool registration
         )
         
-        # Initialize tools with their dependencies
-        self.crypto_tool = CryptoTool(self._init_coingecko())
-        self.perplexity_tool = PerplexityTool(self._init_perplexity())
-        self.twitter_tool = TwitterTool(
+        # Initialize approval manager with schedule_manager
+        self.approval_manager = ApprovalManager(
             tool_state_manager=self.tool_state_manager,
-            llm_service=self.llm_service,
-            deps=self.deps,
-            schedule_manager=self.schedule_manager  # Add schedule_manager
+            schedule_manager=self.schedule_manager,
+            db=db,
+            llm_service=self.llm_service
         )
         
-        calendar_client = self._init_calendar()
-        self.calendar_tool = CalendarTool(calendar_client=calendar_client)
+        # Register TwitterTool last after all managers are initialized
+        self._register_twitter_tool()
+
+    def _register_twitter_tool(self):
+        """Register only TwitterTool for testing"""
+        try:
+            # Get registry requirements from TwitterTool
+            registry = TwitterTool.registry
+
+            # Initialize tool with just deps
+            tool = TwitterTool(deps=AgentDependencies(session_id="test_session"))
+            
+            # Inject required services based on registry
+            tool.inject_dependencies(
+                tool_state_manager=self.tool_state_manager,
+                llm_service=self.llm_service,
+                approval_manager=self.approval_manager,
+                schedule_manager=self.schedule_manager
+            )
+
+            # Register tool
+            self.tools[registry.tool_type.value] = tool
+            logger.info(f"Successfully registered TwitterTool")
+            
+        except Exception as e:
+            logger.error(f"Failed to register TwitterTool: {e}")
+            raise
+
+    def register_tool(self, tool: BaseTool):
+        """Enhanced tool registration"""
+        self.tools[tool.name] = tool
         
-        self.time_tool = TimeTool()
-        self.weather_tool = WeatherTool()
-        
-        # Register tools properly using BaseTool interface
-        self.register_tool(self.crypto_tool)
-        self.register_tool(self.twitter_tool)
-        self.register_tool(self.perplexity_tool)
-        self.register_tool(self.calendar_tool)
-        self.register_tool(self.time_tool)
-        self.register_tool(self.weather_tool)
-        
+        # Use tool's registry directly for schedule manager registration
+        if tool.registry.requires_scheduling:
+            self.schedule_manager.tool_registry[tool.registry.content_type.value] = tool
+            logger.info(f"Registered schedulable tool: {tool.name} for content type: {tool.registry.content_type.value}")
+
+    def set_schedule_service(self, schedule_service):
+        """Set the schedule service instance"""
+        self.schedule_service = schedule_service
+
     async def initialize(self):
         """Initialize async components"""
-        # Start schedule service
-        await self.schedule_service.start()
+        # Initialize tools if any
+        for tool in self.tools.values():
+            if hasattr(tool, 'initialize'):
+                await tool.initialize()
         
-        # Initialize tools that support async initialization
-        if self.crypto_tool:
-            if hasattr(self.crypto_tool, 'initialize'):
-                await self.crypto_tool.initialize()
-            
-        if self.perplexity_tool:
-            if hasattr(self.perplexity_tool, 'initialize'):
-                await self.perplexity_tool.initialize()
-        
-        if self.calendar_tool:
-            if hasattr(self.calendar_tool, 'initialize'):
-                await self.calendar_tool.initialize()
-        
+        # Start schedule service if it exists
+        if self.schedule_service:
+            await self.schedule_service.start()
+
     async def cleanup(self):
         """Cleanup async resources"""
         # Stop schedule service
         await self.schedule_service.stop()
         
-        # Cleanup specific tools
-        if self.crypto_tool:
-            if hasattr(self.crypto_tool, 'cleanup'):
-                await self.crypto_tool.cleanup()
-            
-        if self.perplexity_tool:
-            if hasattr(self.perplexity_tool, 'cleanup'):
-                await self.perplexity_tool.cleanup()
-                
-        if self.calendar_tool:
-            if hasattr(self.calendar_tool, 'cleanup'):
-                await self.calendar_tool.cleanup()
-        
+        # Cleanup all tools
         for tool in self.tools.values():
             if hasattr(tool, 'cleanup'):
                 await tool.cleanup()
-        
-    async def process_command(self, command: str, deps: Optional[AgentDependencies] = None) -> AgentResult:
-        """Process command while maintaining tool state"""
+
+    async def process_command(self, command: str, deps: AgentDependencies) -> AgentResult:
         try:
-            # 1. Get current operation state
-            operation = None
-            if deps and deps.session_id:
-                operation = await self.tool_state_manager.get_operation_state(deps.session_id)
-                logger.info(f"[ORCHESTRATOR] Current operation: {operation}")
-
-            # 2. Resolve tool (either from existing operation or new command)
-            tool = None
-            if operation:
-                tool = self.tools.get(operation.get("tool_type"))
-                if tool:
-                    tool.deps = deps
-                    tool.deps.context = {
-                        "operation": operation,
-                        "step": operation.get("step"),
-                        "schedule_id": operation.get("output_data", {}).get("schedule_id")
-                    }
-            else:
-                tool_type = self.trigger_detector.get_specific_tool_type(command)
-                tool = self.tools.get(tool_type)
-
-            if not tool:
-                return AgentResult(
-                    response="I'm not sure how to handle that request.",
-                    data={"status": "error"}
-                )
-
-            # 3. Execute tool
+            # Get current operation state
+            operation = await self.tool_state_manager.get_operation_state(deps.session_id)
+            
+            # Resolve and execute appropriate tool
+            tool = self.resolve_tool(operation, command)
             result = await tool.run(command)
-
-            # 4. Handle scheduled operations
-            if result.get("status") == "scheduled":
-                return AgentResult(
-                    response=result.get("response"),
-                    data={
-                        "tool_type": tool.name,
-                        "status": "completed",
-                        "completion_type": "scheduled",
-                        "schedule_id": result.get("data", {}).get("schedule_id")
-                    }
-                )
-
-            # 5. Process normal result based on status
-            status = result.get("status")
-            if status in ["completed", "cancelled", "error"]:
-                return AgentResult(
-                    response=result.get("response"),
-                    data={
-                        "tool_type": tool.name,
-                        "status": status,
-                        "completion_type": result.get("data", {}).get("completion_type"),
-                        "final_status": result.get("data", {}).get("final_status")
-                    }
+            
+            # Handle state transitions
+            if result.get("status") in ["completed", "cancelled", "error"]:
+                await self.tool_state_manager.end_operation(
+                    session_id=deps.session_id,
+                    success=result.get("status") == "completed"
                 )
             
-            # 6. Return standardized response for ongoing operations
             return AgentResult(
                 response=result.get("response"),
                 data={
+                    "state": operation.get("state"),
+                    "status": result.get("status"),
                     "tool_type": tool.name,
-                    "operation_state": operation.get("state") if operation else None,
-                    "operation_step": operation.get("step") if operation else None,
-                    "status": status,
-                    "requires_input": True
+                    "requires_input": result.get("requires_input", False)
                 }
             )
 
@@ -228,50 +186,6 @@ class Orchestrator:
                 response="I encountered an error processing your request.",
                 data={"status": "error", "error": str(e)}
             )
-
-    def register_tool(self, tool: BaseTool):
-        """Enhanced tool registration"""
-        self.tools[tool.name] = tool
-        
-        # If tool has content_type, register it with schedule_manager
-        if hasattr(tool, 'content_type') and tool.content_type:
-            self.schedule_manager.tool_registry[tool.content_type.value] = tool
-            logger.info(f"Registered schedulable tool: {tool.name} for content type: {tool.content_type.value}")
-
-    def _init_coingecko(self) -> Optional[CoinGeckoClient]:
-        """Initialize CoinGecko client if configured"""
-        try:
-            api_key = os.getenv("COINGECKO_API_KEY")
-            if not api_key:
-                logger.warning("CoinGecko API key not found in environment variables")
-                return None
-            
-            return CoinGeckoClient(api_key)
-        except Exception as e:
-            logger.warning(f"Failed to initialize CoinGecko client: {e}")
-            return None
-
-    def _init_perplexity(self) -> Optional[PerplexityClient]:
-        """Initialize Perplexity client if configured"""
-        try:
-            api_key = os.getenv("PERPLEXITY_API_KEY")
-            if not api_key:
-                logger.warning("Perplexity API key not found in environment variables")
-                return None
-            
-            return PerplexityClient(api_key)
-        except Exception as e:
-            logger.warning(f"Failed to initialize Perplexity client: {e}")
-            return None
-
-    def _init_calendar(self) -> Optional[GoogleCalendarClient]:
-        """Initialize Google Calendar client if configured"""
-        try:
-            calendar_client = GoogleCalendarClient()
-            return calendar_client
-        except Exception as e:
-            logger.warning(f"Failed to initialize Google Calendar client: {e}")
-            return None
 
     def _is_exit_command(self, command: str) -> bool:
         """Check if command is a global exit command"""
@@ -302,3 +216,219 @@ class Orchestrator:
             **clients,
             **managers
         )
+
+    async def handle_tool_operation(self, message: str, session_id: str, tool_type: Optional[str] = None) -> Dict:
+        try:
+            # Validate tool_type against enum
+            if tool_type and tool_type not in [t.value for t in ToolType]:
+                raise ValueError(f"Invalid tool_type: {tool_type}")
+            
+            # Get or create operation
+            operation = await self.tool_state_manager.get_operation(session_id)
+            
+            if not operation:
+                # Start new operation with validated tool_type
+                operation = await self.tool_state_manager.start_operation(
+                    session_id=session_id,
+                    operation_type=tool_type,
+                    initial_data={
+                        "command": message,
+                        "tool_type": tool_type  # Explicitly include in initial_data
+                    }
+                )
+                
+                # Analyze command
+                tool = self.tools.get(tool_type)
+                command_analysis = await tool.analyze_command(message)
+                requires_approval = command_analysis.get("requires_approval", False)
+                requires_scheduling = command_analysis.get("requires_scheduling", False)
+                
+                # Move to EXECUTING if no approval needed
+                if not requires_approval:
+                    await self.tool_state_manager.update_operation(
+                        operation_id=str(operation['_id']),
+                        state=ToolOperationState.EXECUTING.value,
+                        status=OperationStatus.PENDING.value
+                    )
+                    
+                    if requires_scheduling:
+                        result = await self._handle_scheduled_operation(operation, message)
+                    else:
+                        # One-shot immediate execution
+                        result = await tool.run(message)
+                        await self.tool_state_manager.end_operation(
+                            session_id=session_id,
+                            success=True,
+                            api_response=result
+                        )
+                    
+                    # Update operation with tool metadata
+                    await self.tool_state_manager.update_operation(
+                        session_id=session_id,
+                        tool_operation_id=str(operation['_id']),
+                        metadata={
+                            "tool_type": tool_type,
+                            "content_type": tool.registry.content_type.value
+                        }
+                    )
+                    
+                    return result
+
+                else:
+                    # Move to approval flow
+                    return await self._handle_approval_flow(operation, message)
+
+            # Handle ongoing operations
+            return await self._handle_ongoing_operation(operation, message)
+
+        except Exception as e:
+            logger.error(f"Error in handle_tool_operation: {e}")
+            raise
+
+    async def _handle_scheduled_operation(self, operation: Dict, message: str) -> Dict:
+        """Initialize and activate a schedule for operation"""
+        try:
+            # 1. Initialize schedule if not exists
+            schedule_id = operation.get('metadata', {}).get('schedule_id')
+            if not schedule_id:
+                schedule_id = await self.schedule_manager.initialize_schedule(
+                    tool_operation_id=str(operation['_id']),
+                    schedule_info=operation.get('metadata', {}).get('schedule_params', {}),
+                    content_type=operation.get('content_type'),
+                    session_id=operation['session_id']
+                )
+                if not schedule_id:
+                    raise ValueError("Failed to initialize schedule")
+
+            # 2. Activate schedule (moves items to SCHEDULED status)
+            success = await self.schedule_manager.activate_schedule(
+                tool_operation_id=str(operation['_id']),
+                schedule_id=schedule_id
+            )
+
+            if success:
+                # 3. End operation (ToolOperation is COMPLETED, items remain EXECUTING/SCHEDULED)
+                await self.tool_state_manager.end_operation(
+                    session_id=operation['session_id'],
+                    tool_operation_id=str(operation['_id']),
+                    success=True,
+                    api_response={"message": "Operation scheduled successfully"},
+                    metadata={
+                        "schedule_id": schedule_id,
+                        "requires_scheduling": True
+                    }
+                )
+                return {
+                    "success": True, 
+                    "response": "Operation scheduled successfully",
+                    "state": ToolOperationState.COMPLETED.value,
+                    "status": OperationStatus.SCHEDULED.value
+                }
+
+            return {"success": False, "response": "Failed to schedule operation"}
+
+        except Exception as e:
+            logger.error(f"Error in _handle_scheduled_operation: {e}")
+            return {"success": False, "response": str(e)}
+
+    async def _handle_approval_flow(self, operation: Dict, message: str) -> Dict:
+        """Handle operations requiring approval"""
+        try:
+            # 1. Start approval flow
+            result = await self.approval_manager.start_approval_flow(
+                session_id=operation['session_id'],
+                tool_operation_id=str(operation['_id']),
+                items=operation.get('items', []),
+                message=message
+            )
+
+            # 2. After approval, check scheduling needs
+            if result.get('approval_state') == ApprovalState.APPROVAL_FINISHED.value:
+                requires_scheduling = operation.get('metadata', {}).get('requires_scheduling', False)
+                
+                if requires_scheduling:
+                    # Handle scheduling for approved items
+                    schedule_result = await self._handle_scheduled_operation(operation, message)
+                    return schedule_result
+                else:
+                    # Execute approved items immediately
+                    execution_result = await tool.execute_approved_items(operation)
+                    await self.tool_state_manager.end_operation(
+                        session_id=operation['session_id'],
+                        tool_operation_id=str(operation['_id']),
+                        success=True,
+                        api_response=execution_result
+                    )
+                    return execution_result
+
+            # 3. Return approval flow result for other states
+            return result
+
+        except Exception as e:
+            logger.error(f"Error in approval flow: {e}")
+            raise
+
+    async def _handle_ongoing_operation(self, operation: Dict, message: str) -> Dict:
+        """Handle ongoing operations based on current state"""
+        try:
+            current_state = operation.get('state')
+            tool_type = operation.get('tool_type')
+            tool = self.tools.get(tool_type)
+
+            if current_state == ToolOperationState.COLLECTING.value:
+                # Initial content generation
+                return await tool.run(message)
+            
+            elif current_state == ToolOperationState.APPROVING.value:
+                # Get current items for approval
+                current_items = await self.db.tool_items.find({
+                    "tool_operation_id": str(operation['_id']),
+                    "state": ToolOperationState.APPROVING.value
+                }).to_list(None)
+
+                # Handle approval through ApprovalManager
+                result = await self.approval_manager.process_approval_response(
+                    message=message,
+                    session_id=operation['session_id'],
+                    content_type=operation.get('metadata', {}).get('content_type'),
+                    tool_operation_id=str(operation['_id']),
+                    handlers={
+                        ApprovalAction.PARTIAL_APPROVAL.value: tool._regenerate_rejected_tweets,
+                        ApprovalAction.REGENERATE_ALL.value: tool._regenerate_rejected_tweets,
+                        ApprovalAction.FULL_APPROVAL.value: lambda tool_operation_id, session_id, analysis, **kwargs:
+                            self.approval_manager._handle_full_approval(
+                                tool_operation_id=tool_operation_id,
+                                session_id=session_id,
+                                items=current_items,
+                                analysis=analysis
+                            ),
+                        ApprovalAction.EXIT.value: self.approval_manager.handle_exit
+                    }
+                )
+
+                # Handle regeneration results
+                if result.get("items"):
+                    return await self.approval_manager.start_approval_flow(
+                        session_id=operation['session_id'],
+                        tool_operation_id=str(operation['_id']),
+                        items=result["items"]
+                    )
+
+                return result
+
+            # Handle terminal states
+            elif current_state in [ToolOperationState.COMPLETED.value, 
+                                 ToolOperationState.ERROR.value,
+                                 ToolOperationState.CANCELLED.value]:
+                logger.info(f"Operation in terminal state: {current_state}")
+                return {
+                    "response": "This operation has already been completed or cancelled.",
+                    "state": current_state,
+                    "status": current_status
+                }
+
+            raise ValueError(f"Unexpected state/status combination: {current_state}/{current_status}")
+
+        except Exception as e:
+            logger.error(f"Error in _handle_ongoing_operation: {e}")
+            raise

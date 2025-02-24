@@ -38,58 +38,61 @@ from src.managers.schedule_manager import ScheduleManager
 logger = logging.getLogger(__name__)
 
 class TwitterTool(BaseTool):
+    """Tool for posting and managing tweets"""
+    
+    # Static tool configuration
     name = "twitter"
-    description = "Posts and manages tweets"
+    description = "Post and schedule tweets"
     version = "1.0"
+    
+    # Tool registry configuration
     registry = ToolRegistry(
         content_type=ContentType.TWEET,
         tool_type=ToolType.TWITTER,
         requires_approval=True,
         requires_scheduling=True,
         required_clients=["twitter_client"],
-        required_managers=[
-            "tool_state_manager",
-            "approval_manager",
-            "schedule_manager"
-        ]
+        required_managers=["tool_state_manager", "approval_manager", "schedule_manager"]
     )
 
-    def __init__(self, 
-                 deps: Optional[AgentDependencies] = None, 
-                 tool_state_manager: Optional[ToolStateManager] = None,
-                 llm_service: Optional[LLMService] = None,
-                 approval_manager: Optional[ApprovalManager] = None,
-                 schedule_manager: Optional[ScheduleManager] = None):
-        """Initialize tweet tool with dependencies and services"""
+    def __init__(self, deps: Optional[AgentDependencies] = None):
+        """Initialize tweet tool with dependencies
+        
+        Args:
+            deps: Optional AgentDependencies instance. If not provided, 
+                 dependencies will be injected by the orchestrator.
+        """
         super().__init__()
         self.deps = deps or AgentDependencies()
-        self.tool_state_manager = tool_state_manager
-        self.llm_service = llm_service or LLMService()
-        self.approval_manager = approval_manager or ApprovalManager(
-            tool_state_manager=tool_state_manager,
-            db=tool_state_manager.db if tool_state_manager else None,
-            llm_service=llm_service
-        )
-        self.db = tool_state_manager.db if tool_state_manager else None
-        self.schedule_manager = schedule_manager or ScheduleManager(
-            tool_state_manager=tool_state_manager,
-            db=self.db,
-            tool_registry={ContentType.TWEET.value: self}
-        )
+        
+        # Services will be injected by orchestrator based on registry requirements
+        self.tool_state_manager = None
+        self.llm_service = None
+        self.approval_manager = None
+        self.schedule_manager = None
+        self.db = None
+
+    def inject_dependencies(self, **services):
+        """Inject required services - called by orchestrator during registration"""
+        self.tool_state_manager = services.get("tool_state_manager")
+        self.llm_service = services.get("llm_service")
+        self.approval_manager = services.get("approval_manager")
+        self.schedule_manager = services.get("schedule_manager")
+        self.db = self.tool_state_manager.db if self.tool_state_manager else None
 
     def can_handle(self, input_data: Any) -> bool:
         """Check if input can be handled by tweet tool"""
         return isinstance(input_data, str)  # Basic type check only
 
     async def run(self, input_data: str) -> Dict:
-        """Run the tweet tool"""
+        """Run the tweet tool - handles only initial content generation"""
         try:
             operation = await self.tool_state_manager.get_operation(self.deps.session_id)
             
             if not operation or operation.get('state') == ToolOperationState.COMPLETED.value:
                 # Initial tweet generation flow
-                command_info = await self._analyze_twitter_command(input_data)
-                generation_result = await self._generate_tweets(
+                command_info = await self._analyze_command(input_data)
+                generation_result = await self._generate_content(
                     topic=command_info["topic"],
                     count=command_info["item_count"],
                     schedule_id=command_info["schedule_id"],
@@ -101,54 +104,20 @@ class TwitterTool(BaseTool):
                     items=generation_result["items"]
                 )
             else:
-                # Get current items for the operation
-                current_items = await self.db.tool_items.find({
-                    "tool_operation_id": str(operation['_id']),
-                    "state": ToolOperationState.APPROVING.value
-                }).to_list(None)
-
-                # Handle approval response through ApprovalManager
-                result = await self.approval_manager.process_approval_response(
-                    message=input_data,
-                    session_id=self.deps.session_id,
-                    content_type=ContentType.TWEET.value,
-                    tool_operation_id=str(operation['_id']),
-                    handlers={
-                        ApprovalAction.PARTIAL_APPROVAL.value: self._regenerate_rejected_tweets,
-                        ApprovalAction.REGENERATE_ALL.value: self._regenerate_rejected_tweets,
-                        ApprovalAction.FULL_APPROVAL.value: lambda tool_operation_id, session_id, analysis, **kwargs:
-                            self.approval_manager._handle_full_approval(
-                                tool_operation_id=tool_operation_id,
-                                session_id=session_id,
-                                items=current_items,  # Pass the current items
-                                analysis=analysis
-                            ),
-                        ApprovalAction.EXIT.value: self.approval_manager.handle_exit
-                    }
-                )
-
-                # If regeneration happened, start new approval flow with the generated items
-                if result.get("items"):  # Check for items from _regenerate_rejected_tweets
-                    return await self.approval_manager.start_approval_flow(
-                        session_id=self.deps.session_id,
-                        tool_operation_id=str(operation['_id']),
-                        items=result["items"],
-                        analysis=result.get("analysis")
-                    )
-
-                return result
+                # Let orchestrator handle ongoing operations
+                raise ValueError("Operation already in progress - should be handled by orchestrator")
 
         except Exception as e:
             logger.error(f"Error in tweet tool: {e}", exc_info=True)
             return self.approval_manager.analyzer.create_error_response(str(e))
 
-    async def _analyze_twitter_command(self, command: str) -> Dict:
+    async def _analyze_command(self, command: str) -> Dict:
         """Analyze command and setup initial schedule"""
         try:
             logger.info(f"Starting command analysis for: {command}")
             
             # Start operation through manager with registry settings
-            operation = await self.tool_state_manager.start_operation(
+            operation = await self.tool_state_manager.update_operation(
                 session_id=self.deps.session_id,
                 operation_type=ToolType.TWITTER.value,
                 initial_data={
@@ -181,6 +150,7 @@ Available Twitter actions:
    - interval_minutes: minutes between tweets (if spreading)
    - start_time: when to start posting (ISO format, if specific time)
    - approval_required: true
+   - schedule_required: true
 
 Instructions:
 - Return ONLY valid JSON matching the example format
@@ -200,7 +170,8 @@ Example response format:
             "schedule_type": "one_time",
             "schedule_time": "spread_24h",
             "interval_minutes": 288,  # Calculated for 5 tweets over 24h
-            "approval_required": true
+            "approval_required": true,
+            "schedule_required": true
         }},
         "priority": 1
     }}],
@@ -295,7 +266,7 @@ Example response format:
             logger.error(f"Error in Twitter command analysis: {e}", exc_info=True)
             raise
 
-    async def _generate_tweets(self, topic: str, count: int, schedule_id: str = None, tool_operation_id: str = None) -> Dict:
+    async def _generate_content(self, topic: str, count: int, schedule_id: str = None, tool_operation_id: str = None) -> Dict:
         """Generate tweet content and save as tool items"""
         try:
             logger.info(f"Starting tweet generation: {count} tweets about {topic}")
@@ -536,7 +507,7 @@ Format the response as JSON:
             logger.info(f"Regenerating {regenerate_count} tweets about topic: {topic}")
 
             # Generate new tweet content - _generate_tweets handles state management
-            return await self._generate_tweets(
+            return await self._generate_content(
                 topic=topic, 
                 count=regenerate_count, 
                 schedule_id=operation.get("input_data", {}).get("schedule_id"), 

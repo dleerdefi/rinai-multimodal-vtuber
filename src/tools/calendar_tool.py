@@ -13,14 +13,37 @@ from src.clients.google_calendar_client import GoogleCalendarClient
 logger = logging.getLogger(__name__)
 
 class CalendarTool(BaseTool):
-    """Tool for handling calendar operations"""
+    name = "calendar"
+    description = "Tool for accessing and managing calendar events"
+    version = "1.0"
+    registry = ToolRegistry(
+        content_type=ContentType.CALENDAR,
+        tool_type=ToolType.CALENDAR,
+        requires_approval=True,
+        requires_scheduling=True,
+        required_clients=["google_calendar_client"],
+        required_managers=[
+            "tool_state_manager",
+            "approval_manager",
+            "schedule_manager"
+        ]
+    )
     
-    def __init__(self, calendar_client: Optional[GoogleCalendarClient] = None):
+    def __init__(self, 
+                 calendar_client: Optional[GoogleCalendarClient] = None,
+                 tool_state_manager: Optional[ToolStateManager] = None,
+                 llm_service: Optional[LLMService] = None,
+                 approval_manager: Optional[ApprovalManager] = None,
+                 schedule_manager: Optional[ScheduleManager] = None):
+        """Initialize calendar tool with dependencies and services"""
         super().__init__()
-        self.name = "calendar_tool"
-        self.description = "Tool for accessing and managing calendar events"
-        self.version = "1.0.0"
-        self.calendar_client = calendar_client
+        self.deps = deps or AgentDependencies()
+        self.tool_state_manager = tool_state_manager
+        self.llm_service = llm_service
+        self.approval_manager = approval_manager
+        self.schedule_manager = schedule_manager
+        self.db = tool_state_manager.db if tool_state_manager else None
+        self.calendar_client = calendar_client or GoogleCalendarClient()
         self.cache_ttl = 60  # 1 minute cache for calendar events
         
     async def initialize(self) -> bool:
