@@ -244,17 +244,28 @@ class Orchestrator:
             operation = await self.tool_state_manager.get_operation(session_id)
             logger.info(f"Retrieved operation for session {session_id}: {operation['_id'] if operation else None}")
             
-            if not operation:
-                # Start new operation with validated tool_type
-                operation = await self.tool_state_manager.start_operation(
-                    session_id=session_id,
-                    tool_type=tool_type,
-                    initial_data={
-                        "command": message,
-                        "tool_type": tool_type
-                    }
-                )
-                logger.info(f"Created new operation: {operation['_id']}")
+            # If operation exists, check its state to determine flow
+            if operation:
+                current_state = operation.get('state')
+                logger.info(f"Operation {operation['_id']} in state: {current_state}")
+                
+                if current_state == ToolOperationState.APPROVING.value:
+                    # Handle approval response through approval manager
+                    logger.info(f"Processing approval response for operation {operation['_id']}")
+                    return await self._handle_ongoing_operation(operation, message)
+                
+                # ... handle other states ...
+
+            # If no operation, start new one
+            operation = await self.tool_state_manager.start_operation(
+                session_id=session_id,
+                tool_type=tool_type,
+                initial_data={
+                    "command": message,
+                    "tool_type": tool_type
+                }
+            )
+            logger.info(f"Created new operation: {operation['_id']}")
             
             # Get the appropriate tool
             tool = self.tools.get(tool_type)
@@ -270,55 +281,66 @@ class Orchestrator:
             tool.deps.session_id = session_id
             
             try:
-                # Get command analysis from tool (state-agnostic)
+                # First get command analysis
                 command_analysis = await tool._analyze_command(message)
                 
-                # Handle state updates based on analysis results
-                tool_operation_id = str(operation['_id'])
-                requires_approval = tool.registry.requires_approval
-                requires_scheduling = tool.registry.requires_scheduling
+                # Then generate content using analysis results
+                generation_result = await tool._generate_content(
+                    topic=command_analysis["topic"],
+                    count=command_analysis["item_count"],
+                    schedule_id=command_analysis.get("schedule_id"),
+                    tool_operation_id=str(operation['_id'])
+                )
                 
-                # Update operation with tool registry info
+                # Update operation with tool registry info and generated content
                 await self.tool_state_manager.update_operation(
                     session_id=session_id,
-                    tool_operation_id=tool_operation_id,
+                    tool_operation_id=str(operation['_id']),
                     input_data={
                         "command": message,
                         "tool_registry": {
-                            "requires_approval": requires_approval,
-                            "requires_scheduling": requires_scheduling,
+                            "requires_approval": tool.registry.requires_approval,
+                            "requires_scheduling": tool.registry.requires_scheduling,
                             "content_type": tool.registry.content_type.value,
                             "tool_type": tool.registry.tool_type.value
                         },
                         **command_analysis  # Include analysis results
+                    },
+                    content_updates={
+                        "items": generation_result["items"]  # Store generated items
                     }
                 )
                 
-                # Determine next state based on requirements
-                if requires_approval:
-                    # Move to approval flow
+                # Now determine next state based on requirements
+                if tool.registry.requires_approval:
+                    # Move to approval flow with the generated items
+                    logger.info(f"Moving operation {operation['_id']} to APPROVING state")
                     await self.tool_state_manager.update_operation(
                         session_id=session_id,
-                        tool_operation_id=tool_operation_id,
+                        tool_operation_id=str(operation['_id']),
                         state=ToolOperationState.APPROVING.value
                     )
-                    return await self._handle_approval_flow(operation, message)
+                    return await self._handle_approval_flow(
+                        operation=operation,
+                        message=message,
+                        items=generation_result["items"]  # Pass the generated items
+                    )
                 else:
                     # Move to execution
                     await self.tool_state_manager.update_operation(
                         session_id=session_id,
-                        tool_operation_id=tool_operation_id,
+                        tool_operation_id=str(operation['_id']),
                         state=ToolOperationState.EXECUTING.value
                     )
                     
-                    if requires_scheduling:
+                    if tool.registry.requires_scheduling:
                         return await self._handle_scheduled_operation(operation, message)
                     else:
                         # Execute immediately
                         result = await tool.run(message)
                         await self.tool_state_manager.end_operation(
                             session_id=session_id,
-                            tool_operation_id=tool_operation_id,
+                            tool_operation_id=str(operation['_id']),
                             success=True,
                             api_response=result
                         )
@@ -383,14 +405,14 @@ class Orchestrator:
             logger.error(f"Error in _handle_scheduled_operation: {e}")
             return {"success": False, "response": str(e)}
 
-    async def _handle_approval_flow(self, operation: Dict, message: str) -> Dict:
+    async def _handle_approval_flow(self, operation: Dict, message: str, items: List[Dict]) -> Dict:
         """Handle operations requiring approval"""
         try:
             # 1. Start approval flow
             result = await self.approval_manager.start_approval_flow(
                 session_id=operation['session_id'],
                 tool_operation_id=str(operation['_id']),
-                items=operation.get('items', []),
+                items=items,
                 message=message
             )
 
@@ -425,18 +447,39 @@ class Orchestrator:
         try:
             current_state = operation.get('state')
             tool_type = operation.get('tool_type')
+            current_status = operation.get('status', OperationStatus.PENDING.value)
+            
+            logger.info(f"Handling ongoing operation {operation['_id']} in state {current_state}")
+            
+            # Get the tool instance
             tool = self.tools.get(tool_type)
+            if not tool:
+                logger.error(f"Tool not found for type: {tool_type}")
+                return {
+                    "response": "I encountered an error processing your request.",
+                    "error": f"Tool not found: {tool_type}",
+                    "status": "error"
+                }
 
             if current_state == ToolOperationState.COLLECTING.value:
-                # Initial content generation
+                logger.info(f"Processing collection state for operation {operation['_id']}")
                 return await tool.run(message)
             
             elif current_state == ToolOperationState.APPROVING.value:
-                # Get current items for approval
-                current_items = await self.db.tool_items.find({
-                    "tool_operation_id": str(operation['_id']),
-                    "state": ToolOperationState.APPROVING.value
-                }).to_list(None)
+                # Get current items for approval using tool_state_manager
+                current_items = await self.tool_state_manager.get_operation_items(
+                    tool_operation_id=str(operation['_id']),
+                    state=ToolOperationState.APPROVING.value
+                )
+
+                logger.info(f"Processing approval response for {len(current_items)} items in operation {operation['_id']}")
+
+                if not current_items:
+                    logger.warning(f"No items found for approval in operation {operation['_id']}")
+                    return {
+                        "response": "No items found for approval",
+                        "status": "error"
+                    }
 
                 # Handle approval through ApprovalManager
                 result = await self.approval_manager.process_approval_response(
@@ -454,12 +497,18 @@ class Orchestrator:
                                 items=current_items,
                                 analysis=analysis
                             ),
-                        ApprovalAction.EXIT.value: self.approval_manager.handle_exit
+                        ApprovalAction.EXIT.value: lambda **kwargs: self.approval_manager.handle_exit(
+                            session_id=operation['session_id'],
+                            tool_operation_id=str(operation['_id']),
+                            success=False,
+                            tool_type=tool_type
+                        )
                     }
                 )
 
                 # Handle regeneration results
                 if result.get("items"):
+                    logger.info(f"Starting new approval flow with {len(result['items'])} regenerated items")
                     return await self.approval_manager.start_approval_flow(
                         session_id=operation['session_id'],
                         tool_operation_id=str(operation['_id']),
@@ -472,7 +521,7 @@ class Orchestrator:
             elif current_state in [ToolOperationState.COMPLETED.value, 
                                  ToolOperationState.ERROR.value,
                                  ToolOperationState.CANCELLED.value]:
-                logger.info(f"Operation in terminal state: {current_state}")
+                logger.info(f"Operation {operation['_id']} in terminal state: {current_state}")
                 return {
                     "response": "This operation has already been completed or cancelled.",
                     "state": current_state,
