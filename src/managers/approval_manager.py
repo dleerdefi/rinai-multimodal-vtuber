@@ -608,3 +608,58 @@ class ApprovalManager:
         except Exception as e:
             logger.error(f"Error handling approval error: {e}")
             return self.analyzer.create_error_response(str(e))
+
+    async def _regenerate_rejected_items(
+        self,
+        tool_operation_id: str,
+        regenerate_count: int,
+        analysis: Dict,
+        **kwargs
+    ) -> Dict:
+        """Handle item regeneration after partial approval"""
+        try:
+            # Get operation and tool info
+            operation = await self.tool_state_manager.get_operation_by_id(tool_operation_id)
+            if not operation:
+                raise ValueError(f"No operation found for ID {tool_operation_id}")
+
+            tool_type = operation.get('tool_type')
+            tool = self.orchestrator.tools.get(tool_type)  # We'll need to inject orchestrator
+            if not tool:
+                raise ValueError(f"Tool not found for type {tool_type}")
+
+            # Get generation parameters from original command
+            topic = operation.get("input_data", {}).get("command_info", {}).get("topic")
+            if not topic:
+                raise ValueError("Could not find topic for regeneration")
+
+            logger.info(f"Regenerating {regenerate_count} items for operation {tool_operation_id}")
+
+            # Use tool's _generate_content function
+            generation_result = await tool._generate_content(
+                topic=topic,
+                count=regenerate_count,
+                schedule_id=operation.get("input_data", {}).get("schedule_id"),
+                tool_operation_id=tool_operation_id
+            )
+
+            # Create regeneration items through tool state manager
+            items = await self.tool_state_manager.create_regeneration_items(
+                session_id=operation['session_id'],
+                tool_operation_id=tool_operation_id,
+                items_data=generation_result["items"],
+                content_type=operation['metadata']['content_type'],
+                schedule_id=generation_result.get("schedule_id")
+            )
+
+            return {
+                "items": items,
+                "schedule_id": generation_result.get("schedule_id"),
+                "tool_operation_id": tool_operation_id,
+                "regeneration_needed": True,
+                "regenerate_count": len(items)
+            }
+
+        except Exception as e:
+            logger.error(f"Error regenerating items: {e}")
+            return self.analyzer.create_error_response(str(e))

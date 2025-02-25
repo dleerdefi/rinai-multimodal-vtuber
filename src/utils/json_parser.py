@@ -8,21 +8,45 @@ logger = logging.getLogger(__name__)
 T = TypeVar('T', bound=BaseModel)
 
 def extract_json(response: str) -> str:
-    """Extract JSON substring from text"""
-    # Handle markdown code blocks first
-    if "```json" in response:
-        response = response.split("```json")[1].split("```")[0].strip()
-    elif "```" in response:
-        response = response.split("```")[1].strip()
+    """Extract JSON substring from text, handling various LLM response formats"""
+    try:
+        # Strip whitespace
+        response = response.strip()
         
-    start_idx = response.find('{')
-    end_idx = response.rfind('}')
-    if start_idx == -1 or end_idx == -1 or end_idx < start_idx:
+        # Handle markdown code blocks
+        if "```" in response:
+            # Split on code block markers and get the content
+            blocks = response.split("```")
+            # Get the block that contains json (usually the second block)
+            for block in blocks:
+                # Remove "json" language identifier if present
+                if block.startswith("json"):
+                    block = block[4:].strip()
+                elif block.startswith("javascript"):
+                    block = block[10:].strip()
+                    
+                # Try to find JSON markers
+                if "{" in block and "}" in block:
+                    start_idx = block.find('{')
+                    end_idx = block.rfind('}')
+                    if start_idx != -1 and end_idx > start_idx:
+                        return block[start_idx:end_idx + 1].strip()
+        
+        # If no code blocks, try to find JSON markers directly
+        start_idx = response.find('{')
+        end_idx = response.rfind('}')
+        if start_idx != -1 and end_idx > start_idx:
+            return response[start_idx:end_idx + 1].strip()
+            
+        logger.warning(f"No valid JSON structure found in response: {response[:100]}...")
         return ""
-    return response[start_idx:end_idx+1]
+        
+    except Exception as e:
+        logger.error(f"Error extracting JSON: {e}")
+        return ""
 
-def parse_strict_json(response: str, model_cls: Type[T]) -> Optional[T]:
-    """Parse LLM response into Pydantic model"""
+def parse_strict_json(response: str, model_cls: Optional[Type[T]] = None) -> Optional[T]:
+    """Parse LLM response into Pydantic model or dict with enhanced error handling"""
     try:
         json_str = extract_json(response)
         if not json_str:
@@ -31,10 +55,9 @@ def parse_strict_json(response: str, model_cls: Type[T]) -> Optional[T]:
             
         logger.debug(f"Attempting to parse JSON: {json_str}")
         raw_data = json.loads(json_str)
-        logger.debug(f"Parsed raw data: {raw_data}")
         
-        # If model_cls is dict, return raw_data
-        if model_cls == dict:
+        # If no model class specified or it's dict, return raw data
+        if not model_cls or model_cls == dict:
             return raw_data
             
         try:
@@ -43,7 +66,6 @@ def parse_strict_json(response: str, model_cls: Type[T]) -> Optional[T]:
             return validated
         except ValidationError as ve:
             logger.error(f"Validation error: {ve}")
-            # Return raw data if validation fails
             return raw_data
             
     except json.JSONDecodeError as e:

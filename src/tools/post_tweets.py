@@ -164,6 +164,8 @@ Instructions:
 - For spread_24h, calculate appropriate interval based on tweet count
 - For specific times, provide start_time in ISO format
 - Include ALL scheduling parameters
+- Follow the exact schema provided
+- Include NO additional text or markdown
 
 Example response format:
 {{
@@ -491,7 +493,7 @@ Format the response as JSON:
             logger.error(f"Error handling approval error: {e}")
             return self.approval_manager._create_error_response(str(e))
 
-    async def _regenerate_rejected_tweets(
+    async def _regenerate_rejected_items(
         self,
         tool_operation_id: str,
         regenerate_count: int,
