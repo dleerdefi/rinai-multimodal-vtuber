@@ -47,6 +47,16 @@ from src.utils.json_parser import parse_strict_json, extract_json
 # Prompt imports
 from src.prompts.tool_prompts import ToolPrompts
 
+# DB enums
+from src.db.enums import (
+    AgentState, 
+    ToolOperationState, 
+    OperationStatus, 
+    ContentType, 
+    ToolType,
+    ApprovalState
+)
+
 load_dotenv()
 logger = logging.getLogger(__name__)
 
@@ -219,67 +229,109 @@ class Orchestrator:
 
     async def handle_tool_operation(self, message: str, session_id: str, tool_type: Optional[str] = None) -> Dict:
         try:
+            logger.info(f"Handling tool operation for session: {session_id}")
+            
             # Validate tool_type against enum
             if tool_type and tool_type not in [t.value for t in ToolType]:
-                raise ValueError(f"Invalid tool_type: {tool_type}")
+                logger.warning(f"Invalid tool_type: {tool_type}")
+                return {
+                    "response": "I encountered an error processing your request.",
+                    "error": f"Invalid tool type: {tool_type}",
+                    "status": "error"
+                }
             
             # Get or create operation
             operation = await self.tool_state_manager.get_operation(session_id)
+            logger.info(f"Retrieved operation for session {session_id}: {operation['_id'] if operation else None}")
             
             if not operation:
                 # Start new operation with validated tool_type
                 operation = await self.tool_state_manager.start_operation(
                     session_id=session_id,
-                    operation_type=tool_type,
+                    tool_type=tool_type,
                     initial_data={
                         "command": message,
-                        "tool_type": tool_type  # Explicitly include in initial_data
+                        "tool_type": tool_type
+                    }
+                )
+                logger.info(f"Created new operation: {operation['_id']}")
+            
+            # Get the appropriate tool
+            tool = self.tools.get(tool_type)
+            if not tool:
+                logger.error(f"Tool not found for type: {tool_type}")
+                return {
+                    "response": "I encountered an error processing your request.",
+                    "error": f"Tool not found: {tool_type}",
+                    "status": "error"
+                }
+            
+            # Update tool's session ID
+            tool.deps.session_id = session_id
+            
+            try:
+                # Get command analysis from tool (state-agnostic)
+                command_analysis = await tool._analyze_command(message)
+                
+                # Handle state updates based on analysis results
+                tool_operation_id = str(operation['_id'])
+                requires_approval = tool.registry.requires_approval
+                requires_scheduling = tool.registry.requires_scheduling
+                
+                # Update operation with tool registry info
+                await self.tool_state_manager.update_operation(
+                    session_id=session_id,
+                    tool_operation_id=tool_operation_id,
+                    input_data={
+                        "command": message,
+                        "tool_registry": {
+                            "requires_approval": requires_approval,
+                            "requires_scheduling": requires_scheduling,
+                            "content_type": tool.registry.content_type.value,
+                            "tool_type": tool.registry.tool_type.value
+                        },
+                        **command_analysis  # Include analysis results
                     }
                 )
                 
-                # Analyze command
-                tool = self.tools.get(tool_type)
-                command_analysis = await tool.analyze_command(message)
-                requires_approval = command_analysis.get("requires_approval", False)
-                requires_scheduling = command_analysis.get("requires_scheduling", False)
-                
-                # Move to EXECUTING if no approval needed
-                if not requires_approval:
+                # Determine next state based on requirements
+                if requires_approval:
+                    # Move to approval flow
                     await self.tool_state_manager.update_operation(
-                        operation_id=str(operation['_id']),
-                        state=ToolOperationState.EXECUTING.value,
-                        status=OperationStatus.PENDING.value
+                        session_id=session_id,
+                        tool_operation_id=tool_operation_id,
+                        state=ToolOperationState.APPROVING.value
+                    )
+                    return await self._handle_approval_flow(operation, message)
+                else:
+                    # Move to execution
+                    await self.tool_state_manager.update_operation(
+                        session_id=session_id,
+                        tool_operation_id=tool_operation_id,
+                        state=ToolOperationState.EXECUTING.value
                     )
                     
                     if requires_scheduling:
-                        result = await self._handle_scheduled_operation(operation, message)
+                        return await self._handle_scheduled_operation(operation, message)
                     else:
-                        # One-shot immediate execution
+                        # Execute immediately
                         result = await tool.run(message)
                         await self.tool_state_manager.end_operation(
                             session_id=session_id,
+                            tool_operation_id=tool_operation_id,
                             success=True,
                             api_response=result
                         )
-                    
-                    # Update operation with tool metadata
-                    await self.tool_state_manager.update_operation(
-                        session_id=session_id,
-                        tool_operation_id=str(operation['_id']),
-                        metadata={
-                            "tool_type": tool_type,
-                            "content_type": tool.registry.content_type.value
-                        }
-                    )
-                    
-                    return result
+                        return result
 
-                else:
-                    # Move to approval flow
-                    return await self._handle_approval_flow(operation, message)
-
-            # Handle ongoing operations
-            return await self._handle_ongoing_operation(operation, message)
+            except Exception as e:
+                logger.error(f"Error processing tool operation: {e}")
+                await self.tool_state_manager.update_operation(
+                    session_id=session_id,
+                    tool_operation_id=str(operation['_id']),
+                    state=ToolOperationState.ERROR.value
+                )
+                raise
 
         except Exception as e:
             logger.error(f"Error in handle_tool_operation: {e}")
@@ -393,8 +445,8 @@ class Orchestrator:
                     content_type=operation.get('metadata', {}).get('content_type'),
                     tool_operation_id=str(operation['_id']),
                     handlers={
-                        ApprovalAction.PARTIAL_APPROVAL.value: tool._regenerate_rejected_tweets,
-                        ApprovalAction.REGENERATE_ALL.value: tool._regenerate_rejected_tweets,
+                        ApprovalAction.PARTIAL_APPROVAL.value: tool._regenerate_rejected_items,
+                        ApprovalAction.REGENERATE_ALL.value: tool._regenerate_rejected_items,
                         ApprovalAction.FULL_APPROVAL.value: lambda tool_operation_id, session_id, analysis, **kwargs:
                             self.approval_manager._handle_full_approval(
                                 tool_operation_id=tool_operation_id,

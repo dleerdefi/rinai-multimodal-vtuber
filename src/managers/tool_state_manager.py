@@ -35,11 +35,13 @@ class ToolStateManager:
             ],
             ToolOperationState.COLLECTING.value: [
                 ToolOperationState.APPROVING.value,
-                ToolOperationState.EXECUTING.value
+                ToolOperationState.EXECUTING.value,
+                ToolOperationState.ERROR.value  # Allow error from collecting
             ],
             ToolOperationState.APPROVING.value: [
                 ToolOperationState.EXECUTING.value,
-                ToolOperationState.CANCELLED.value
+                ToolOperationState.CANCELLED.value,
+                ToolOperationState.ERROR.value  # Allow error from approving
             ],
             ToolOperationState.EXECUTING.value: [
                 ToolOperationState.COMPLETED.value,
@@ -53,7 +55,7 @@ class ToolStateManager:
     async def start_operation(
         self,
         session_id: str,
-        operation_type: str,
+        tool_type: str,
         initial_data: Optional[Dict[str, Any]] = None
     ) -> Dict:
         """Start any tool operation with a unique ID"""
@@ -72,7 +74,7 @@ class ToolStateManager:
             operation_data = {
                 "_id": ObjectId(tool_operation_id),
                 "session_id": session_id,
-                "tool_type": operation_type,
+                "tool_type": tool_type,
                 "state": ToolOperationState.COLLECTING.value,
                 "step": "analyzing",
                 "input_data": {
@@ -110,7 +112,7 @@ class ToolStateManager:
             result = await self.db.tool_operations.insert_one(operation_data)
             operation_data['_id'] = result.inserted_id
             
-            logger.info(f"Started {operation_type} operation {tool_operation_id} for session {session_id}")
+            logger.info(f"Started {tool_type} operation {tool_operation_id} for session {session_id}")
             return operation_data
 
         except Exception as e:

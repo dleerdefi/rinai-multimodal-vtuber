@@ -575,3 +575,36 @@ class ApprovalManager:
         except (ValueError, TypeError):
             logger.warning(f"Invalid approval state: {approval_state}, defaulting to AWAITING_INITIAL")
             return ApprovalState.AWAITING_INITIAL
+
+    async def handle_error(
+        self,
+        session_id: str,
+        tool_operation_id: str,
+        error_message: str
+    ) -> Dict:
+        """Handle error during approval flow"""
+        try:
+            logger.error(f"Handling error in approval flow: {error_message}")
+            
+            # Update operation state to ERROR through tool_state_manager
+            await self.tool_state_manager.update_operation(
+                session_id=session_id,
+                tool_operation_id=tool_operation_id,
+                metadata={
+                    "error": error_message,
+                    "error_timestamp": datetime.now(UTC).isoformat(),
+                    "approval_state": ApprovalState.ERROR.value
+                }
+            )
+            
+            # Call handle_exit to properly clean up and transition state
+            return await self.handle_exit(
+                session_id=session_id,
+                tool_operation_id=tool_operation_id,
+                success=False,
+                tool_type=self._current_tool_type
+            )
+
+        except Exception as e:
+            logger.error(f"Error handling approval error: {e}")
+            return self.analyzer.create_error_response(str(e))

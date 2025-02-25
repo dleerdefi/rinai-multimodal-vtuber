@@ -57,24 +57,24 @@ class AgentStateManager:
                 tool_type = self.trigger_detector.get_specific_tool_type(message)
                 if tool_type:
                     try:
+                        # Transition to TOOL_OPERATION state BEFORE handling operation
+                        await self._transition_state(
+                            AgentAction.START_TOOL,
+                            f"Starting {tool_type} operation"
+                        )
+                        
                         # Store tool_type for the session
                         self._current_tool_type = tool_type
                         logger.info(f"Starting tool operation with type: {tool_type}")
 
-                        # Start tool operation with explicit tool_type
+                        # Now handle the tool operation
                         result = await self.orchestrator.handle_tool_operation(
                             message=message,
                             session_id=session_id,
-                            tool_type=tool_type  # Pass tool_type explicitly
+                            tool_type=tool_type
                         )
                         
                         if isinstance(result, dict):
-                            # Transition to TOOL_OPERATION state
-                            await self._transition_state(
-                                AgentAction.START_TOOL,
-                                f"Starting {tool_type} operation"
-                            )
-                            
                             return {
                                 **result,
                                 "state": self.current_state.value,
@@ -82,33 +82,35 @@ class AgentStateManager:
                             }
                     except Exception as e:
                         logger.error(f"Error starting tool operation: {e}")
-                        raise
+                        # Don't transition state on error - let approval_manager handle it
+                        return self._create_error_response(str(e))
 
             # TOOL_OPERATION: Handle ongoing operation
             elif self.current_state == AgentState.TOOL_OPERATION:
-                # Pass the stored tool_type for ongoing operations
-                result = await self.orchestrator.handle_tool_operation(
-                    message=message,
-                    session_id=session_id,
-                    tool_type=self._current_tool_type  # Pass stored tool_type
-                )
-                
-                if isinstance(result, dict):
-                    # Check operation completion status
-                    operation_status = result.get("status", "").lower()
-                    if operation_status in ["completed", "cancelled"]:
-                        action = AgentAction.COMPLETE_TOOL if operation_status == "completed" else AgentAction.CANCEL_TOOL
-                        await self._transition_state(action, f"Operation {operation_status}")
-                        self._current_tool_type = None  # Clear tool_type on completion
-                    elif operation_status == "error":
-                        await self._transition_state(AgentAction.ERROR, "Operation error")
-                        self._current_tool_type = None  # Clear tool_type on error
+                try:
+                    result = await self.orchestrator.handle_tool_operation(
+                        message=message,
+                        session_id=session_id,
+                        tool_type=self._current_tool_type
+                    )
                     
-                    return {
-                        **result,
-                        "state": self.current_state.value,
-                        "response": result.get("response", "Processing your request...")
-                    }
+                    if isinstance(result, dict):
+                        # Only transition state if explicitly completed/cancelled
+                        operation_status = result.get("status", "").lower()
+                        if operation_status in ["completed", "cancelled"]:
+                            action = AgentAction.COMPLETE_TOOL if operation_status == "completed" else AgentAction.CANCEL_TOOL
+                            await self._transition_state(action, f"Operation {operation_status}")
+                            self._current_tool_type = None
+                        
+                        return {
+                            **result,
+                            "state": self.current_state.value,
+                            "response": result.get("response", "Processing your request...")
+                        }
+                except Exception as e:
+                    logger.error(f"Error in tool operation: {e}")
+                    # Let approval_manager handle the error state transition
+                    return self._create_error_response(str(e))
 
             # Default response for NORMAL_CHAT
             return {
@@ -118,8 +120,7 @@ class AgentStateManager:
 
         except Exception as e:
             logger.error(f"Error in state management: {e}")
-            await self._transition_state(AgentAction.ERROR, str(e))
-            self._current_tool_type = None  # Clear tool_type on error
+            # Don't transition state here - let approval_manager handle it
             return self._create_error_response(str(e))
 
     def _create_error_response(self, error_message: str) -> Dict:

@@ -116,11 +116,18 @@ class TwitterTool(BaseTool):
         try:
             logger.info(f"Starting command analysis for: {command}")
             
-            # Start operation through manager with registry settings
-            operation = await self.tool_state_manager.update_operation(
+            # Get the existing operation that was created by orchestrator
+            operation = await self.tool_state_manager.get_operation(self.deps.session_id)
+            if not operation:
+                raise ValueError("No active operation found")
+                
+            tool_operation_id = str(operation['_id'])
+            
+            # Update the operation with registry settings
+            await self.tool_state_manager.update_operation(
                 session_id=self.deps.session_id,
-                operation_type=ToolType.TWITTER.value,
-                initial_data={
+                tool_operation_id=tool_operation_id,  # Required parameter from existing operation
+                input_data={
                     "command": command,
                     "content_type": self.registry.content_type.value,
                     "tool_registry": {
@@ -130,7 +137,6 @@ class TwitterTool(BaseTool):
                     }
                 }
             )
-            tool_operation_id = str(operation['_id'])
             
             # Get LLM analysis
             prompt = f"""You are a Twitter action analyzer. Determine the specific Twitter action needed.
