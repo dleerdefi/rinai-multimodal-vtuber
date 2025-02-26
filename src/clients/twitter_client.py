@@ -14,9 +14,17 @@ class TwitterAgentClient:
             "Accept": "application/json"
         }
 
-    async def send_tweet(self, content: str, params: Optional[Dict] = None) -> bool:
+    async def send_tweet(self, content: str, params: Optional[Dict] = None, test_mode: bool = False) -> Dict:
         """Send a tweet through our Twitter client server"""
         try:
+            if test_mode:
+                logger.info(f"TEST MODE: Would have posted tweet: {content}")
+                return {
+                    "success": True,
+                    "id": f"mock_tweet_{datetime.now(UTC).timestamp()}",
+                    "text": content
+                }
+            
             endpoint = f"{self.base_url}/tweets/send"
             payload = {
                 "message": content,
