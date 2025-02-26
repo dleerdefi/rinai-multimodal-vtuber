@@ -177,16 +177,19 @@ class ScheduleManager:
             
             if status == OperationStatus.EXECUTED:
                 update_data.update({
+                    "state": ToolOperationState.COMPLETED.value,  # Update state to COMPLETED
                     "executed_time": datetime.now(UTC),
-                    "api_response": api_response
+                    "api_response": api_response,
+                    "metadata.schedule_state": ScheduleState.COMPLETED.value,
+                    "metadata.execution_completed_at": datetime.now(UTC).isoformat()
                 })
             
             if error:
                 update_data["last_error"] = error
                 update_data["retry_count"] = 1
-            
+                
             result = await self.db.tool_items.update_one(
-                {"_id": item_id},
+                {"_id": ObjectId(item_id)},
                 {"$set": update_data}
             )
             
@@ -282,10 +285,11 @@ class ScheduleManager:
                 logger.error(f"No executable items found for operation {tool_operation_id}")
                 return False
 
-            # 2. Update schedule state only
+            # 2. Update schedule state - FIX: Use schedule_state instead of state
             await self.db.update_scheduled_operation(
                 schedule_id=schedule_id,
-                state=ScheduleState.ACTIVE.value,
+                state=ScheduleState.ACTIVE.value,  # This sets the 'state' field
+                schedule_state=ScheduleState.ACTIVE.value,  # Add this line to set 'schedule_state' field
                 status=OperationStatus.SCHEDULED.value,
                 metadata={
                     "state_history": {
@@ -301,13 +305,21 @@ class ScheduleManager:
                 }
             )
 
-            # 3. Update only item status (state remains EXECUTING)
+            # 3. Update item status and add schedule state tracking
             await self.db.tool_items.update_many(
                 {
                     "tool_operation_id": tool_operation_id,
                     "_id": {"$in": [ObjectId(item["_id"]) for item in items]}
                 },
-                {"$set": {"status": OperationStatus.SCHEDULED.value}}
+                {"$set": {
+                    "status": OperationStatus.SCHEDULED.value,
+                    "metadata.schedule_state": ScheduleState.ACTIVE.value,  # Add schedule state tracking
+                    "metadata.schedule_state_history": [{
+                        "state": ScheduleState.ACTIVE.value,
+                        "timestamp": datetime.now(UTC).isoformat(),
+                        "reason": "Schedule activated"
+                    }]
+                }}
             )
 
             return True
@@ -419,37 +431,50 @@ class ScheduleManager:
             # Get all items for this schedule
             items = await self.db.tool_items.find({
                 "schedule_id": schedule_id,
-                "state": ToolOperationState.COMPLETED.value  # Items should be in EXECUTING state
+                "status": {"$ne": OperationStatus.REJECTED.value}  # Exclude rejected items
             }).to_list(None)
 
             if not items:
                 logger.warning(f"No items found for schedule {schedule_id}")
                 return False
 
-            # Check if all items have completed their schedule
-            all_completed = all(
-                item.get("schedule_state") == ScheduleState.COMPLETED.value
-                for item in items
+            # Count items by schedule state
+            items_by_state = {
+                'pending': [i for i in items if i.get('metadata', {}).get('schedule_state') == ScheduleState.PENDING.value],
+                'active': [i for i in items if i.get('metadata', {}).get('schedule_state') == ScheduleState.ACTIVE.value],
+                'completed': [i for i in items if i.get('metadata', {}).get('schedule_state') == ScheduleState.COMPLETED.value],
+                'error': [i for i in items if i.get('metadata', {}).get('schedule_state') == ScheduleState.ERROR.value],
+                'cancelled': [i for i in items if i.get('metadata', {}).get('schedule_state') == ScheduleState.CANCELLED.value]
+            }
+
+            # Check if all non-rejected items have reached a terminal state
+            all_terminal = all(
+                i.get('metadata', {}).get('schedule_state') in [
+                    ScheduleState.COMPLETED.value,
+                    ScheduleState.ERROR.value,
+                    ScheduleState.CANCELLED.value
+                ]
+                for i in items
             )
 
-            if all_completed:
+            if all_terminal:
                 # Update schedule state to COMPLETED
                 await self._transition_schedule_state(
                     schedule_id=schedule_id,
                     action=ScheduleAction.COMPLETE,
-                    reason="All scheduled items completed execution",
+                    reason="All scheduled items reached terminal state",
                     metadata={
                         "completion_time": datetime.now(UTC).isoformat(),
                         "total_items": len(items),
                         "execution_summary": {
-                            "completed": len([i for i in items if i.get("schedule_state") == ScheduleState.COMPLETED.value]),
-                            "error": len([i for i in items if i.get("schedule_state") == ScheduleState.ERROR.value]),
-                            "cancelled": len([i for i in items if i.get("schedule_state") == ScheduleState.CANCELLED.value])
+                            "completed": len(items_by_state['completed']),
+                            "error": len(items_by_state['error']),
+                            "cancelled": len(items_by_state['cancelled'])
                         }
                     }
                 )
 
-            return all_completed
+            return all_terminal
 
         except Exception as e:
             logger.error(f"Error checking schedule completion: {e}")

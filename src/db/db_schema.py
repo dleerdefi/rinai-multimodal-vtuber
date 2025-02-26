@@ -724,6 +724,7 @@ class RinDB:
         self,
         schedule_id: str,
         state: Optional[str] = None,
+        schedule_state: Optional[str] = None,
         status: Optional[str] = None,
         pending_item_ids: Optional[List[str]] = None,
         approved_item_ids: Optional[List[str]] = None,
@@ -731,47 +732,33 @@ class RinDB:
         schedule_info: Optional[Dict] = None,
         metadata: Optional[Dict] = None
     ) -> bool:
-        """Update scheduled operation state and metadata"""
+        """Update a scheduled operation"""
         try:
             update_data = {}
-            update_ops = {}  # Separate dict for $push operations
-            
-            if state:
-                update_data["schedule_state"] = state
-                
-            if status:
+            if state is not None:
+                update_data["state"] = state
+            if schedule_state is not None:
+                update_data["schedule_state"] = schedule_state
+            if status is not None:
                 update_data["status"] = status
-                
             if pending_item_ids is not None:
                 update_data["pending_items"] = pending_item_ids
-                
             if approved_item_ids is not None:
                 update_data["approved_items"] = approved_item_ids
-                
             if rejected_item_ids is not None:
                 update_data["rejected_items"] = rejected_item_ids
-                
-            if schedule_info:
+            if schedule_info is not None:
                 update_data["schedule_info"] = schedule_info
-                
-            if metadata:
-                # Handle state history as a push operation
+            if metadata is not None:
                 if "state_history" in metadata:
-                    update_ops["$push"] = {
-                        "state_history": metadata.pop("state_history")
-                    }
-                # Update remaining metadata
+                    update_data["state_history"] = metadata.pop("state_history")
                 update_data["metadata"] = {
                     **update_data.get("metadata", {}),
                     **metadata,
                     "last_modified": datetime.now(UTC).isoformat()
                 }
 
-            # Combine updates if needed
             final_update = {"$set": update_data}
-            if update_ops:
-                final_update.update(update_ops)
-
             result = await self.scheduled_operations.update_one(
                 {"_id": ObjectId(schedule_id) if ObjectId.is_valid(schedule_id) else schedule_id},
                 final_update
