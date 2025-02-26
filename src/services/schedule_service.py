@@ -51,29 +51,67 @@ class ScheduleService:
         while self.running:
             try:
                 # Get operations ready for execution
-                due_operations = await self.db.get_scheduled_operation(
-                    status=OperationStatus.SCHEDULED.value
-                )
+                current_time = datetime.now(UTC)
                 
-                # Ensure due_operations is a list
-                if due_operations and not isinstance(due_operations, list):
-                    due_operations = [due_operations]
+                # Get all scheduled items due for execution
+                due_items = await self.db.tool_items.find({
+                    "status": OperationStatus.SCHEDULED.value,
+                    "scheduled_time": {"$lte": current_time}
+                }).to_list(None)
                 
-                if due_operations:
-                    for operation in due_operations:
-                        if isinstance(operation, dict):  # Ensure operation is a dict
-                            if operation.get('state') != ToolOperationState.CANCELLED.value:
-                                try:
-                                    await self._handle_scheduled_operation(operation)
-                                except Exception as e:
-                                    logger.error(f"Error processing operation {operation.get('_id')}: {e}")
-                                    continue
+                if due_items:
+                    logger.info(f"Found {len(due_items)} items due for execution at {current_time.isoformat()}")
+                    
+                    for item in due_items:
+                        try:
+                            # Get the tool for this content type
+                            content_type = item.get('content_type')
+                            tool = self._get_tool_for_content(content_type)
+                            
+                            if not tool:
+                                logger.error(f"No tool found for content type: {content_type}")
+                                continue
+                            
+                            # Execute the item
+                            logger.info(f"Executing scheduled item: {item.get('_id')}")
+                            
+                            result = await tool.execute({
+                                'content': item.get('content', {}),
+                                'parameters': {
+                                    'custom_params': {
+                                        'account_id': 'default',
+                                        'media_files': []
+                                    }
+                                }
+                            })
+                            
+                            # Update item status
+                            if result.get('success'):
+                                await self.db.tool_items.update_one(
+                                    {"_id": item['_id']},
+                                    {"$set": {
+                                        "status": OperationStatus.EXECUTED.value,
+                                        "state": ToolOperationState.COMPLETED.value,
+                                        "executed_time": datetime.now(UTC),
+                                        "api_response": result,
+                                        "metadata.execution_result": result,
+                                        "metadata.executed_at": datetime.now(UTC).isoformat(),
+                                        "metadata.schedule_state": ScheduleState.COMPLETED.value
+                                    }}
+                                )
+                                logger.info(f"Successfully executed scheduled item {item['_id']}")
+                            else:
+                                logger.error(f"Failed to execute scheduled item {item['_id']}: {result.get('error')}")
+                        
+                        except Exception as e:
+                            logger.error(f"Error executing scheduled item {item.get('_id')}: {e}")
                 
-                await asyncio.sleep(60)  # Check every minute
+                # Check every 5 seconds during testing (can be longer in production)
+                await asyncio.sleep(5)
                 
             except Exception as e:
                 logger.error(f"Error in schedule loop: {e}")
-                await asyncio.sleep(60)  # Wait before retry
+                await asyncio.sleep(5)  # Wait before retry
 
     async def _handle_scheduled_operation(self, operation: Dict):
         """Handle a scheduled operation that's due for execution"""

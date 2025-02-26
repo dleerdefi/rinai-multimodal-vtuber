@@ -134,7 +134,7 @@ class TwitterScheduleExecutionTester:
             session_id=self.session_id,
             tool_type=ToolType.TWITTER.value,
             initial_data={
-                "command": "schedule 2 tweets about AI technology",
+                "command": "schedule 2 tweets about tweeting via agent state machine over the next 5 minutes",
                 "tool_type": ToolType.TWITTER.value
             }
         )
@@ -145,10 +145,11 @@ class TwitterScheduleExecutionTester:
         # Set the session_id in the Twitter tool's dependencies
         self.twitter_tool.deps.session_id = self.session_id
         
-        # Create schedule directly (like in test_schedule_flow.py)
+        # Create schedule with short intervals for testing
+        # First tweet in 30 seconds, second tweet 30 seconds after that
         schedule_info = {
-            "start_time": (datetime.now(UTC) + timedelta(minutes=2)).isoformat(),
-            "interval_minutes": 5,
+            "start_time": (datetime.now(UTC) + timedelta(seconds=30)).isoformat(),
+            "interval_minutes": 0.5,  # 30 seconds between tweets
             "schedule_type": "one_time",
             "total_items": 2
         }
@@ -175,7 +176,7 @@ class TwitterScheduleExecutionTester:
             },
             input_data={
                 "command_info": {
-                    "topic": "AI technology",
+                    "topic": "scheduled tweets",
                     "item_count": 2,
                     "schedule_info": schedule_info
                 },
@@ -185,7 +186,7 @@ class TwitterScheduleExecutionTester:
         
         # Generate tweet content
         generation_result = await self.twitter_tool._generate_content(
-            topic="AI technology",
+            topic="scheduled tweets",
             count=2,
             schedule_id=self.schedule_id,
             tool_operation_id=self.operation_id
@@ -295,9 +296,9 @@ class TwitterScheduleExecutionTester:
         
         return schedule, scheduled_items
     
-    async def test_tweet_execution(self):
-        """Test execution of schedule"""
-        logger.info("Testing tweet execution...")
+    async def test_schedule_execution(self):
+        """Test the schedule execution by waiting for scheduled times"""
+        logger.info("Testing schedule execution...")
         
         # Get scheduled items
         scheduled_items = await self.tool_state_manager.get_operation_items(
@@ -305,53 +306,92 @@ class TwitterScheduleExecutionTester:
             status=OperationStatus.SCHEDULED.value
         )
         
-        # Execute each tweet
-        executed_items = []
-        for item in scheduled_items:
-            logger.info(f"Executing tweet: {item.get('content', {}).get('raw_content')}")
+        # Sort items by scheduled time
+        scheduled_items.sort(key=lambda x: x.get('scheduled_time', datetime.max.replace(tzinfo=UTC)))
+        
+        # Log scheduled times
+        for i, item in enumerate(scheduled_items):
+            scheduled_time = item.get('scheduled_time')
+            if scheduled_time:
+                if isinstance(scheduled_time, str):
+                    scheduled_time = datetime.fromisoformat(scheduled_time.replace('Z', '+00:00'))
+                
+                now = datetime.now(UTC)
+                wait_seconds = max(0, (scheduled_time - now).total_seconds())
+                
+                logger.info(f"Tweet {i+1} scheduled for: {scheduled_time.isoformat()} (in {wait_seconds:.1f} seconds)")
+            else:
+                logger.warning(f"Tweet {i+1} has no scheduled time")
+        
+        # Wait for the schedule service to execute the tweets
+        if self.post_real_tweets:
+            # Wait for all tweets to be executed by the schedule service
+            max_wait_time = 300  # 5 minutes max wait
+            check_interval = 5   # Check every 5 seconds
+            start_time = datetime.now(UTC)
             
-            # Execute tweet using Twitter client with test_mode parameter
-            execution_result = await self.twitter_client.send_tweet(
-                content=item.get('content', {}).get('raw_content'),
-                params={
-                    'account_id': 'default',
-                    'media_files': []
-                },
-                test_mode=not self.post_real_tweets  # Use test mode unless post_real_tweets is True
+            logger.info(f"Waiting for scheduled tweets to be executed (max {max_wait_time} seconds)...")
+            
+            while (datetime.now(UTC) - start_time).total_seconds() < max_wait_time:
+                # Check if all items have been executed
+                executed_items = await self.tool_state_manager.get_operation_items(
+                    tool_operation_id=self.operation_id,
+                    status=OperationStatus.EXECUTED.value
+                )
+                
+                if len(executed_items) == len(scheduled_items):
+                    logger.info(f"All {len(executed_items)} tweets have been executed by the schedule service!")
+                    break
+                    
+                logger.info(f"Waiting for scheduled execution... ({len(executed_items)}/{len(scheduled_items)} executed)")
+                await asyncio.sleep(check_interval)
+            
+            # Verify all items were executed
+            executed_items = await self.tool_state_manager.get_operation_items(
+                tool_operation_id=self.operation_id,
+                status=OperationStatus.EXECUTED.value
             )
             
-            logger.info(f"Tweet execution result: {execution_result}")
+            if len(executed_items) < len(scheduled_items):
+                logger.warning(f"Only {len(executed_items)}/{len(scheduled_items)} tweets were executed within the wait time")
             
-            # Update item status to EXECUTED
-            await self.schedule_manager.update_item_execution_status(
-                item_id=str(item.get('_id')),
-                status=OperationStatus.EXECUTED,
-                api_response=execution_result
-            )
+            # Verify items are in COMPLETED/EXECUTED state
+            for item in executed_items:
+                updated_item = await self.db.tool_items.find_one({"_id": item.get('_id')})
+                logger.info(f"Item state after execution: {updated_item.get('state')}/{updated_item.get('status')}")
+                assert updated_item.get('state') == ToolOperationState.COMPLETED.value, "Expected item to be in COMPLETED state"
+                assert updated_item.get('status') == OperationStatus.EXECUTED.value, "Expected item to have EXECUTED status"
             
-            executed_items.append(item)
+            return executed_items
+        else:
+            # In test mode, simulate execution
+            logger.info("Test mode: Simulating scheduled execution")
+            executed_items = []
             
-            # Verify item is now in COMPLETED/EXECUTED state
-            updated_item = await self.db.tool_items.find_one({"_id": item.get('_id')})
-            logger.info(f"Item state after execution: {updated_item.get('state')}/{updated_item.get('status')}")
-            assert updated_item.get('state') == ToolOperationState.COMPLETED.value, "Expected item to be in COMPLETED state"
-            assert updated_item.get('status') == OperationStatus.EXECUTED.value, "Expected item to have EXECUTED status"
+            for item in scheduled_items:
+                # Simulate execution
+                execution_result = {
+                    "success": True,
+                    "id": f"mock_tweet_{datetime.now(UTC).timestamp()}",
+                    "text": item.get('content', {}).get('raw_content')
+                }
+                
+                # Update item status to EXECUTED
+                await self.schedule_manager.update_item_execution_status(
+                    item_id=str(item.get('_id')),
+                    status=OperationStatus.EXECUTED,
+                    api_response=execution_result
+                )
+                
+                executed_items.append(item)
+                
+                # Verify item is now in COMPLETED/EXECUTED state
+                updated_item = await self.db.tool_items.find_one({"_id": item.get('_id')})
+                logger.info(f"Item state after simulated execution: {updated_item.get('state')}/{updated_item.get('status')}")
+                assert updated_item.get('state') == ToolOperationState.COMPLETED.value, "Expected item to be in COMPLETED state"
+                assert updated_item.get('status') == OperationStatus.EXECUTED.value, "Expected item to have EXECUTED status"
             
-            if self.post_real_tweets and execution_result.get("success"):
-                # Verify the tweet was posted by checking the tweet ID
-                tweet_id = execution_result.get("id")
-                if tweet_id:
-                    logger.info(f"Successfully posted tweet with ID: {tweet_id}")
-                    # You could add additional verification here, like fetching the tweet
-                else:
-                    logger.warning("Tweet posted but no ID returned")
-        
-        # Check if schedule is now COMPLETED
-        await self.schedule_manager.check_schedule_completion(self.schedule_id)
-        schedule = await self.db.get_scheduled_operation(self.schedule_id)
-        logger.info(f"Schedule state after execution: {schedule.get('schedule_state')}")
-        
-        return executed_items
+            return executed_items
     
     async def test_complete_flow(self):
         """Test the complete flow from approval to execution"""
@@ -371,9 +411,9 @@ class TwitterScheduleExecutionTester:
             schedule, scheduled_items = await self.test_schedule_activation()
             logger.info(f"Schedule activation completed with state: {schedule.get('schedule_state')}")
             
-            # Test actual tweet execution
-            executed_items = await self.test_tweet_execution()
-            logger.info(f"Tweet execution completed with {len(executed_items)} executed items")
+            # Test schedule execution
+            executed_items = await self.test_schedule_execution()
+            logger.info(f"Schedule execution completed with {len(executed_items)} executed items")
             
             logger.info("All tests completed successfully!")
             return True

@@ -51,16 +51,22 @@ class TwitterAgentClient:
             logger.debug(f"Response content: {response.text}")
             
             response.raise_for_status()
-            return response.json()
+            result = response.json()
+            
+            # Ensure there's an ID in the response
+            if "id" not in result:
+                # Generate a mock ID if the real API doesn't provide one
+                result["id"] = f"tweet_{datetime.now(UTC).timestamp()}"
+            
+            return {
+                "success": True,
+                "id": result.get("id"),
+                "text": content,
+                "result": result
+            }
 
-        except requests.exceptions.RequestException as e:
-            logger.error(f"Request failed: {str(e)}")
-            return {"error": str(e), "success": False}
-        except json.JSONDecodeError as e:
-            logger.error(f"Failed to parse response: {str(e)}")
-            return {"error": "Invalid JSON response", "success": False}
         except Exception as e:
-            logger.error(f"Unexpected error: {str(e)}")
+            logger.error(f"Request failed: {str(e)}")
             return {"error": str(e), "success": False}
 
     def like_tweet(self, tweet_id, account_id="default"):

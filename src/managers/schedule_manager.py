@@ -224,6 +224,12 @@ class ScheduleManager:
                 schedule_info=schedule_info
             )
 
+            # Initialize state_history as an array
+            await self.db.scheduled_operations.update_one(
+                {"_id": ObjectId(schedule_id)},
+                {"$set": {"state_history": []}}
+            )
+
             # Track state transition
             await self._transition_schedule_state(
                 schedule_id=schedule_id,
@@ -409,16 +415,47 @@ class ScheduleManager:
                 logger.error(f"Invalid state transition: {current_state} -> {action}")
                 return False
 
-            # Update state using db_schema method
-            return await self.db.update_schedule_state(
-                schedule_id=schedule_id,
-                state=next_state,
-                reason=f"{action.value}: {reason}",
-                metadata=metadata
+            # Create history entry
+            history_entry = {
+                "state": next_state.value,
+                "timestamp": datetime.now(UTC).isoformat(),
+                "reason": f"{action.value}: {reason}"
+            }
+
+            # Update state using db_schema method with proper array handling
+            update_ops = {
+                "$set": {
+                    "schedule_state": next_state.value,
+                    "last_updated": datetime.now(UTC)
+                },
+                "$push": {
+                    "state_history": history_entry
+                }
+            }
+            
+            # Add metadata if provided
+            if metadata:
+                update_ops["$set"]["metadata"] = {
+                    **schedule.get("metadata", {}),
+                    **metadata,
+                    "last_modified": datetime.now(UTC).isoformat()
+                }
+            
+            result = await self.db.scheduled_operations.update_one(
+                {"_id": ObjectId(schedule_id)},
+                update_ops
             )
+            
+            success = result.modified_count > 0
+            if success:
+                logger.info(f"Updated schedule {schedule_id} state to {next_state.value}")
+            else:
+                logger.warning(f"No schedule updated for ID: {schedule_id}")
+            
+            return success
 
         except Exception as e:
-            logger.error(f"Error in state transition: {e}")
+            logger.error(f"Error in state transition: {e}", exc_info=True)
             return False
 
     async def check_schedule_completion(self, schedule_id: str) -> bool:
