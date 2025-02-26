@@ -41,7 +41,7 @@ class ApprovalManager:
         ApprovalState.AWAITING_INITIAL: ToolOperationState.APPROVING,
         ApprovalState.AWAITING_APPROVAL: ToolOperationState.APPROVING,
         ApprovalState.REGENERATING: ToolOperationState.COLLECTING,      # For rejected items
-        ApprovalState.APPROVAL_FINISHED: ToolOperationState.COMPLETED,  # For approved items
+        ApprovalState.APPROVAL_FINISHED: ToolOperationState.EXECUTING,  # For approved items
         ApprovalState.APPROVAL_CANCELLED: ToolOperationState.CANCELLED
     }
 
@@ -217,7 +217,7 @@ class ApprovalManager:
         logger.info(f"Successfully updated items {approved_ids} to APPROVED/EXECUTING")
 
     async def _update_rejected_items(self, tool_operation_id: str, regenerate_indices: List[int], items: List[Dict]):
-        """Update rejected items to COMPLETED state"""
+        """Update rejected items to CANCELLED state"""
         rejected_ids = [items[idx]['_id'] for idx in regenerate_indices if 0 <= idx < len(items)]
         logger.info(f"Updating {len(rejected_ids)} items to REJECTED/CANCELLED state")
         
@@ -273,7 +273,7 @@ class ApprovalManager:
             await self.tool_state_manager.update_operation(
                 session_id=session_id,
                 tool_operation_id=tool_operation_id,
-                state=ToolOperationState.COMPLETED.value,
+                state=ToolOperationState.EXECUTING.value,
                 metadata={
                     "approval_state": ApprovalState.APPROVAL_FINISHED.value,
                     "item_summary": {

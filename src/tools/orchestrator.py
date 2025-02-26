@@ -493,84 +493,123 @@ class Orchestrator:
                     }
                 )
 
-                # Check if approval was successful and scheduling is required
-                if (approval_result.get("status") == "success" and 
-                    tool.registry.requires_scheduling):
-                    logger.info(f"Moving to scheduling flow for operation {operation['_id']}")
+                # Check if approval was successful
+                if approval_result.get("status") == OperationStatus.APPROVED.value:
+                    logger.info(f"Approval successful for operation {operation['_id']}")
                     
-                    # First transition to EXECUTING state (required intermediate step)
-                    await self.tool_state_manager.update_operation(
-                        session_id=operation['session_id'],
-                        tool_operation_id=str(operation['_id']),
-                        state=ToolOperationState.EXECUTING.value,
-                        metadata={
-                            "approval_completed": True,
-                            "approval_timestamp": datetime.now(UTC).isoformat()
-                        }
-                    )
-                    logger.info(f"Transitioned operation {operation['_id']} from APPROVING to EXECUTING state")
-                    
-                    # Now handle scheduling
-                    schedule_id = operation.get('metadata', {}).get('schedule_id')
-                    if not schedule_id:
-                        logger.error("No schedule ID found for scheduled operation")
-                        return {"status": "error", "response": "Schedule information missing"}
-
-                    # Activate the schedule
-                    logger.info(f"Activating schedule {schedule_id} for operation {operation['_id']}")
-                    schedule_result = await self.schedule_manager.activate_schedule(
-                        tool_operation_id=str(operation['_id']),
-                        schedule_id=schedule_id
-                    )
-
-                    if schedule_result:
-                        # Now we can safely transition to COMPLETED state
-                        logger.info(f"Schedule activated successfully, completing operation {operation['_id']}")
-                        await self.tool_state_manager.end_operation(
-                            session_id=operation['session_id'],
-                            tool_operation_id=str(operation['_id']),
-                            success=True,
-                            api_response={"message": "Operation scheduled successfully"},
-                            metadata={
-                                "schedule_id": schedule_id,
-                                "schedule_state": ScheduleState.ACTIVE.value,
-                                "requires_scheduling": True
-                            }
+                    # Check if scheduling is required
+                    if tool.registry.requires_scheduling:
+                        logger.info(f"Tool requires scheduling, proceeding to schedule flow for operation {operation['_id']}")
+                        
+                        # Get schedule_id from various possible locations
+                        schedule_id = (
+                            operation.get('metadata', {}).get('schedule_id') or 
+                            operation.get('output_data', {}).get('schedule_id') or
+                            operation.get('input_data', {}).get('schedule_id')
                         )
                         
-                        # Get schedule details for user-friendly response
-                        schedule_info = operation.get('input_data', {}).get('command_info', {})
-                        topic = schedule_info.get('topic', 'your content')
-                        count = schedule_info.get('item_count', 'multiple items')
+                        if not schedule_id:
+                            logger.error(f"No schedule_id found for operation {operation['_id']}")
+                            return {
+                                "status": "error",
+                                "response": "Schedule information is missing. Unable to activate schedule."
+                            }
                         
-                        return {
-                            "status": "success", 
-                            "response": f"Great! I've scheduled {count} tweets about {topic}. They will be posted according to your schedule.",
-                            "requires_tts": True,
-                            "state": ToolOperationState.COMPLETED.value,
-                            "status": OperationStatus.SCHEDULED.value
-                        }
-                    else:
-                        logger.error(f"Failed to activate schedule {schedule_id}")
-                        return {"status": "error", "response": "Failed to schedule operation"}
-
+                        logger.info(f"Activating schedule {schedule_id} for operation {operation['_id']}")
+                        
+                        # Activate the schedule using the existing function in schedule_manager
+                        activation_result = await self.schedule_manager.activate_schedule(
+                            tool_operation_id=str(operation['_id']),
+                            schedule_id=schedule_id
+                        )
+                        
+                        if activation_result:
+                            logger.info(f"Schedule {schedule_id} activated successfully")
+                            
+                            # Update operation to COMPLETED state
+                            await self.tool_state_manager.end_operation(
+                                session_id=operation['session_id'],
+                                success=True,
+                                api_response={"message": "Schedule activated successfully"}
+                            )
+                            
+                            # Get topic and count for user-friendly response
+                            topic = operation.get('input_data', {}).get('command_info', {}).get('topic', 'your content')
+                            count = len(await self.tool_state_manager.get_operation_items(
+                                tool_operation_id=str(operation['_id']),
+                                state=ToolOperationState.EXECUTING.value
+                            ))
+                            
+                            return {
+                                "status": "success",
+                                "response": f"Great! I've scheduled {count} tweets about {topic}. They will be posted according to your schedule.",
+                                "requires_tts": True
+                            }
+                        else:
+                            logger.error(f"Failed to activate schedule {schedule_id}")
+                            return {
+                                "status": "error",
+                                "response": "I was unable to activate the schedule. Please try again."
+                            }
+                
+                # If not scheduled or approval wasn't successful, just return the approval result
                 return approval_result
 
             # Handle other states...
             elif current_state == ToolOperationState.EXECUTING.value:
                 # Handle execution state - check schedule status, etc.
                 logger.info(f"Operation {operation['_id']} is in EXECUTING state")
-                schedule_id = operation.get('metadata', {}).get('schedule_id')
                 
-                if schedule_id:
-                    # Check schedule status
-                    schedule = await self.db.get_scheduled_operation(schedule_id)
-                    if schedule:
-                        return {
-                            "status": "success",
-                            "response": f"Your content is scheduled and will be posted according to the schedule. Current status: {schedule.get('state')}",
-                            "requires_tts": True
-                        }
+                # Check if this is a scheduled operation that needs activation
+                if tool.registry.requires_scheduling:
+                    schedule_id = (
+                        operation.get('metadata', {}).get('schedule_id') or 
+                        operation.get('output_data', {}).get('schedule_id') or
+                        operation.get('input_data', {}).get('schedule_id')
+                    )
+                    
+                    if schedule_id:
+                        # Check schedule status
+                        schedule = await self.db.get_scheduled_operation(schedule_id)
+                        
+                        if schedule and schedule.get('state') == ScheduleState.PENDING.value:
+                            logger.info(f"Found pending schedule {schedule_id} that needs activation")
+                            
+                            # Activate the schedule
+                            activation_result = await self.schedule_manager.activate_schedule(
+                                tool_operation_id=str(operation['_id']),
+                                schedule_id=schedule_id
+                            )
+                            
+                            if activation_result:
+                                logger.info(f"Schedule {schedule_id} activated successfully")
+                                
+                                # Update operation to COMPLETED state
+                                await self.tool_state_manager.end_operation(
+                                    session_id=operation['session_id'],
+                                    success=True,
+                                    api_response={"message": "Schedule activated successfully"}
+                                )
+                                
+                                # Get topic and count for user-friendly response
+                                topic = operation.get('input_data', {}).get('command_info', {}).get('topic', 'your content')
+                                count = len(await self.tool_state_manager.get_operation_items(
+                                    tool_operation_id=str(operation['_id']),
+                                    state=ToolOperationState.EXECUTING.value
+                                ))
+                                
+                                return {
+                                    "status": "success",
+                                    "response": f"Great! I've scheduled {count} tweets about {topic}. They will be posted according to your schedule.",
+                                    "requires_tts": True
+                                }
+                        
+                        elif schedule:
+                            return {
+                                "status": "success",
+                                "response": f"Your content is scheduled and will be posted according to the schedule. Current status: {schedule.get('state')}",
+                                "requires_tts": True
+                            }
                 
                 return {
                     "status": "success",

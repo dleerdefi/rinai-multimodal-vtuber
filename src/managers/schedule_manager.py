@@ -266,7 +266,19 @@ class ScheduleManager:
                 ]
             )
             
+            # Log the query parameters and results for debugging
+            logger.info(f"Looking for items with tool_operation_id={tool_operation_id}, state=EXECUTING, status=[APPROVED, PENDING]")
+            logger.info(f"Found {len(items)} items matching criteria")
+            
             if not items:
+                # Try a more general query to see what items exist
+                all_items = await self.tool_state_manager.get_operation_items(
+                    tool_operation_id=tool_operation_id
+                )
+                logger.info(f"Found {len(all_items)} total items for operation {tool_operation_id}")
+                for item in all_items:
+                    logger.info(f"Item {item.get('_id')}: state={item.get('state')}, status={item.get('status')}")
+                
                 logger.error(f"No executable items found for operation {tool_operation_id}")
                 return False
 

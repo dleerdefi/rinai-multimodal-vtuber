@@ -1,4 +1,4 @@
-from typing import Dict, Optional, Any, List
+from typing import Dict, Optional, Any, List, Union
 from datetime import datetime, UTC
 import logging
 from bson.objectid import ObjectId
@@ -422,17 +422,30 @@ class ToolStateManager:
         self,
         tool_operation_id: str,
         state: Optional[str] = None,
-        status: Optional[str] = None
+        status: Optional[Union[str, List[str]]] = None
     ) -> List[Dict]:
-        """Get items for an operation with optional state/status filters"""
+        """Get all items for a tool operation with optional state/status filter"""
         try:
             query = {"tool_operation_id": tool_operation_id}
+            
             if state:
                 query["state"] = state
+                
             if status:
-                query["status"] = status
+                if isinstance(status, list):
+                    query["status"] = {"$in": status}
+                else:
+                    query["status"] = status
+                    
+            # Log the query for debugging
+            logger.info(f"Querying items with: {query}")
             
-            return await self.db.tool_items.find(query).to_list(None)
+            cursor = self.db.tool_items.find(query)
+            items = await cursor.to_list(length=None)
+            
+            logger.info(f"Found {len(items)} items matching query")
+            return items
+            
         except Exception as e:
             logger.error(f"Error getting operation items: {e}")
             return []
