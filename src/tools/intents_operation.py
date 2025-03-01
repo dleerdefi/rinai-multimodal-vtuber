@@ -122,7 +122,7 @@ class IntentsTool(BaseTool):
             return self.approval_manager.analyzer.create_error_response(str(e))
 
     async def _analyze_command(self, command: str) -> Dict:
-        """Analyze command and setup initial monitoring for token operations"""
+        """Analyze command and setup initial monitoring for limit order"""
         try:
             logger.info(f"Starting command analysis for: {command}")
             
@@ -134,38 +134,12 @@ class IntentsTool(BaseTool):
             tool_operation_id = str(operation['_id'])
             
             # Get LLM analysis
-            prompt = f"""You are a blockchain intents analyzer. Determine the specific token operation requested.
+            prompt = f"""You are a blockchain intents analyzer. Determine the limit order parameters.
 
 Command: "{command}"
 
-Available token operations: 
-1. deposit: Only deposit tokens into intents.near contract
-   Parameters: 
-   - topic: what to deposit (e.g., NEAR, USDC)
-   - token_symbol: token to deposit (e.g., NEAR, USDC)
-   - amount: amount to deposit
-
-2. withdraw: Only withdraw tokens from intents.near contract
-   Parameters: 
-   - topic: what to withdraw (e.g., NEAR, USDC)
-   - token_symbol: token to withdraw (e.g., NEAR, USDC)
-   - amount: amount to withdraw
-   - destination_address: address to withdraw to (optional, defaults to user's address)
-   - destination_chain: chain to withdraw to (optional, defaults to "near")
-
-3. swap: Swap one token for another immediately at quoted price
-   Parameters: 
+Required parameters for limit order:
    - topic: what to swap (e.g., NEAR to USDC, USDC to NEAR)
-   - from_token: token to swap from (e.g., NEAR, USDC)
-   - from_amount: amount to swap
-   - to_token: token to swap to (e.g., NEAR, USDC)
-   - to_chain: chain for the output token (optional, defaults to "near")
-   - slippage: slippage tolerance percentage (optional, defaults to 0.5)
-
-4. limit_order: Create a limit order to swap tokens when price conditions are met
-   Parameters: 
-   - topic: what to swap (e.g., NEAR to USDC, USDC to NEAR)
-   - item_count: number of swaps to perform
    - from_token: token to swap from (e.g., NEAR, USDC)
    - from_amount: amount to swap
    - to_token: token to swap to (e.g., NEAR, USDC)
@@ -185,17 +159,19 @@ Instructions:
 Example response format:
 {{
     "tools_needed": [{{
-        "tool_type": "intents",
-        "operation_type": "limit_order",
+        "tool_name": "intents",
+        "action": "limit_order",
         "parameters": {{
             "topic": "NEAR to USDC",
             "from_token": "NEAR",
             "from_amount": 5.0,
             "to_token": "USDC",
-            "min_price": 3.0,
+            "target_price_usd": 3.0,
             "to_chain": "eth",
             "expiration_hours": 24,
-            "slippage": 0.5
+            "slippage": 0.5,
+            "destination_address": "0x1234567890123456789012345678901234567890", # optional
+            "destination_chain": "eth" # optional
         }},
         "priority": 1
     }}],
@@ -249,271 +225,140 @@ Example response format:
                 logger.error(f"Error processing LLM response: {e}")
                 raise
             
-            # For limit orders, set up monitoring parameters
-            if content_type == "limit_order":
-                # Calculate expiration timestamp
-                expiration_hours = params.get("expiration_hours", 24)
-                expiration_timestamp = int((datetime.now(UTC) + timedelta(hours=expiration_hours)).timestamp())
-                
-                # Calculate min_amount_out based on min_price and from_amount
-                min_amount_out = params.get("from_amount", 0) * params.get("min_price", 0)
-                
-                # Set up monitoring parameters
-                monitoring_params = {
-                    "check_interval_seconds": 60,
-                    "last_checked_timestamp": int(datetime.now(UTC).timestamp()),
-                    "best_price_seen": 0,
-                    "expiration_timestamp": expiration_timestamp,
-                    "max_checks": 1000  # Arbitrary limit to prevent infinite checking
-                }
-                
-                # Create schedule for monitoring service
-                schedule_id = await self.schedule_manager.initialize_schedule(
-                    tool_operation_id=tool_operation_id,
-                    schedule_info={
-                        "schedule_type": "monitoring",
-                        "operation_type": content_type,
-                        "total_items": 1,  # Default to 1 trade
-                        "monitoring_params": monitoring_params
-                    },
-                    content_type=self.registry.content_type.value,
-                    session_id=self.deps.session_id
-                )
-                
-                # Update operation with command info and schedule info
-                await self.tool_state_manager.update_operation(
-                    session_id=self.deps.session_id,
-                    tool_operation_id=tool_operation_id,
-                    input_data={
-                        "command_info": {
-                            "operation_type": content_type,
-                            "parameters": params,
-                            "monitoring_params": monitoring_params,
-                            "topic": f"{params.get('from_token')} to {params.get('to_token')} at {params.get('min_price')}"
-                        },
-                        "schedule_id": schedule_id
-                    },
-                    metadata={
-                        "schedule_state": ScheduleState.PENDING.value,
-                        "schedule_id": schedule_id,
-                        "operation_type": content_type
-                    }
-                )
-                
-                return {
-                    "schedule_id": schedule_id,
-                    "tool_operation_id": tool_operation_id,
-                    "operation_type": content_type,
-                    "parameters": params,
-                    "monitoring_params": monitoring_params,
-                    "topic": f"{params.get('from_token')} to {params.get('to_token')} at {params.get('min_price')}"
-                }
+            # Set up monitoring parameters
+            monitoring_params = {
+                "check_interval_seconds": 60,
+                "last_checked_timestamp": int(datetime.now(UTC).timestamp()),
+                "best_price_seen": 0,
+                "expiration_timestamp": int((datetime.now(UTC) + timedelta(hours=params.get("expiration_hours", 24))).timestamp()),
+                "max_checks": 1000
+            }
             
-            # For other operations (deposit, withdraw, swap)
-            else:
-                # Update operation with command info - no scheduling needed
-                await self.tool_state_manager.update_operation(
-                    session_id=self.deps.session_id,
-                    tool_operation_id=tool_operation_id,
-                    input_data={
-                        "command_info": {
-                            "operation_type": content_type,
-                            "parameters": params,
-                            "topic": f"{content_type} {params.get('token_symbol', params.get('from_token', 'tokens'))}"
-                        }
+            # Create schedule for monitoring service
+            schedule_id = await self.schedule_manager.initialize_schedule(
+                tool_operation_id=tool_operation_id,
+                schedule_info={
+                    "schedule_type": "monitoring",
+                    "operation_type": "limit_order",
+                    "total_items": 1,
+                    "monitoring_params": monitoring_params
+                },
+                content_type=self.registry.content_type.value,
+                session_id=self.deps.session_id
+            )
+            
+            # Create topic string for display and tracking
+            topic = f"Limit order: {params['from_token']} to {params['to_token']} at ${params['target_price_usd']}"
+            
+            # Update operation with all necessary info
+            await self.tool_state_manager.update_operation(
+                session_id=self.deps.session_id,
+                tool_operation_id=tool_operation_id,
+                input_data={
+                    "command_info": {
+                        "operation_type": "limit_order",
+                        "parameters": params,
+                        "monitoring_params": monitoring_params,
+                        "topic": topic
                     },
-                    metadata={
-                        "operation_type": content_type
-                    }
-                )
-                
-                return {
-                    "tool_operation_id": tool_operation_id,
-                    "operation_type": content_type,
-                    "parameters": params,
-                    "topic": f"{content_type} {params.get('token_symbol', params.get('from_token', 'tokens'))}"
+                    "schedule_id": schedule_id
+                },
+                metadata={
+                    "schedule_state": ScheduleState.PENDING.value,
+                    "schedule_id": schedule_id,
+                    "operation_type": "limit_order"
                 }
+            )
+            
+            # Return all required information for orchestrator and managers
+            return {
+                # Required by orchestrator
+                "tool_operation_id": tool_operation_id,
+                "topic": topic,
+                "item_count": 1,
+                "schedule_id": schedule_id,
+                
+                # Required by approval_manager
+                "tool_registry": {
+                    "requires_approval": True,
+                    "requires_scheduling": True,
+                    "content_type": self.registry.content_type.value,
+                    "tool_type": self.registry.tool_type.value
+                },
+                
+                # Required by schedule_manager
+                "schedule_info": {
+                    "schedule_type": "monitoring",
+                    "operation_type": "limit_order",
+                    "total_items": 1,
+                    "monitoring_params": monitoring_params
+                },
+                
+                # Limit order specific parameters
+                "parameters": {
+                    "price_oracle": {
+                        "symbol": params["from_token"],
+                        "target_price_usd": params["target_price_usd"]
+                    },
+                    "swap": {
+                        "from_token": params["from_token"],
+                        "from_amount": params["from_amount"],
+                        "to_token": params["to_token"],
+                        "chain_out": params.get("to_chain", "eth")
+                    },
+                    "withdraw": {
+                        "enabled": bool(params.get("destination_address")),
+                        "destination_address": params.get("destination_address"),
+                        "destination_chain": params.get("destination_chain", "eth")
+                    }
+                }
+            }
 
         except Exception as e:
-            logger.error(f"Error in Intents command analysis: {e}", exc_info=True)
+            logger.error(f"Error in limit order analysis: {e}", exc_info=True)
             raise
 
-    async def _generate_content(self, operation_info: Dict) -> Dict:
-        """Generate human-readable content for approval based on operation type"""
+    async def _generate_content(self, topic: str, count: int, schedule_id: str = None, tool_operation_id: str = None) -> Dict:
+        """Generate human-readable content for limit order approval"""
         try:
-            logger.info(f"Generating content for operation: {operation_info}")
+            logger.info(f"Generating limit order content for approval: {topic}")
             
-            # Get operation type and parameters
-            operation_type = operation_info.get("operation_type")
-            params = operation_info.get("parameters", {})
-            
-            # Get parent operation to access stored data
+            # Get parent operation to access stored parameters
             operation = await self.tool_state_manager.get_operation(self.deps.session_id)
             if not operation:
                 raise ValueError("No active operation found")
-
-            # Generate LLM description based on operation type
-            generated_content = await self._generate_llm_description(operation_type, params)
             
-            # Format content based on operation type
-            if operation_type == "deposit":
-                formatted_content = {
-                    "title": generated_content.get("title"),
-                    "description": generated_content.get("description"),
-                    "warnings": generated_content.get("warnings", []),
-                    "expected_outcome": generated_content.get("expected_outcome"),
-                    "operation_details": {
-                        "token_symbol": params.get("token_symbol"),
-                        "amount": params.get("amount"),
-                        "requires_wrap": params.get("token_symbol", "").upper() == "NEAR"
-                    }
-                }
-                
-            elif operation_type == "withdraw":
-                formatted_content = {
-                    "title": generated_content.get("title"),
-                    "description": generated_content.get("description"),
-                    "warnings": generated_content.get("warnings", []),
-                    "expected_outcome": generated_content.get("expected_outcome"),
-                    "operation_details": {
-                        "token_symbol": params.get("token_symbol"),
-                        "amount": params.get("amount"),
-                        "destination_chain": params.get("destination_chain", "near"),
-                        "destination_address": params.get("destination_address")
-                    }
-                }
-                
-            elif operation_type in ["swap", "limit_order"]:
-                # For swaps/limit orders, include quote information
-                quotes = operation.get("metadata", {}).get("quotes", [])
-                formatted_content = {
-                    "title": generated_content.get("title"),
-                    "description": generated_content.get("description"),
-                    "warnings": generated_content.get("warnings", []),
-                    "expected_outcome": generated_content.get("expected_outcome"),
-                    "operation_details": {
-                        "from_token": params.get("from_token"),
-                        "from_amount": params.get("from_amount"),
-                        "to_token": params.get("to_token"),
-                        "to_chain": params.get("to_chain", "near"),
-                        "quotes": quotes,
-                        "limit_price": params.get("limit_price") if operation_type == "limit_order" else None
-                    }
-                }
-
-            # Return formatted content for approval
-            return {
-                "success": True,
-                "content": formatted_content,
-                "tool_operation_id": operation_info["tool_operation_id"],
-                "operation_type": operation_type,
-                "requires_approval": True,
-                "schedule_id": operation.get("schedule_id")
-            }
+            # Get the parameters from _analyze_command
+            params = operation.get("input_data", {}).get("command_info", {}).get("parameters", {})
             
-        except Exception as e:
-            logger.error(f"Error generating content for approval: {e}", exc_info=True)
-            raise
+            # Generate description using LLM
+            prompt = f"""You are a cryptocurrency expert. Generate a detailed description for a limit order with the following parameters:
 
-    async def _generate_llm_description(self, operation_type: str, params: Dict) -> Dict:
-        """Generate human-readable description using LLM"""
-                prompt = f"""You are a cryptocurrency expert. Generate a detailed description for a deposit operation with the following details:
+Operation Details:
+- Swap {params['from_amount']} {params['from_token']} for {params['to_token']}
+- Target Price: ${params['target_price_usd']} per {params['from_token']}
+- Output Chain: {params.get('to_chain', 'eth')}
+- Destination: {params.get('destination_address', 'default wallet')} on {params.get('destination_chain', 'eth')}
+- Expires in: {params.get('expiration_hours', 24)} hours
 
-    - Operation: Deposit {amount} {token_symbol} to intents.near contract
-    - Current time: {datetime.now(UTC).strftime("%Y-%m-%d %H:%M:%S UTC")}
+Include:
+1. A clear title summarizing the limit order
+2. A detailed description of what will happen when executed
+3. Important warnings about market volatility and risks
+4. Expected outcome when price target is met
 
-    Include:
-    1. A clear title for the operation
-    2. A detailed description of what will happen
-    3. Any relevant warnings or considerations
-    4. Expected outcome
+Format the response as JSON:
+{{
+    "title": "Limit Order Summary",
+    "description": "Detailed description here...",
+    "warnings": ["Warning 1", "Warning 2"],
+    "expected_outcome": "Expected outcome description"
+}}"""
 
-    Format the response as JSON:
-    {{
-        "title": "Deposit {amount} {token_symbol}",
-        "description": "Detailed description here...",
-        "expected_outcome": "Expected outcome description"
-    }}"""
-
-            elif operation_type == "withdraw":
-                token_symbol = params.get("token_symbol")
-                amount = params.get("amount")
-                destination_chain = params.get("destination_chain", "near")
-                destination_address = params.get("destination_address", "your account")
-                
-                prompt = f"""You are a cryptocurrency expert. Generate a detailed description for a withdrawal operation with the following details:
-
-    - Operation: Withdraw {amount} {token_symbol} from intents.near contract to {destination_address} on {destination_chain} chain
-    - Current time: {datetime.now(UTC).strftime("%Y-%m-%d %H:%M:%S UTC")}
-
-    Include:
-    1. A clear title for the operation
-    2. A detailed description of what will happen
-    3. Any relevant warnings or considerations
-    4. Expected outcome
-
-    Format the response as JSON:
-    {{
-        "title": "Withdraw {amount} {token_symbol} to {destination_chain}",
-        "description": "Detailed description here...",
-        "warnings": ["Warning 1", "Warning 2"],
-        "expected_outcome": "Expected outcome description"
-    }}"""
-
-            elif operation_type == "swap" or operation_type == "limit_order":
-                from_token = params.get("from_token")
-                from_amount = params.get("from_amount")
-                to_token = params.get("to_token")
-                to_chain = params.get("to_chain", "near")
-                limit_price = params.get("limit_price")
-                
-                operation_name = "Limit Order" if limit_price else "Swap"
-                price_condition = f" when price reaches {limit_price} {to_token} per {from_token}" if limit_price else ""
-                
-                prompt = f"""You are a cryptocurrency expert. Generate a detailed description for a {operation_name.lower()} operation with the following details:
-
-    - Operation: {operation_name} {from_amount} {from_token} for {to_token} on {to_chain} chain{price_condition}
-    - Current time: {datetime.now(UTC).strftime("%Y-%m-%d %H:%M:%S UTC")}
-
-    Include:
-    1. A clear title for the operation
-    2. A detailed description of what will happen
-    3. Any relevant warnings or considerations
-    4. Expected outcome
-
-    Format the response as JSON:
-    {{
-        "title": "{operation_name} {from_amount} {from_token} for {to_token}",
-        "description": "Detailed description here...",
-        "warnings": ["Warning 1", "Warning 2"],
-        "expected_outcome": "Expected outcome description"
-    }}"""
-
-            else:
-                prompt = f"""You are a cryptocurrency expert. Generate a detailed description for a {operation_type} operation with the following details:
-
-    - Operation parameters: {json.dumps(params)}
-    - Current time: {datetime.now(UTC).strftime("%Y-%m-%d %H:%M:%S UTC")}
-
-    Include:
-    1. A clear title for the operation
-    2. A detailed description of what will happen
-    3. Any relevant warnings or considerations
-    4. Expected outcome
-
-    Format the response as JSON:
-    {{
-        "title": "Operation title",
-        "description": "Detailed description here...",
-        "warnings": ["Warning 1", "Warning 2"],
-        "expected_outcome": "Expected outcome description"
-    }}"""
-
-            # Call LLM to generate content
             messages = [
                 {
                     "role": "system",
-                    "content": "You are a cryptocurrency expert. Generate detailed descriptions for crypto operations in JSON format."
+                    "content": "You are a cryptocurrency expert. Generate clear, detailed descriptions for limit orders."
                 },
                 {
                     "role": "user",
@@ -521,7 +366,7 @@ Example response format:
                 }
             ]
 
-            logger.info(f"Sending generation prompt to LLM: {messages}")
+            # Get LLM response
             response = await self.llm_service.get_response(
                 prompt=messages,
                 model_type=ModelType.GROQ_LLAMA_3_3_70B,
@@ -531,13 +376,75 @@ Example response format:
                 }
             )
             
-            logger.info(f"Raw LLM response: {response}")
+            # Parse LLM response
+            generated_content = json.loads(response)
             
-            # Strip markdown code blocks if present
-            response = response.strip()
-            if response.startswith('```') and response.endswith('```'):
-                # Remove the first line (```json) and the last line (```)
-                response = '\n'.join(response.split('\n')[1:-1])
+            # Create tool item for approval
+            tool_item = {
+                "session_id": self.deps.session_id,
+                "tool_operation_id": tool_operation_id,
+                "schedule_id": schedule_id,
+                "content_type": self.registry.content_type.value,
+                "state": ToolOperationState.COLLECTING.value,
+                "status": OperationStatus.PENDING.value,
+                "content": {
+                    "title": generated_content["title"],
+                    "description": generated_content["description"],
+                    "warnings": generated_content["warnings"],
+                    "expected_outcome": generated_content["expected_outcome"],
+                    "operation_details": {
+                        "from_token": params["from_token"],
+                        "from_amount": params["from_amount"],
+                        "to_token": params["to_token"],
+                        "target_price_usd": params["target_price_usd"],
+                        "to_chain": params.get("to_chain", "eth"),
+                        "destination_address": params.get("destination_address"),
+                        "destination_chain": params.get("destination_chain", "eth"),
+                        "expiration_hours": params.get("expiration_hours", 24)
+                    }
+                },
+                "metadata": {
+                    "generated_at": datetime.now(UTC).isoformat(),
+                    "monitoring_params": operation.get("input_data", {}).get("command_info", {}).get("monitoring_params", {}),
+                    "state_history": [{
+                        "state": ToolOperationState.COLLECTING.value,
+                        "status": OperationStatus.PENDING.value,
+                        "timestamp": datetime.now(UTC).isoformat()
+                    }]
+                }
+            }
+            
+            # Save item
+            result = await self.db.tool_items.insert_one(tool_item)
+            item_id = str(result.inserted_id)
+            tool_item["_id"] = item_id
+            
+            # Update operation with the new item
+            await self.tool_state_manager.update_operation(
+                session_id=self.deps.session_id,
+                tool_operation_id=tool_operation_id,
+                content_updates={
+                    "pending_items": [item_id]
+                },
+                metadata={
+                    "item_states": {
+                        item_id: {
+                            "state": ToolOperationState.COLLECTING.value,
+                            "status": OperationStatus.PENDING.value
+                        }
+                    }
+                }
+            )
+
+            return {
+                "items": [tool_item],
+                "schedule_id": schedule_id,
+                "tool_operation_id": tool_operation_id
+            }
+
+        except Exception as e:
+            logger.error(f"Error generating limit order content: {e}", exc_info=True)
+            raise
 
     async def _handle_deposit(self, command_info: Dict) -> Dict:
         """Handle deposit operation"""
