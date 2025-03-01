@@ -52,6 +52,18 @@ class ScheduleManager:
             (ScheduleState.ACTIVE, ScheduleAction.COMPLETE): ScheduleState.COMPLETED
         }
 
+        # Add monitoring service reference
+        self.monitoring_service = None
+        self.schedule_service = None
+
+    async def inject_services(self, schedule_service=None, monitoring_service=None):
+        """Inject service dependencies"""
+        if schedule_service:
+            self.schedule_service = schedule_service
+        
+        if monitoring_service:
+            self.monitoring_service = monitoring_service
+
     async def schedule_approved_items(
         self,
         tool_operation_id: str,
@@ -268,70 +280,114 @@ class ScheduleManager:
             # 1. Verify items are in EXECUTING state
             items = await self.tool_state_manager.get_operation_items(
                 tool_operation_id=tool_operation_id,
-                state=ToolOperationState.EXECUTING.value,  # Items must be in EXECUTING state
-                status=[                                   # Status can be either:
-                    OperationStatus.APPROVED.value,        # - APPROVED (from approval flow)
-                    OperationStatus.PENDING.value          # - PENDING (from direct/one-shot flow)
-                ]
+                state=ToolOperationState.EXECUTING.value,
+                status={"$in": [OperationStatus.APPROVED.value, OperationStatus.PENDING.value]}
             )
             
-            # Log the query parameters and results for debugging
             logger.info(f"Looking for items with tool_operation_id={tool_operation_id}, state=EXECUTING, status=[APPROVED, PENDING]")
             logger.info(f"Found {len(items)} items matching criteria")
             
             if not items:
-                # Try a more general query to see what items exist
-                all_items = await self.tool_state_manager.get_operation_items(
-                    tool_operation_id=tool_operation_id
-                )
-                logger.info(f"Found {len(all_items)} total items for operation {tool_operation_id}")
-                for item in all_items:
-                    logger.info(f"Item {item.get('_id')}: state={item.get('state')}, status={item.get('status')}")
-                
                 logger.error(f"No executable items found for operation {tool_operation_id}")
                 return False
 
-            # 2. Update schedule state - FIX: Use schedule_state instead of state
-            await self.db.update_scheduled_operation(
-                schedule_id=schedule_id,
-                state=ScheduleState.ACTIVE.value,  # This sets the 'state' field
-                schedule_state=ScheduleState.ACTIVE.value,  # Add this line to set 'schedule_state' field
-                status=OperationStatus.SCHEDULED.value,
-                metadata={
-                    "state_history": {
-                        "schedule_state": ScheduleState.ACTIVE.value,
-                        "reason": "Schedule activated for execution",
-                        "timestamp": datetime.now(UTC).isoformat()
-                    },
-                    "execution_status": {
+            # 2. Get schedule info
+            schedule = await self.db.get_scheduled_operation(schedule_id)
+            if not schedule:
+                logger.error(f"Schedule {schedule_id} not found")
+                return False
+            
+            # 3. Calculate start time and interval
+            current_time = datetime.now(UTC)
+            schedule_info = schedule.get("schedule_info", {})
+            
+            # Get start time, ensure it's in the future
+            start_time_str = schedule_info.get("start_time")
+            if start_time_str:
+                try:
+                    start_time = datetime.fromisoformat(start_time_str.replace('Z', '+00:00'))
+                    # If start time is in the past, set to 1 minute from now
+                    if start_time <= current_time:
+                        logger.warning(f"Start time {start_time} is in the past, adjusting to future")
+                        start_time = current_time + timedelta(minutes=1)
+                except (ValueError, TypeError):
+                    logger.warning(f"Invalid start time format: {start_time_str}, using current time + 1 minute")
+                    start_time = current_time + timedelta(minutes=1)
+            else:
+                # No start time provided, set to 1 minute from now
+                start_time = current_time + timedelta(minutes=1)
+                
+            # Get interval between items
+            interval_minutes = schedule_info.get("interval_minutes", 2.5)
+            if not isinstance(interval_minutes, (int, float)) or interval_minutes <= 0:
+                logger.warning(f"Invalid interval: {interval_minutes}, using default of 2.5 minutes")
+                interval_minutes = 2.5
+                
+            logger.info(f"Scheduling items starting at {start_time.isoformat()} with {interval_minutes} minute intervals")
+            
+            # 4. Update each item with scheduled time
+            for i, item in enumerate(items):
+                scheduled_time = start_time + timedelta(minutes=i * interval_minutes)
+                
+                await self.db.tool_items.update_one(
+                    {"_id": item["_id"]},
+                    {"$set": {
+                        "status": OperationStatus.SCHEDULED.value,
+                        "scheduled_time": scheduled_time,
+                        "execution_order": i + 1,
+                        "metadata.schedule_state": ScheduleState.ACTIVE.value,
+                        "metadata.schedule_state_history": [{
+                            "state": ScheduleState.ACTIVE.value,
+                            "timestamp": datetime.now(UTC).isoformat(),
+                            "reason": "Schedule activated"
+                        }]
+                    }}
+                )
+                
+                logger.info(f"Scheduled item {item['_id']} for execution at {scheduled_time.isoformat()}")
+
+            # 5. Fix state history format - ensure it's an array
+            # First check if state_history exists and is an array
+            schedule_doc = await self.db.scheduled_operations.find_one({"_id": ObjectId(schedule_id)})
+            if "state_history" not in schedule_doc or not isinstance(schedule_doc["state_history"], list):
+                # Initialize as empty array if not exists or not an array
+                await self.db.scheduled_operations.update_one(
+                    {"_id": ObjectId(schedule_id)},
+                    {"$set": {"state_history": []}}
+                )
+            
+            # 6. Add new state history entry
+            state_entry = {
+                "state": ScheduleState.ACTIVE.value,
+                "timestamp": datetime.now(UTC).isoformat(),
+                "reason": "Schedule activated for execution"
+            }
+            
+            await self.db.scheduled_operations.update_one(
+                {"_id": ObjectId(schedule_id)},
+                {"$push": {"state_history": state_entry}}
+            )
+            
+            # 7. Update schedule state and status
+            await self.db.scheduled_operations.update_one(
+                {"_id": ObjectId(schedule_id)},
+                {"$set": {
+                    "schedule_state": ScheduleState.ACTIVE.value,
+                    "state": "active",
+                    "status": "scheduled",
+                    "metadata.execution_status": {
                         "pending": len(items),
                         "completed": 0,
                         "failed": 0
-                    }
-                }
-            )
-
-            # 3. Update item status and add schedule state tracking
-            await self.db.tool_items.update_many(
-                {
-                    "tool_operation_id": tool_operation_id,
-                    "_id": {"$in": [ObjectId(item["_id"]) for item in items]}
-                },
-                {"$set": {
-                    "status": OperationStatus.SCHEDULED.value,
-                    "metadata.schedule_state": ScheduleState.ACTIVE.value,  # Add schedule state tracking
-                    "metadata.schedule_state_history": [{
-                        "state": ScheduleState.ACTIVE.value,
-                        "timestamp": datetime.now(UTC).isoformat(),
-                        "reason": "Schedule activated"
-                    }]
+                    },
+                    "metadata.last_modified": datetime.now(UTC).isoformat()
                 }}
             )
 
             return True
 
         except Exception as e:
-            logger.error(f"Error activating schedule: {e}")
+            logger.error(f"Error activating schedule: {e}", exc_info=True)
             return False
 
     async def pause_schedule(self, schedule_id: str) -> bool:
@@ -520,22 +576,26 @@ class ScheduleManager:
     async def execute_operation(self, operation: Dict) -> Dict:
         """Execute operation using appropriate tool from registry"""
         try:
-            content_type = operation.get('metadata', {}).get('content_type')
+            content_type = operation.get('content_type')
             tool = self.tool_registry.get(content_type)
             
             if not tool:
                 raise ValueError(f"No tool found for content type: {content_type}")
 
-            result = await tool.execute_scheduled_operation(operation)
-            
-            if result.get('success'):
-                await self._update_execution_status(operation['_id'], result)
+            # Check if the tool has a custom adapter
+            if hasattr(tool, 'adapter') and hasattr(tool.adapter, 'execute_scheduled_operation'):
+                result = await tool.adapter.execute_scheduled_operation(operation)
+            # Check if the tool implements execute_scheduled_operation
+            elif hasattr(tool, 'execute_scheduled_operation'):
+                result = await tool.execute_scheduled_operation(operation)
+            # Fall back to the standard execute method
+            elif hasattr(tool, 'execute'):
+                result = await tool.execute(operation)
             else:
-                await self._handle_execution_error(operation['_id'], result.get('error'))
-
+                raise ValueError(f"Tool {type(tool).__name__} has no execution method")
+            
             return result
 
         except Exception as e:
             logger.error(f"Error executing operation: {e}")
-            await self._handle_execution_error(operation['_id'], str(e))
             return {'success': False, 'error': str(e)} 

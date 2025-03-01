@@ -101,3 +101,7 @@ weather_cache.sqlite
 src/db/*
 !src/db/db_schema.py
 !src/db/mongo_manager.py
+
+logs/*
+*.log
+*.csv

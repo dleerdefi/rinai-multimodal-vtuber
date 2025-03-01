@@ -228,6 +228,7 @@ class Orchestrator:
         )
 
     async def handle_tool_operation(self, message: str, session_id: str, tool_type: Optional[str] = None) -> Dict:
+        """Handle tool operations based on current state"""
         try:
             logger.info(f"Handling tool operation for session: {session_id}")
             
@@ -355,9 +356,56 @@ class Orchestrator:
                 )
                 raise
 
+            # If we get to this point, check if the operation is in a terminal state
+            # and ensure we return the proper status
+            if operation and operation.get("state") in ["completed", "cancelled", "error"]:
+                # Map operation state to response status for proper state transitions
+                status_mapping = {
+                    "completed": "completed",
+                    "cancelled": "cancelled", 
+                    "error": "exit"  # Map error to exit for state transition
+                }
+                
+                # Ensure the response includes the status for state transitions
+                return {
+                    "response": result,
+                    "status": status_mapping.get(operation.get("state"), "ongoing"),
+                    "state": operation.get("state"),
+                    "tool_type": tool_type
+                }
+            
+            # For ongoing operations
+            return {
+                "response": result,
+                "status": "ongoing",
+                "state": operation.get("state") if operation else "unknown",
+                "tool_type": tool_type
+            }
+
         except Exception as e:
             logger.error(f"Error in handle_tool_operation: {e}")
-            raise
+            
+            # Try to end the operation with error status
+            try:
+                operation = await self.tool_state_manager.get_operation(session_id)
+                if operation:
+                    await self.tool_state_manager.end_operation(
+                        session_id=session_id,
+                        success=False,
+                        api_response={"error": str(e)},
+                        step="error"
+                    )
+                    logger.info(f"Operation {operation['_id']} marked as error")
+            except Exception as end_error:
+                logger.error(f"Failed to end operation with error: {end_error}")
+            
+            # Ensure errors also trigger state transition by returning exit status
+            return {
+                "error": str(e),
+                "response": f"I encountered an error: {str(e)}",
+                "status": "exit",
+                "state": "error"
+            }
 
     async def _handle_scheduled_operation(self, operation: Dict, message: str) -> Dict:
         """Initialize and activate a schedule for operation"""
@@ -497,6 +545,13 @@ class Orchestrator:
                 if approval_result.get("status") == OperationStatus.APPROVED.value:
                     logger.info(f"Approval successful for operation {operation['_id']}")
                     
+                    # Update step to "scheduling"
+                    await self.tool_state_manager.update_operation(
+                        session_id=operation['session_id'],
+                        tool_operation_id=str(operation['_id']),
+                        step="scheduling"  # Add step update
+                    )
+                    
                     # Check if scheduling is required
                     if tool.registry.requires_scheduling:
                         logger.info(f"Tool requires scheduling, proceeding to schedule flow for operation {operation['_id']}")
@@ -526,24 +581,34 @@ class Orchestrator:
                         if activation_result:
                             logger.info(f"Schedule {schedule_id} activated successfully")
                             
-                            # Update operation to COMPLETED state
-                            await self.tool_state_manager.end_operation(
-                                session_id=operation['session_id'],
-                                success=True,
-                                api_response={"message": "Schedule activated successfully"}
-                            )
-                            
                             # Get topic and count for user-friendly response
-                            topic = operation.get('input_data', {}).get('command_info', {}).get('topic', 'your content')
+                            topic = operation.get('input_data', {}).get('topic', 'your content')
                             count = len(await self.tool_state_manager.get_operation_items(
                                 tool_operation_id=str(operation['_id']),
                                 state=ToolOperationState.EXECUTING.value
                             ))
                             
+                            # Use end_operation to properly mark the operation as complete
+                            # Make sure to include the tool_operation_id
+                            updated_operation = await self.tool_state_manager.end_operation(
+                                session_id=operation['session_id'],
+                                tool_operation_id=str(operation['_id']),  # Add this parameter
+                                success=True,
+                                api_response={
+                                    "message": "Schedule activated successfully",
+                                    "content_type": tool.registry.content_type.value  # Add content_type
+                                },
+                                step="completed"
+                            )
+                            
+                            logger.info(f"Operation {operation['_id']} marked as completed")
+                            
+                            # Return with "completed" status to trigger state transition
                             return {
-                                "status": "success",
+                                "status": "completed",  # Signal completion for state transition
                                 "response": f"Great! I've scheduled {count} tweets about {topic}. They will be posted according to your schedule.",
-                                "requires_tts": True
+                                "requires_tts": True,
+                                "state": ToolOperationState.COMPLETED.value  # Include the state
                             }
                         else:
                             logger.error(f"Failed to activate schedule {schedule_id}")
@@ -552,8 +617,8 @@ class Orchestrator:
                                 "response": "I was unable to activate the schedule. Please try again."
                             }
                 
-                # If not scheduled or approval wasn't successful, just return the approval result
-                return approval_result
+                    # If not scheduled or approval wasn't successful, just return the approval result
+                    return approval_result
 
             # Handle other states...
             elif current_state == ToolOperationState.EXECUTING.value:
@@ -584,35 +649,40 @@ class Orchestrator:
                             if activation_result:
                                 logger.info(f"Schedule {schedule_id} activated successfully")
                                 
-                                # Update operation to COMPLETED state
-                                await self.tool_state_manager.end_operation(
+                                # Use end_operation to properly mark the operation as complete
+                                updated_operation = await self.tool_state_manager.end_operation(
                                     session_id=operation['session_id'],
                                     success=True,
-                                    api_response={"message": "Schedule activated successfully"}
+                                    api_response={"message": "Schedule activated successfully"},
+                                    step="completed"
                                 )
                                 
+                                logger.info(f"Operation {operation['_id']} marked as completed")
+                                
                                 # Get topic and count for user-friendly response
-                                topic = operation.get('input_data', {}).get('command_info', {}).get('topic', 'your content')
+                                topic = operation.get('input_data', {}).get('topic', 'your content')
                                 count = len(await self.tool_state_manager.get_operation_items(
                                     tool_operation_id=str(operation['_id']),
                                     state=ToolOperationState.EXECUTING.value
                                 ))
                                 
+                                # Return with "completed" status to trigger state transition
                                 return {
-                                    "status": "success",
+                                    "status": "completed",  # Signal completion for state transition
                                     "response": f"Great! I've scheduled {count} tweets about {topic}. They will be posted according to your schedule.",
-                                    "requires_tts": True
+                                    "requires_tts": True,
+                                    "state": ToolOperationState.COMPLETED.value  # Include the state
                                 }
                         
                         elif schedule:
                             return {
-                                "status": "success",
+                                "status": "ongoing",  # Still in progress
                                 "response": f"Your content is scheduled and will be posted according to the schedule. Current status: {schedule.get('state')}",
                                 "requires_tts": True
                             }
                 
                 return {
-                    "status": "success",
+                    "status": "ongoing",
                     "response": "Your content is being processed.",
                     "requires_tts": True
                 }
@@ -622,14 +692,28 @@ class Orchestrator:
                                  ToolOperationState.ERROR.value,
                                  ToolOperationState.CANCELLED.value]:
                 logger.info(f"Operation {operation['_id']} in terminal state: {current_state}")
+                
+                # For terminal states, return the appropriate status to trigger state transition
+                status_mapping = {
+                    ToolOperationState.COMPLETED.value: "completed",
+                    ToolOperationState.ERROR.value: "error",
+                    ToolOperationState.CANCELLED.value: "cancelled"
+                }
+                
                 return {
                     "response": "This operation has already been completed or cancelled.",
                     "state": current_state,
-                    "status": operation.get('status', OperationStatus.PENDING.value)
+                    "status": status_mapping.get(current_state, "exit")  # Map to appropriate status for state transition
                 }
 
             raise ValueError(f"Unexpected state/status combination: {current_state}/{operation.get('status')}")
 
         except Exception as e:
             logger.error(f"Error in _handle_ongoing_operation: {e}")
-            raise
+            # Ensure errors also trigger state transition
+            return {
+                "error": str(e),
+                "response": f"I encountered an error: {str(e)}",
+                "status": "exit",  # Signal exit on error
+                "state": "error"
+            }

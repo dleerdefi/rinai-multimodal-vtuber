@@ -220,3 +220,11 @@ class ToolOperation(BaseModel):
     def to_dict(self) -> Dict:
         """Convert to dictionary for database storage"""
         return self.dict(exclude_none=True)
+
+class SchedulableToolInterface(ABC):
+    """Interface for tools that can be scheduled"""
+    
+    @abstractmethod
+    async def execute_scheduled_operation(self, operation: Dict[str, Any]) -> Dict[str, Any]:
+        """Execute a scheduled operation"""
+        pass

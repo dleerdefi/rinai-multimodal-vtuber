@@ -57,41 +57,22 @@ There are {len(current_items)} items to analyze. Return ONLY valid JSON in this 
             analysis = json.loads(response)
             logger.info(f"LLM analysis result: {analysis}")
             
-            # Convert to 0-based indices
-            approved_indices = [i-1 for i in analysis.get("approved_indices", [])]
-            regenerate_indices = [i-1 for i in analysis.get("regenerate_indices", [])]
+            # Ensure the indices are correctly extracted and logged
+            if 'approved_indices' in analysis:
+                # Make sure they're integers
+                analysis['approved_indices'] = [int(idx) for idx in analysis['approved_indices']]
             
-            logger.info(f"Processing approval with {len(approved_indices)} approved and {len(regenerate_indices)} regenerate items")
+            if 'regenerate_indices' in analysis:
+                # Make sure they're integers
+                analysis['regenerate_indices'] = [int(idx) for idx in analysis['regenerate_indices']]
             
-            # Validate indices are within bounds
-            approved_indices = [i for i in approved_indices if 0 <= i < len(current_items)]
-            regenerate_indices = [i for i in regenerate_indices if 0 <= i < len(current_items)]
+            # Log the processed analysis
+            logger.info(f"Processed analysis: {analysis}")
             
-            return {
-                "action": analysis.get("action", "error"),
-                "indices": approved_indices,
-                "items": current_items,
-                "regenerate_indices": regenerate_indices,
-                "feedback": analysis.get("feedback", ""),
-                "metadata": {
-                    "approval_type": analysis.get("action"),
-                    "analyzed_at": datetime.now(UTC).isoformat(),
-                    "original_response": user_response,
-                    "item_count": len(current_items),
-                    "approved_count": len(approved_indices),
-                    "regenerate_count": len(regenerate_indices)
-                }
-            }
+            return analysis
         except Exception as e:
             logger.error(f"Error analyzing approval response: {e}")
-            return {
-                "action": "error",
-                "error": str(e),
-                "metadata": {
-                    "analyzed_at": datetime.now(UTC).isoformat(),
-                    "original_response": user_response
-                }
-            }
+            return {"action": "error", "feedback": str(e)}
 
     def _build_analysis_prompt(self, user_response: str, current_items: List[Dict]) -> str:
         """Build prompt for analyzing user response"""

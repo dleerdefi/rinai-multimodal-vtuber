@@ -97,10 +97,13 @@ class AgentStateManager:
                     if isinstance(result, dict):
                         # Only transition state if explicitly completed/cancelled
                         operation_status = result.get("status", "").lower()
-                        if operation_status in ["completed", "cancelled"]:
-                            action = AgentAction.COMPLETE_TOOL if operation_status == "completed" else AgentAction.CANCEL_TOOL
+                        
+                        # Check for both "completed" and "cancelled" status, as well as "exit" status
+                        if operation_status in ["completed", "cancelled", "exit"]:
+                            action = AgentAction.COMPLETE_TOOL if operation_status in ["completed", "exit"] else AgentAction.CANCEL_TOOL
                             await self._transition_state(action, f"Operation {operation_status}")
                             self._current_tool_type = None
+                            logger.info(f"Transitioned to {self.current_state} after operation {operation_status}")
                         
                         return {
                             **result,

@@ -26,6 +26,13 @@ logging.basicConfig(
     force=True
 )
 
+# Configure pytest-asyncio
+pytest_plugins = ["pytest_asyncio"]
+
+# Set default asyncio mode to auto
+def pytest_configure(config):
+    config.option.asyncio_mode = "auto"
+
 @pytest.fixture(scope="session")
 def event_loop():
     """Create an instance of the default event loop for each test case."""

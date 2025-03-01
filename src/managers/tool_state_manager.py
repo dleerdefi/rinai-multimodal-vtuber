@@ -229,51 +229,55 @@ class ToolStateManager:
     async def end_operation(
         self,
         session_id: str,
+        tool_operation_id: Optional[str] = None,
         success: bool = True,
-        api_response: Optional[Dict] = None
-    ) -> bool:
-        """End tool operation with appropriate state/status based on operation type"""
+        api_response: Optional[Dict] = None,
+        step: str = "completed"
+    ) -> Dict:
+        """End an operation with success or failure"""
         try:
-            operation = await self.get_operation(session_id)
-            if not operation:
-                return False
-
-            # Get operation characteristics
-            requires_approval = operation.get("metadata", {}).get("requires_approval", False)
-            requires_scheduling = operation.get("metadata", {}).get("requires_scheduling", False)
-            current_state = operation.get("state")
-            current_status = operation.get("status")
-
-            # Determine final states based on operation type and success
-            final_state = self._determine_final_state(
-                success=success,
-                current_state=current_state
+            # Get current operation if tool_operation_id not provided
+            if not tool_operation_id:
+                operation = await self.get_operation(session_id)
+                if not operation:
+                    raise ValueError(f"No active operation found for session {session_id}")
+                tool_operation_id = str(operation["_id"])
+            else:
+                # Get operation by ID if provided
+                operation = await self.get_operation_by_id(tool_operation_id)
+                if not operation:
+                    raise ValueError(f"No operation found with ID {tool_operation_id}")
+            
+            logger.info(f"Ending operation {tool_operation_id} with success={success}")
+            
+            # Update operation state
+            update_data = {
+                "state": ToolOperationState.COMPLETED.value if success else ToolOperationState.ERROR.value,
+                "step": step,
+                "metadata.completion_time": datetime.now(UTC).isoformat(),
+                "metadata.final_status": "success" if success else "error"
+            }
+            
+            if api_response:
+                update_data["output_data.api_response"] = api_response
+                
+                # Ensure content_type is set if provided in api_response
+                if api_response.get("content_type"):
+                    update_data["metadata.content_type"] = api_response.get("content_type")
+            
+            # Update operation
+            await self.db.tool_operations.update_one(
+                {"_id": ObjectId(tool_operation_id)},
+                {"$set": update_data}
             )
-
-            final_status = self._determine_final_status(
-                success=success,
-                requires_scheduling=requires_scheduling,
-                current_status=current_status
-            )
-
-            # Update operation with final state/status
-            return await self.update_operation(
-                session_id=session_id,
-                tool_operation_id=str(operation["_id"]),
-                state=final_state,
-                output_data={
-                    "status": final_status,
-                    "api_response": api_response
-                },
-                metadata={
-                    "completion_time": datetime.now(UTC).isoformat(),
-                    "final_status": "success" if success else "error"
-                }
-            )
-
+            
+            # Get updated operation
+            updated_operation = await self.get_operation_by_id(tool_operation_id)
+            return updated_operation
+            
         except Exception as e:
             logger.error(f"Error ending operation: {e}")
-            return False
+            raise
 
     def _determine_final_state(self, success: bool, current_state: str) -> str:
         """Determine final ToolOperationState based on success and current state"""

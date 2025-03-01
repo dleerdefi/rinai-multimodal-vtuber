@@ -232,6 +232,31 @@ class TwitterCommandAnalysis(BaseModel):
 class TweetGenerationResponse(BaseModel):
     items: List[Dict[str, Any]]
 
+class LimitOrderParams(ToolItemParams):
+    """Limit order-specific parameters"""
+    custom_params: Dict[str, Any] = {
+        # Order Parameters
+        "from_token": str,
+        "from_amount": float,
+        "to_token": str,
+        "to_chain": str,
+        "min_price": float,  # Minimum price in to_token per from_token
+        "min_amount_out": float,  # Calculated min amount based on price
+        
+        # Execution Parameters
+        "slippage": float,
+        "expiration_timestamp": Optional[int],  # Unix timestamp when order expires
+        
+        # Monitoring Parameters
+        "check_interval_seconds": int,  # How often to check price
+        "last_checked_timestamp": Optional[int],
+        "best_quote_seen": Optional[Dict],  # Store the best quote seen so far
+        
+        # Execution Payload (stored for when conditions are met)
+        "quote_payload": Optional[Dict],  # Parameters needed to recreate quote
+        "swap_payload": Optional[Dict]  # Parameters needed to execute swap
+    }
+
 class RinDB:
     def __init__(self, client: AsyncIOMotorClient):
         self.client = client

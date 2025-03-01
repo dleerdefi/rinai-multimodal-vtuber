@@ -4,7 +4,7 @@ from datetime import datetime, UTC
 from motor.motor_asyncio import AsyncIOMotorClient
 from src.clients.twitter_client import TwitterAgentClient
 from src.db.db_schema import ContentType, RinDB
-from src.db.enums import OperationStatus, ToolOperationState, ToolType
+from src.db.enums import OperationStatus, ToolOperationState, ScheduleState
 from src.managers.tool_state_manager import ToolStateManager
 from src.managers.schedule_manager import ScheduleManager, SchedulableToolProtocol
 from src.tools.base import ToolRegistry
@@ -22,16 +22,24 @@ class ScheduleService:
         # Initialize Twitter client first
         self.twitter_client = TwitterAgentClient()
         
-        # Initialize tool registry with correct values
-        self.tool_registry = ToolRegistry(
-            content_type='tweet',   # ContentType.TWEET.value
-            tool_type='twitter'     # ToolType.TWITTER.value
-        )
-        
         # Store tools separately for lookup
         self._tools = {
-            'twitter': self.twitter_client
+            ContentType.TWEET.value: self.twitter_client,
+            'tweet': self.twitter_client  # Add string version for flexibility
         }
+        
+        # Create a tool registry for the schedule manager
+        tool_registry = {
+            ContentType.TWEET.value: self.twitter_client,
+            'tweet': self.twitter_client  # Add string version for flexibility
+        }
+        
+        # Initialize schedule manager with the tool registry
+        self.schedule_manager = ScheduleManager(
+            tool_state_manager=self.tool_state_manager,
+            db=self.db,
+            tool_registry=tool_registry
+        )
         
         self.running = False
         self._task = None
@@ -50,7 +58,7 @@ class ScheduleService:
         """Main scheduling loop that checks for and executes operations"""
         while self.running:
             try:
-                # Get operations ready for execution
+                # Get current time
                 current_time = datetime.now(UTC)
                 
                 # Get all scheduled items due for execution
@@ -75,18 +83,49 @@ class ScheduleService:
                             # Execute the item
                             logger.info(f"Executing scheduled item: {item.get('_id')}")
                             
-                            result = await tool.execute({
-                                'content': item.get('content', {}),
-                                'parameters': {
-                                    'custom_params': {
-                                        'account_id': 'default',
-                                        'media_files': []
-                                    }
-                                }
-                            })
+                            # Try different execution methods in order of preference
+                            result = None
+                            execution_error = None
                             
-                            # Update item status
-                            if result.get('success'):
+                            try:
+                                # 1. Try execute_scheduled_operation if it exists
+                                if hasattr(tool, 'execute_scheduled_operation'):
+                                    result = await tool.execute_scheduled_operation(item)
+                                # 2. Fall back to execute method if available
+                                elif hasattr(tool, 'execute'):
+                                    result = await tool.execute(item)
+                                # 3. Use send_tweet directly for TwitterAgentClient as last resort
+                                elif hasattr(tool, 'send_tweet') and content_type == ContentType.TWEET.value:
+                                    content = item.get('content', {}).get('raw_content')
+                                    if not content:
+                                        content = item.get('content', {}).get('formatted_content')
+                                    
+                                    if not content:
+                                        raise ValueError("No content found for scheduled tweet")
+                                    
+                                    params = {
+                                        'account_id': item.get('metadata', {}).get('account_id', 'default'),
+                                        'media_files': item.get('metadata', {}).get('media_files', []),
+                                        'poll_options': item.get('metadata', {}).get('poll_options', [])
+                                    }
+                                    
+                                    tweet_result = await tool.send_tweet(content=content, params=params)
+                                    result = {
+                                        'success': tweet_result.get('success', False),
+                                        'id': tweet_result.get('id'),
+                                        'text': content,
+                                        'timestamp': datetime.now(UTC).isoformat(),
+                                        'result': tweet_result
+                                    }
+                                else:
+                                    raise ValueError(f"Tool {type(tool).__name__} has no suitable execution method")
+                            except Exception as exec_error:
+                                execution_error = exec_error
+                                logger.error(f"Error executing item: {exec_error}")
+                                result = {'success': False, 'error': str(exec_error)}
+                            
+                            # Update item status based on execution result
+                            if result and result.get('success'):
                                 await self.db.tool_items.update_one(
                                     {"_id": item['_id']},
                                     {"$set": {
@@ -100,18 +139,32 @@ class ScheduleService:
                                     }}
                                 )
                                 logger.info(f"Successfully executed scheduled item {item['_id']}")
+                                
+                                # Update schedule execution status
+                                if item.get('schedule_id'):
+                                    await self.db.scheduled_operations.update_one(
+                                        {"_id": ObjectId(item.get('schedule_id'))},
+                                        {"$inc": {
+                                            "metadata.execution_status.pending": -1,
+                                            "metadata.execution_status.completed": 1
+                                        }}
+                                    )
+                                    
+                                    # Check if schedule is complete
+                                    await self._check_schedule_completion(item.get('schedule_id'))
                             else:
-                                logger.error(f"Failed to execute scheduled item {item['_id']}: {result.get('error')}")
+                                error_msg = result.get('error') if result else str(execution_error)
+                                logger.error(f"Failed to execute scheduled item {item['_id']}: {error_msg}")
                         
                         except Exception as e:
                             logger.error(f"Error executing scheduled item {item.get('_id')}: {e}")
                 
-                # Check every 5 seconds during testing (can be longer in production)
-                await asyncio.sleep(5)
+                # Check every 10 seconds
+                await asyncio.sleep(10)
                 
             except Exception as e:
                 logger.error(f"Error in schedule loop: {e}")
-                await asyncio.sleep(5)  # Wait before retry
+                await asyncio.sleep(10)  # Wait before retry
 
     async def _handle_scheduled_operation(self, operation: Dict):
         """Handle a scheduled operation that's due for execution"""
@@ -203,9 +256,13 @@ class ScheduleService:
             if isinstance(content_type, ContentType):
                 content_type = content_type.value
             
-            if content_type == self.tool_registry.content_type:
-                return self._tools.get(self.tool_registry.tool_type)
-            return None
+            # Normalize content type string
+            if content_type == ContentType.TWEET.value or content_type == 'tweet':
+                # Return the twitter client
+                return self.twitter_client
+            
+            # For other content types, check the registry
+            return self._tools.get(content_type)
         except Exception as e:
             logger.error(f"Error getting tool for content type {content_type}: {e}")
             return None
@@ -213,21 +270,8 @@ class ScheduleService:
     async def _check_schedule_completion(self, schedule_id: str):
         """Check if all operations in a schedule are complete"""
         try:
-            # Use correct enum values
-            schedule = await self.db.get_scheduled_operation(
-                state=ToolOperationState.EXECUTING.value,  # Changed from OperationStatus
-                status={"$ne": OperationStatus.EXECUTED.value}
-            )
-            
-            if not schedule:
-                # All operations are complete
-                await self.db.update_schedule_state(
-                    schedule_id=schedule_id,
-                    state=OperationStatus.COMPLETED.value,
-                    reason="All operations completed"
-                )
-                logger.info(f"Schedule {schedule_id} completed")
-
+            # Use the schedule manager to check completion
+            await self.schedule_manager.check_schedule_completion(schedule_id)
         except Exception as e:
             logger.error(f"Error checking schedule completion: {e}")
 
