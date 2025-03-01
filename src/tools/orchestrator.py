@@ -105,7 +105,7 @@ class Orchestrator:
         # Register TwitterTool last after all managers are initialized
         self._register_twitter_tool()
 
-    def _register_twitter_tool(self):
+    def _register_twitter_tool(self): # register all tools?
         """Register only TwitterTool for testing"""
         try:
             # Get registry requirements from TwitterTool

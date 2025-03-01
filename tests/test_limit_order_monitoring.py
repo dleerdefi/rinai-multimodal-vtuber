@@ -34,6 +34,7 @@ from services.monitoring_service import LimitOrderMonitoringService
 from db.db_schema import RinDB
 from db.enums import OperationStatus, ToolOperationState
 from motor.motor_asyncio import AsyncIOMotorClient
+from clients.coingecko_client import CoinGeckoClient
 
 # Configure logging
 logging.basicConfig(
@@ -72,40 +73,44 @@ class TestLimitOrderMonitoring:
         signer = Signer(account_id, key_pair)
         self.near_account = Account(provider, signer, account_id)
         
-        # Initialize Solver Bus client
-        self.solver_bus_client = SolverBusClient(SOLVER_BUS_URL)
+        # Initialize CoinGecko client with API key from environment
+        coingecko_api_key = os.getenv('COINGECKO_API_KEY')
+        if not coingecko_api_key:
+            raise ValueError("COINGECKO_API_KEY environment variable is not set")
+        self.coingecko_client = CoinGeckoClient(api_key=coingecko_api_key)
         
         # Test parameters
         self.from_token = "NEAR"
         self.to_token = "USDC"
-        self.from_amount = 0.1  # Small amount for testing
-        self.min_price = 0  # Set to 0 to always execute for testing
-        self.check_interval = 10  # Check every 10 seconds
+        self.from_amount = 0.1
+        self.target_price_usd = 3.0  # Target price in USD
+        self.check_interval = 10
         
     async def create_test_limit_order(self):
         """Create a test limit order in the database"""
         await self.db.initialize()
         
-        # Create a test tool item for a limit order
         order_data = {
             "session_id": "test_session",
             "tool_operation_id": str(ObjectId()),
             "content_type": "limit_order",
             "state": ToolOperationState.EXECUTING.value,
-            "status": OperationStatus.PENDING.value,
+            "status": OperationStatus.SCHEDULED.value,
             "content": {
                 "operation_type": "limit_order",
                 "from_token": self.from_token,
                 "from_amount": self.from_amount,
                 "to_token": self.to_token,
-                "to_chain": "near",
-                "min_price": self.min_price,
-                "raw_content": f"Limit order: {self.from_amount} {self.from_token} to {self.to_token} at min price {self.min_price}",
-                "formatted_content": f"Limit order: {self.from_amount} {self.from_token} to {self.to_token} at min price {self.min_price}",
-                "version": "1.0"
+                "target_price_usd": self.target_price_usd,
+                "raw_content": f"Limit order: {self.from_amount} {self.from_token} when price reaches ${self.target_price_usd}"
             },
             "parameters": {
-                "custom_params": {}
+                "custom_params": {
+                    "check_interval_seconds": self.check_interval,
+                    "last_checked_timestamp": 0,
+                    "best_price_seen": 0,
+                    "expiration_timestamp": int((datetime.now(UTC) + timedelta(hours=24)).timestamp())
+                }
             },
             "metadata": {
                 "created_at": datetime.now(UTC).isoformat(),
@@ -118,439 +123,242 @@ class TestLimitOrderMonitoring:
         logger.info(f"Created test limit order with ID: {order_id}")
         
         return order_id
-        
-    async def test_manual_quote_monitoring(self):
-        """Test manual monitoring of quotes for a limit order"""
+
+    async def test_price_monitoring(self):
+        """Test price monitoring using real CoinGecko prices"""
         # Create a test limit order
         order_id = await self.create_test_limit_order()
         
-        # Set up monitoring parameters
-        monitoring_params = {
-            "check_interval_seconds": self.check_interval,
-            "expiration_seconds": 300  # 5 minutes for testing
-        }
+        # Initialize monitoring service with real CoinGecko client
+        monitoring_service = LimitOrderMonitoringService(MONGO_URI)
+        await monitoring_service.inject_dependencies(
+            near_account=self.near_account,
+            coingecko_client=self.coingecko_client  # Using real CoinGecko client
+        )
+        
+        logger.info("\nStarting price monitoring test with real CoinGecko data")
+        logger.info(f"Monitoring {self.from_token} price, target: ${self.target_price_usd}")
+        
+        # Test for 5 iterations
+        for i in range(5):
+            logger.info(f"\nPrice check iteration {i+1}/5")
+            
+            try:
+                # Get current market price from CoinGecko
+                coingecko_id = await self.coingecko_client._get_coingecko_id(self.from_token)
+                if not coingecko_id:
+                    logger.error(f"Could not find CoinGecko ID for {self.from_token}")
+                    continue
+                
+                price_data = await self.coingecko_client.get_token_price(coingecko_id)
+                current_price = price_data.get('price_usd') if price_data else None
+                
+                if current_price:
+                    logger.info(f"Current {self.from_token} price: ${current_price}")
+                    logger.info(f"Target price: ${self.target_price_usd}")
+                else:
+                    logger.warning(f"Could not get current price for {self.from_token}")
+                    continue
+                
+                # Get the order and check price conditions
+                order = await self.db.tool_items.find_one({"_id": ObjectId(order_id)})
+                await monitoring_service._check_limit_order(order)
+                
+                # Get updated order and log status
+                updated_order = await self.db.tool_items.find_one({"_id": ObjectId(order_id)})
+                best_price = updated_order.get("parameters", {}).get("custom_params", {}).get("best_price_seen", 0)
+                last_check = updated_order.get("metadata", {}).get("last_check_result", "No check result")
+                
+                logger.info(f"Best price seen: ${best_price}")
+                logger.info(f"Last check result: {last_check}")
+                
+                # If price target was met, log the event
+                if current_price >= self.target_price_usd:
+                    logger.info(f"🎯 Price target met! Current price (${current_price}) >= Target (${self.target_price_usd})")
+                    if updated_order.get("status") == OperationStatus.EXECUTED.value:
+                        logger.info("Order execution was triggered!")
+                
+            except Exception as e:
+                logger.error(f"Error in monitoring iteration: {e}")
+            
+            # Wait before next check
+            await asyncio.sleep(self.check_interval)
+            
+        # Final order status
+        final_order = await self.db.tool_items.find_one({"_id": ObjectId(order_id)})
+        logger.info("\nFinal order status:")
+        logger.info(f"Status: {final_order.get('status')}")
+        logger.info(f"State: {final_order.get('state')}")
+        logger.info(f"Best price seen: ${final_order.get('parameters', {}).get('custom_params', {}).get('best_price_seen', 0)}")
+        
+        # Clean up
+        await self.db.tool_items.delete_one({"_id": ObjectId(order_id)})
+        logger.info(f"\nTest completed and cleaned up order {order_id}")
+
+    async def test_execution_trigger(self):
+        """Test execution trigger when price target is met"""
+        # Create test order with low target price to ensure trigger
+        self.target_price_usd = 0.1  # Set very low to ensure trigger
+        order_id = await self.create_test_limit_order()
+        
+        # Track execution calls
+        execution_called = False
+        
+        class MockScheduleManager:
+            def __init__(self, db: RinDB):
+                self.db = db
+
+            async def execute_scheduled_operation(self, operation):
+                nonlocal execution_called
+                execution_called = True
+                logger.info(f"Mock executing operation: {operation['_id']}")
+                
+                # Update the operation status and state
+                await self.db.tool_items.update_one(
+                    {"_id": operation["_id"]},
+                    {"$set": {
+                        "status": OperationStatus.EXECUTED.value,
+                        "state": ToolOperationState.COMPLETED.value,
+                        "executed_time": datetime.now(UTC),
+                        "metadata.execution_completed_at": datetime.now(UTC).isoformat()
+                    }}
+                )
+                
+                return {"success": True}
+        
+        # Initialize service with proper mock
+        monitoring_service = LimitOrderMonitoringService(MONGO_URI)
+        await monitoring_service.inject_dependencies(
+            near_account=self.near_account,
+            coingecko_client=self.coingecko_client,
+            schedule_manager=MockScheduleManager(self.db)  # Pass db to mock
+        )
+        
+        # Start monitoring
+        await monitoring_service.start()
+        
+        # Wait for potential execution
+        timeout = 60
+        start_time = time.time()
+        
+        while not execution_called and (time.time() - start_time) < timeout:
+            await asyncio.sleep(5)
+            
+        # Stop monitoring
+        await monitoring_service.stop()
+        
+        # Verify execution was triggered
+        assert execution_called, "Execution was not triggered within timeout"
+        
+        # Allow time for state updates to complete
+        await asyncio.sleep(1)
+        
+        # Check final order status
+        final_order = await self.db.tool_items.find_one({"_id": ObjectId(order_id)})
+        assert final_order["status"] == OperationStatus.EXECUTED.value
+        assert final_order["state"] == ToolOperationState.COMPLETED.value
+
+    async def test_price_monitoring_with_expiration(self):
+        """Test price monitoring with order expiration"""
+        # Create order that expires quickly
+        self.target_price_usd = 1000000  # Set very high to ensure no trigger
+        order_id = await self.create_test_limit_order()
+        
+        # Update expiration to 5 seconds from now
+        await self.db.tool_items.update_one(
+            {"_id": ObjectId(order_id)},
+            {"$set": {
+                "parameters.custom_params.expiration_timestamp": int(time.time() + 5)
+            }}
+        )
+        
+        # Initialize service
+        monitoring_service = LimitOrderMonitoringService(MONGO_URI)
+        await monitoring_service.inject_dependencies(
+            near_account=self.near_account,
+            coingecko_client=self.coingecko_client,
+            schedule_manager=None  # No need for schedule manager in this test
+        )
+        
+        # Wait for expiration
+        await asyncio.sleep(6)
+        
+        # Check order one more time
+        order = await self.db.tool_items.find_one({"_id": ObjectId(order_id)})
+        await monitoring_service._check_limit_order(order)
+        
+        # Verify order was expired
+        final_order = await self.db.tool_items.find_one({"_id": ObjectId(order_id)})
+        assert final_order["status"] == OperationStatus.FAILED.value
+        assert "expired_at" in final_order["metadata"]
+
+    async def test_live_price_tracking(self):
+        """Test continuous price tracking with real CoinGecko data"""
+        logger.info("\nStarting live price tracking test")
+        
+        # Get initial price to set a realistic target
+        coingecko_id = await self.coingecko_client._get_coingecko_id(self.from_token)
+        initial_price = (await self.coingecko_client.get_token_price(coingecko_id))['price_usd']
+        
+        # Set target price slightly above current price
+        self.target_price_usd = initial_price * 1.001  # 0.1% above current price
+        
+        logger.info(f"Initial {self.from_token} price: ${initial_price}")
+        logger.info(f"Target price set to: ${self.target_price_usd}")
+        
+        # Create test order
+        order_id = await self.create_test_limit_order()
         
         # Initialize monitoring service
         monitoring_service = LimitOrderMonitoringService(MONGO_URI)
         await monitoring_service.inject_dependencies(
             near_account=self.near_account,
-            solver_bus_client=self.solver_bus_client
+            coingecko_client=self.coingecko_client
         )
         
-        # Register the limit order with the monitoring service
-        registration_result = await monitoring_service.register_limit_order(order_id, monitoring_params)
-        assert registration_result, "Failed to register limit order"
+        # Track execution trigger
+        execution_triggered = False
+        start_time = time.time()
+        timeout = 300  # 5 minutes timeout
         
-        # Manually check quotes for 5 iterations
-        logger.info("Starting manual quote monitoring test")
-        
-        for i in range(5):
-            logger.info(f"Iteration {i+1}/5")
-            
-            # Get the order from the database
-            order = await self.db.tool_items.find_one({"_id": ObjectId(order_id)})
-            assert order, f"Order {order_id} not found"
-            
-            # Log current order status
-            logger.info(f"Order status: {order.get('status')}")
-            logger.info(f"Best price seen: {order.get('parameters', {}).get('custom_params', {}).get('best_price_seen', 0)}")
-            
-            # Get quotes manually
+        while not execution_triggered and (time.time() - start_time) < timeout:
             try:
-                # Convert amount to proper decimal format
-                from_token_info = get_token_by_symbol(self.from_token)
-                from_decimals = from_token_info.get('decimals', 24) if from_token_info else 24
-                decimal_amount = str(int(self.from_amount * 10**from_decimals))
+                # Get current price
+                price_data = await self.coingecko_client.get_token_price(coingecko_id)
+                current_price = price_data.get('price_usd')
                 
-                # Get asset IDs
-                from_asset_id = to_asset_id(self.from_token)
-                to_asset_id = to_asset_id(self.to_token)
+                if current_price:
+                    logger.info(f"\nCurrent {self.from_token} price: ${current_price}")
+                    logger.info(f"Target price: ${self.target_price_usd}")
+                    logger.info(f"Price difference: {((current_price - self.target_price_usd) / self.target_price_usd) * 100:.4f}%")
                 
-                # Get quotes from Solver Bus
-                quote_result = await self.solver_bus_client.get_quote(
-                    token_in=from_asset_id,
-                    token_out=to_asset_id,
-                    amount_in=decimal_amount
-                )
+                # Check order
+                order = await self.db.tool_items.find_one({"_id": ObjectId(order_id)})
+                await monitoring_service._check_limit_order(order)
                 
-                if quote_result.get("success", False):
-                    solver_quotes = quote_result.get("quotes", [])
-                    
-                    if solver_quotes:
-                        # Find best quote
-                        best_option = None
-                        best_amount_out = 0
-                        
-                        for quote in solver_quotes:
-                            if 'amount_out' in quote:
-                                amount_out = float(quote['amount_out'])
-                                if amount_out > best_amount_out:
-                                    best_amount_out = amount_out
-                                    best_option = quote
-                        
-                        if best_option:
-                            # Calculate current price
-                            to_token_info = get_token_by_symbol(self.to_token)
-                            to_decimals = to_token_info.get('decimals', 6) if to_token_info else 6
-                            
-                            human_amount_in = float(best_option['amount_in']) / (10 ** from_decimals)
-                            human_amount_out = float(best_option['amount_out']) / (10 ** to_decimals)
-                            
-                            current_price = human_amount_out / human_amount_in if human_amount_in > 0 else 0
-                            
-                            logger.info(f"Current price: {current_price} {self.to_token}/{self.from_token}")
-                            logger.info(f"You would receive: {human_amount_out} {self.to_token} for {human_amount_in} {self.from_token}")
-                            
-                            # Print quote details
-                            logger.info(f"Quote hash: {best_option.get('quote_hash')}")
-                            logger.info(f"Solver ID: {best_option.get('solver_id')}")
-                    else:
-                        logger.warning("No quotes available")
-                else:
-                    logger.error(f"Failed to get quotes: {quote_result.get('error')}")
-                    
+                # Check if execution was triggered
+                updated_order = await self.db.tool_items.find_one({"_id": ObjectId(order_id)})
+                if updated_order.get("status") == OperationStatus.EXECUTED.value:
+                    execution_triggered = True
+                    logger.info("\n🎯 Execution triggered!")
+                    break
+                
             except Exception as e:
-                logger.error(f"Error getting quotes: {e}")
+                logger.error(f"Error in live tracking: {e}")
             
-            # Wait for next check
             await asyncio.sleep(self.check_interval)
-            
-        # Check final order status
-        order = await self.db.tool_items.find_one({"_id": ObjectId(order_id)})
-        logger.info(f"Final order status: {order.get('status')}")
-        logger.info(f"Best price seen: {order.get('parameters', {}).get('custom_params', {}).get('best_price_seen', 0)}")
+        
+        # Final status
+        final_order = await self.db.tool_items.find_one({"_id": ObjectId(order_id)})
+        logger.info("\nFinal tracking results:")
+        logger.info(f"Execution triggered: {execution_triggered}")
+        logger.info(f"Time elapsed: {time.time() - start_time:.2f} seconds")
+        logger.info(f"Final status: {final_order.get('status')}")
+        logger.info(f"Best price seen: ${final_order.get('parameters', {}).get('custom_params', {}).get('best_price_seen', 0)}")
         
         # Clean up
         await self.db.tool_items.delete_one({"_id": ObjectId(order_id)})
-        logger.info(f"Deleted test order {order_id}")
-        
-    async def test_monitoring_service(self):
-        """Test the full monitoring service functionality"""
-        # Create a test limit order
-        order_id = await self.create_test_limit_order()
-        
-        # Set up monitoring parameters
-        monitoring_params = {
-            "check_interval_seconds": self.check_interval,
-            "expiration_seconds": 300  # 5 minutes for testing
-        }
-        
-        # Initialize and start monitoring service
-        monitoring_service = LimitOrderMonitoringService(MONGO_URI)
-        await monitoring_service.inject_dependencies(
-            near_account=self.near_account,
-            solver_bus_client=self.solver_bus_client
-        )
-        
-        # Register the limit order with the monitoring service
-        registration_result = await monitoring_service.register_limit_order(order_id, monitoring_params)
-        assert registration_result, "Failed to register limit order"
-        
-        # Start the monitoring service
-        await monitoring_service.start()
-        logger.info("Monitoring service started")
-        
-        # Let the service run for a while
-        logger.info("Letting monitoring service run for 60 seconds...")
-        await asyncio.sleep(60)
-        
-        # Stop the monitoring service
-        await monitoring_service.stop()
-        logger.info("Monitoring service stopped")
-        
-        # Check final order status
-        order = await self.db.tool_items.find_one({"_id": ObjectId(order_id)})
-        logger.info(f"Final order status: {order.get('status')}")
-        logger.info(f"Best price seen: {order.get('parameters', {}).get('custom_params', {}).get('best_price_seen', 0)}")
-        
-        # If the order was executed, show the execution result
-        if order.get('status') == OperationStatus.EXECUTED.value:
-            logger.info(f"Order was executed!")
-            logger.info(f"Execution result: {order.get('metadata', {}).get('execution_result')}")
-        
-        # Clean up
-        await self.db.tool_items.delete_one({"_id": ObjectId(order_id)})
-        logger.info(f"Deleted test order {order_id}")
-
-    async def test_direct_quote_fetching(self):
-        """Test direct quote fetching without using the monitoring service"""
-        logger.info("Testing direct quote fetching")
-        
-        # Convert amount to proper decimal format
-        from_token_info = get_token_by_symbol(self.from_token)
-        from_decimals_val = from_token_info.get('decimals', 24) if from_token_info else 24
-        decimal_amount = str(int(self.from_amount * 10**from_decimals_val))
-        
-        # Get asset IDs
-        from_asset_id_val = to_asset_id(self.from_token)
-        to_asset_id_val = to_asset_id(self.to_token)
-        
-        # Fetch quotes 5 times with a delay
-        for i in range(5):
-            logger.info(f"Quote fetch iteration {i+1}/5")
-            
-            try:
-                # Get quotes from Solver Bus
-                quote_result = await self.solver_bus_client.get_quote(
-                    token_in=from_asset_id_val,
-                    token_out=to_asset_id_val,
-                    amount_in=decimal_amount
-                )
-                
-                logger.info(f"Quote result success: {quote_result.get('success', False)}")
-                
-                if quote_result.get("success", False):
-                    solver_quotes = quote_result.get("quotes", [])
-                    logger.info(f"Received {len(solver_quotes)} quotes")
-                    
-                    if solver_quotes:
-                        # Find best quote
-                        best_option = None
-                        best_amount_out = 0
-                        
-                        for quote in solver_quotes:
-                            if 'amount_out' in quote:
-                                amount_out = float(quote['amount_out'])
-                                if amount_out > best_amount_out:
-                                    best_amount_out = amount_out
-                                    best_option = quote
-                        
-                        if best_option:
-                            # Calculate current price
-                            to_token_info = get_token_by_symbol(self.to_token)
-                            to_decimals_val = to_token_info.get('decimals', 6) if to_token_info else 6
-                            
-                            human_amount_in = float(best_option['amount_in']) / (10 ** from_decimals_val)
-                            human_amount_out = float(best_option['amount_out']) / (10 ** to_decimals_val)
-                            
-                            current_price = human_amount_out / human_amount_in if human_amount_in > 0 else 0
-                            
-                            logger.info(f"Best quote details:")
-                            logger.info(f"Current price: {current_price} {self.to_token}/{self.from_token}")
-                            logger.info(f"You would receive: {human_amount_out} {self.to_token} for {human_amount_in} {self.from_token}")
-                            logger.info(f"Quote hash: {best_option.get('quote_hash')}")
-                            logger.info(f"Solver ID: {best_option.get('solver_id')}")
-                            
-                            # Save the quote to a file for reference
-                            with open(f"quote_result_{i}.json", "w") as f:
-                                json.dump(best_option, f, indent=2)
-                                logger.info(f"Saved quote to quote_result_{i}.json")
-                    else:
-                        logger.warning("No quotes available")
-                else:
-                    logger.error(f"Failed to get quotes: {quote_result.get('error')}")
-                    
-            except Exception as e:
-                logger.error(f"Error getting quotes: {e}")
-            
-            # Wait before next fetch
-            await asyncio.sleep(self.check_interval)
-
-    async def test_execution_trigger(self):
-        """Test execution trigger logic with a low min_price to ensure it executes"""
-        logger.info("Testing execution trigger")
-        
-        # Set up monitoring parameters
-        monitoring_params = {
-            "check_interval_seconds": self.check_interval,
-            "expiration_seconds": 300  # 5 minutes for testing
-        }
-        
-        # Initialize and start monitoring service
-        monitoring_service = LimitOrderMonitoringService(MONGO_URI)
-        await monitoring_service.inject_dependencies(
-            near_account=self.near_account,
-            solver_bus_client=self.solver_bus_client
-        )
-        
-        # Register the limit order with the monitoring service
-        order_id = await self.create_test_limit_order()
-        registration_result = await monitoring_service.register_limit_order(order_id, monitoring_params)
-        assert registration_result, "Failed to register limit order"
-        
-        # Start the monitoring service
-        await monitoring_service.start()
-        logger.info("Monitoring service started")
-        
-        # Let the service run for a while
-        logger.info("Letting monitoring service run for 60 seconds...")
-        await asyncio.sleep(60)
-        
-        # Stop the monitoring service
-        await monitoring_service.stop()
-        logger.info("Monitoring service stopped")
-        
-        # Check final order status
-        order = await self.db.tool_items.find_one({"_id": ObjectId(order_id)})
-        logger.info(f"Final order status: {order.get('status')}")
-        logger.info(f"Best price seen: {order.get('parameters', {}).get('custom_params', {}).get('best_price_seen', 0)}")
-        
-        # If the order was executed, show the execution result
-        if order.get('status') == OperationStatus.EXECUTED.value:
-            logger.info(f"Order was executed!")
-            logger.info(f"Execution result: {order.get('metadata', {}).get('execution_result')}")
-        else:
-            logger.warning(f"Order was not executed. Status: {order.get('status')}")
-        
-        # Clean up
-        await self.db.tool_items.delete_one({"_id": ObjectId(order_id)})
-        logger.info(f"Deleted test order {order_id}")
-
-    async def test_create_token_diff_quote(self):
-        """Test creating a token diff quote for execution"""
-        logger.info("Testing create_token_diff_quote function")
-        
-        try:
-            # Get the best quote first
-            request = IntentRequest()
-            request.asset_in(self.from_token, self.from_amount)
-            request.asset_out(self.to_token, chain="eth")
-            
-            # Get quotes
-            solver_quotes = fetch_options(request)
-            
-            if not solver_quotes:
-                logger.error("No quotes available for testing create_token_diff_quote")
-                return
-                
-            # Find best quote
-            best_option = select_best_option(solver_quotes)
-            
-            if not best_option:
-                logger.error("No best option found")
-                return
-                
-            # Get token info
-            from_token_info = get_token_by_symbol(self.from_token)
-            to_token_info = get_token_by_symbol(self.to_token)
-            
-            from_decimals_val = from_token_info.get('decimals', 24) if from_token_info else 24
-            to_decimals_val = to_token_info.get('decimals', 6) if to_token_info else 6
-            
-            # Calculate human-readable amounts
-            human_amount_in = float(best_option['amount_in']) / (10 ** from_decimals_val)
-            human_amount_out = float(best_option['amount_out']) / (10 ** to_decimals_val)
-            
-            # Create token diff quote
-            logger.info(f"Creating token diff quote for {human_amount_in} {self.from_token} to {human_amount_out} {self.to_token}")
-            
-            # Get asset IDs
-            from_asset_id = to_asset_id(self.from_token)
-            to_asset_id_val = to_asset_id(self.to_token)
-            
-            # Create the quote
-            quote = await create_token_diff_quote(
-                account=self.near_account,
-                token_in=self.from_token,
-                amount_in=human_amount_in,
-                token_out=self.to_token,
-                amount_out=human_amount_out,
-                from_asset_id=from_asset_id,
-                to_asset_id=to_asset_id_val
-            )
-            
-            logger.info(f"Created token diff quote: {quote}")
-            logger.info(f"Quote signature: {quote.get('signature')}")
-            
-            # Save the quote to a file for reference
-            with open("token_diff_quote.json", "w") as f:
-                json.dump(quote, f, indent=2)
-                logger.info("Saved token diff quote to token_diff_quote.json")
-                
-            # Test publishing the intent (commented out to avoid actual execution)
-            # logger.info("Publishing intent...")
-            # publish_result = await publish_intent(self.near_account, quote)
-            # logger.info(f"Publish result: {publish_result}")
-            
-        except Exception as e:
-            logger.error(f"Error creating token diff quote: {e}", exc_info=True)
-
-    async def test_intents_tool_limit_order_creation(self):
-        """Test limit order creation through IntentsTool"""
-        from tools.intents_operation import IntentsTool
-        from services.llm_service import LLMService, ModelType
-        from managers.tool_state_manager import ToolStateManager
-        from managers.schedule_manager import ScheduleManager
-        
-        # Initialize dependencies
-        await self.db.initialize()
-        tool_state_manager = ToolStateManager(db=self.db)
-        
-        # Create a mock LLM service that returns a predefined response
-        class MockLLMService:
-            async def get_response(self, prompt, model_type=None, override_config=None):
-                return """
-                {
-                    "tools_needed": [{
-                        "tool_name": "intents",
-                        "action": "limit_order",
-                        "parameters": {
-                            "from_token": "NEAR",
-                            "from_amount": 0.1,
-                            "to_token": "USDC",
-                            "min_price": 1.5,
-                            "to_chain": "eth",
-                            "expiration_hours": 24,
-                            "slippage": 0.5
-                        },
-                        "priority": 1
-                    }],
-                    "reasoning": "User requested a limit order to swap NEAR to USDC when the price reaches a specific threshold"
-                }
-                """
-        
-        # Create a mock schedule manager
-        class MockScheduleManager:
-            async def initialize_schedule(self, tool_operation_id, schedule_info, content_type, session_id=None):
-                logger.info(f"Initializing schedule for operation {tool_operation_id}")
-                logger.info(f"Schedule info: {schedule_info}")
-                return "mock_schedule_id"
-        
-        # Initialize IntentsTool
-        intents_tool = IntentsTool()
-        intents_tool.tool_state_manager = tool_state_manager
-        intents_tool.llm_service = MockLLMService()
-        intents_tool.schedule_manager = MockScheduleManager()
-        intents_tool.near_account = self.near_account
-        intents_tool.solver_bus_client = self.solver_bus_client
-        intents_tool.db = self.db
-        
-        # Create a test session and operation
-        session_id = "test_session_intents_tool"
-        operation_id = await tool_state_manager.create_operation(
-            session_id=session_id,
-            tool_name="intents",
-            command="I want to swap 0.1 NEAR for USDC at $1.50 / NEAR"
-        )
-        
-        # Set the session ID for the tool
-        intents_tool.deps = type('obj', (object,), {'session_id': session_id})
-        
-        # Analyze the command
-        command = "I want to swap 0.1 NEAR for USDC at $1.50 / NEAR"
-        result = await intents_tool._analyze_command(command)
-        
-        # Verify the result
-        assert result["operation_type"] == "limit_order"
-        assert result["parameters"]["from_token"] == "NEAR"
-        assert result["parameters"]["from_amount"] == 0.1
-        assert result["parameters"]["to_token"] == "USDC"
-        assert result["parameters"]["min_price"] == 1.5
-        assert "monitoring_params" in result
-        assert "schedule_id" in result
-        
-        # Now test the _generate_content method
-        content_result = await intents_tool._generate_content(result)
-        
-        # Verify content generation
-        assert content_result["success"] is True
-        assert "items" in content_result
-        assert len(content_result["items"]) > 0
-        assert content_result["operation_type"] == "limit_order"
-        
-        # Clean up
-        await self.db.tool_operations.delete_one({"_id": ObjectId(operation_id)})
-        logger.info(f"Deleted test operation {operation_id}")
+        logger.info(f"\nTest completed and cleaned up order {order_id}")
 
     async def teardown_method(self):
         """Clean up resources after each test"""
@@ -565,13 +373,13 @@ async def run_tests():
     test = TestLimitOrderMonitoring()
     test.setup_method()
     
-    # Choose which test to run
-    # await test.test_manual_quote_monitoring()
-    # await test.test_monitoring_service()
-    await test.test_direct_quote_fetching()  # Uncomment to run this test
-    # await test.test_execution_trigger()
-    # await test.test_create_token_diff_quote()
-    await test.test_intents_tool_limit_order_creation()  # Uncomment to run this test
+    logger.info("Running price monitoring test...")
+    await test.test_price_monitoring()
+    
+    logger.info("\nRunning live price tracking test...")
+    await test.test_live_price_tracking()
+    
+    await test.teardown_method()
 
 if __name__ == "__main__":
     asyncio.run(run_tests()) 

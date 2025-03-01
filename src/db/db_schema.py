@@ -171,38 +171,31 @@ class TwitterContent(ToolItemContent):
 class TwitterParams(ToolItemParams):
     """Twitter-specific parameters"""
     custom_params: Dict[str, Any] = {
-        # API Parameters
-        "account_id": Optional[str],
-        "media_files": Optional[List[str]],
-        "poll_options": Optional[List[str]],
-        "poll_duration": Optional[int],
-        "reply_settings": Optional[str],
-        "quote_tweet_id": Optional[str],
-        
-        # Content Parameters
-        "thread_structure": Optional[List[str]],
-        "mentions": Optional[List[str]],
-        "hashtags": Optional[List[str]],
-        "urls": Optional[List[str]],
-        
-        # Targeting Parameters
-        "audience_targeting": Optional[Dict],
-        "content_category": Optional[str],
-        "sensitivity_level": Optional[str],
-        
-        # Engagement Parameters
-        "estimated_engagement": Optional[str],
-        "visibility_settings": Optional[Dict]
+        "account_id": None,  # Optional[str]
+        "media_files": None,  # Optional[List[str]]
+        "poll_options": None,  # Optional[List[str]]
+        "poll_duration": None,  # Optional[int]
+        "reply_settings": None,  # Optional[str]
+        "quote_tweet_id": None,  # Optional[str]
+        "thread_structure": None,  # Optional[List[str]]
+        "mentions": None,  # Optional[List[str]]
+        "hashtags": None,  # Optional[List[str]]
+        "urls": None,  # Optional[List[str]]
+        "audience_targeting": None,  # Optional[Dict]
+        "content_category": None,  # Optional[str]
+        "sensitivity_level": None,  # Optional[str]
+        "estimated_engagement": None,  # Optional[str]
+        "visibility_settings": None  # Optional[Dict]
     }
 
 class CalendarParams(ToolItemParams):
     """Calendar-specific parameters"""
     custom_params: Dict[str, Any] = {
-        "event_duration": Optional[int],
-        "attendees": Optional[List[str]],
-        "location": Optional[str],
-        "reminder_minutes": Optional[int],
-        "calendar_id": Optional[str]
+        "event_duration": None,  # Optional[int]
+        "attendees": None,  # Optional[List[str]]
+        "location": None,  # Optional[str]
+        "reminder_minutes": None,  # Optional[int]
+        "calendar_id": None  # Optional[str]
     }
 
 class TwitterMetadata(ToolItemMetadata):
@@ -237,60 +230,60 @@ class LimitOrderParams(ToolItemParams):
     custom_params: Dict[str, Any] = {
         # Price Oracle Check (CoinGecko)
         "price_oracle": {
-            "symbol": str,                    # Token symbol (e.g., "NEAR")
-            "target_price_usd": float,        # User's target price
+            "symbol": "",  # str
+            "target_price_usd": 0.0,  # float
             "last_check": {
-                "price_usd": Optional[float],
-                "timestamp": int
+                "price_usd": None,  # Optional[float]
+                "timestamp": 0  # int
             },
-            "check_interval_seconds": int
+            "check_interval_seconds": 0  # int
         },
 
         # Step 1: Deposit Check & Parameters
         "deposit": {
-            "needs_deposit": bool,            # Whether deposit is needed
-            "token_symbol": str,              # Token to deposit (e.g., "NEAR")
-            "amount": float,                  # Amount to deposit
-            "requires_wrap": bool,            # True if NEAR token
-            "executed": bool = False
+            "needs_deposit": False,  # bool
+            "token_symbol": "",  # str
+            "amount": 0.0,  # float
+            "requires_wrap": False,  # bool
+            "executed": False  # bool
         },
 
-        # Step 2: Swap Parameters (per test_intents_client.py)
+        # Step 2: Swap Parameters
         "swap": {
-            "from_token": str,                # Token symbol (e.g., "NEAR")
-            "from_amount": float,             # Human readable amount
-            "to_token": str,                  # Token symbol (e.g., "USDC")
-            "chain_out": str,                 # Destination chain (e.g., "eth")
-            "executed": bool = False,
-            "current_quote": Optional[Dict] = {
-                "defuse_asset_identifier_in": str,
-                "defuse_asset_identifier_out": str,
-                "amount_in": str,             # Base units
-                "amount_out": str,            # Base units
-                "expiration_time": str,
-                "quote_hash": str
+            "from_token": "",  # str
+            "from_amount": 0.0,  # float
+            "to_token": "",  # str
+            "chain_out": "",  # str
+            "executed": False,  # bool
+            "current_quote": {  # Optional[Dict]
+                "defuse_asset_identifier_in": "",  # str
+                "defuse_asset_identifier_out": "",  # str
+                "amount_in": "",  # str
+                "amount_out": "",  # str
+                "expiration_time": "",  # str
+                "quote_hash": ""  # str
             }
         },
 
-        # Step 3: Withdrawal Parameters (per smart_withdraw)
+        # Step 3: Withdrawal Parameters
         "withdraw": {
-            "enabled": bool,                  # Whether to withdraw after swap
-            "token_symbol": str,              # Token to withdraw
-            "amount": Optional[float],        # Will be set after swap
-            "destination_address": str,       # Address to withdraw to
-            "destination_chain": str,         # Chain to withdraw to
-            "source_chain": str,              # Chain where token currently is
-            "executed": bool = False
+            "enabled": False,  # bool
+            "token_symbol": "",  # str
+            "amount": None,  # Optional[float]
+            "destination_address": "",  # str
+            "destination_chain": "",  # str
+            "source_chain": "",  # str
+            "executed": False  # bool
         },
 
         # Execution Control
         "execution": {
-            "current_step": str,              # deposit/swap/withdraw
-            "expiration_timestamp": int,
-            "max_retries": int = 3,
-            "retry_count": int = 0,
-            "last_error": Optional[str] = None,
-            "completed": bool = False
+            "current_step": "",  # str
+            "expiration_timestamp": 0,  # int
+            "max_retries": 3,  # int
+            "retry_count": 0,  # int
+            "last_error": None,  # Optional[str]
+            "completed": False  # bool
         }
     }
 
