@@ -235,26 +235,63 @@ class TweetGenerationResponse(BaseModel):
 class LimitOrderParams(ToolItemParams):
     """Limit order-specific parameters"""
     custom_params: Dict[str, Any] = {
-        # Order Parameters
-        "from_token": str,
-        "from_amount": float,
-        "to_token": str,
-        "to_chain": str,
-        "min_price": float,  # Minimum price in to_token per from_token
-        "min_amount_out": float,  # Calculated min amount based on price
-        
-        # Execution Parameters
-        "slippage": float,
-        "expiration_timestamp": Optional[int],  # Unix timestamp when order expires
-        
-        # Monitoring Parameters
-        "check_interval_seconds": int,  # How often to check price
-        "last_checked_timestamp": Optional[int],
-        "best_quote_seen": Optional[Dict],  # Store the best quote seen so far
-        
-        # Execution Payload (stored for when conditions are met)
-        "quote_payload": Optional[Dict],  # Parameters needed to recreate quote
-        "swap_payload": Optional[Dict]  # Parameters needed to execute swap
+        # Price Oracle Check (CoinGecko)
+        "price_oracle": {
+            "symbol": str,                    # Token symbol (e.g., "NEAR")
+            "target_price_usd": float,        # User's target price
+            "last_check": {
+                "price_usd": Optional[float],
+                "timestamp": int
+            },
+            "check_interval_seconds": int
+        },
+
+        # Step 1: Deposit Check & Parameters
+        "deposit": {
+            "needs_deposit": bool,            # Whether deposit is needed
+            "token_symbol": str,              # Token to deposit (e.g., "NEAR")
+            "amount": float,                  # Amount to deposit
+            "requires_wrap": bool,            # True if NEAR token
+            "executed": bool = False
+        },
+
+        # Step 2: Swap Parameters (per test_intents_client.py)
+        "swap": {
+            "from_token": str,                # Token symbol (e.g., "NEAR")
+            "from_amount": float,             # Human readable amount
+            "to_token": str,                  # Token symbol (e.g., "USDC")
+            "chain_out": str,                 # Destination chain (e.g., "eth")
+            "executed": bool = False,
+            "current_quote": Optional[Dict] = {
+                "defuse_asset_identifier_in": str,
+                "defuse_asset_identifier_out": str,
+                "amount_in": str,             # Base units
+                "amount_out": str,            # Base units
+                "expiration_time": str,
+                "quote_hash": str
+            }
+        },
+
+        # Step 3: Withdrawal Parameters (per smart_withdraw)
+        "withdraw": {
+            "enabled": bool,                  # Whether to withdraw after swap
+            "token_symbol": str,              # Token to withdraw
+            "amount": Optional[float],        # Will be set after swap
+            "destination_address": str,       # Address to withdraw to
+            "destination_chain": str,         # Chain to withdraw to
+            "source_chain": str,              # Chain where token currently is
+            "executed": bool = False
+        },
+
+        # Execution Control
+        "execution": {
+            "current_step": str,              # deposit/swap/withdraw
+            "expiration_timestamp": int,
+            "max_retries": int = 3,
+            "retry_count": int = 0,
+            "last_error": Optional[str] = None,
+            "completed": bool = False
+        }
     }
 
 class RinDB:

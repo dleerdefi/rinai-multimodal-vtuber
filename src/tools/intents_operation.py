@@ -133,41 +133,29 @@ class IntentsTool(BaseTool):
                 
             tool_operation_id = str(operation['_id'])
             
-            # Update the operation with registry settings
-            await self.tool_state_manager.update_operation(
-                session_id=self.deps.session_id,
-                tool_operation_id=tool_operation_id,
-                input_data={
-                    "command": command,
-                    "content_type": self.registry.content_type.value,
-                    "tool_registry": {
-                        "requires_approval": self.registry.requires_approval,
-                        "requires_scheduling": self.registry.requires_scheduling,
-                        "content_type": self.registry.content_type.value
-                    }
-                }
-            )
-            
             # Get LLM analysis
             prompt = f"""You are a blockchain intents analyzer. Determine the specific token operation requested.
 
 Command: "{command}"
 
 Available token operations: 
-1. deposit: Deposit tokens into intents.near contract
+1. deposit: Only deposit tokens into intents.near contract
    Parameters: 
+   - topic: what to deposit (e.g., NEAR, USDC)
    - token_symbol: token to deposit (e.g., NEAR, USDC)
    - amount: amount to deposit
 
-2. withdraw: Withdraw tokens from intents.near contract
+2. withdraw: Only withdraw tokens from intents.near contract
    Parameters: 
+   - topic: what to withdraw (e.g., NEAR, USDC)
    - token_symbol: token to withdraw (e.g., NEAR, USDC)
    - amount: amount to withdraw
    - destination_address: address to withdraw to (optional, defaults to user's address)
    - destination_chain: chain to withdraw to (optional, defaults to "near")
 
-3. swap: Swap one token for another immediately
+3. swap: Swap one token for another immediately at quoted price
    Parameters: 
+   - topic: what to swap (e.g., NEAR to USDC, USDC to NEAR)
    - from_token: token to swap from (e.g., NEAR, USDC)
    - from_amount: amount to swap
    - to_token: token to swap to (e.g., NEAR, USDC)
@@ -176,6 +164,8 @@ Available token operations:
 
 4. limit_order: Create a limit order to swap tokens when price conditions are met
    Parameters: 
+   - topic: what to swap (e.g., NEAR to USDC, USDC to NEAR)
+   - item_count: number of swaps to perform
    - from_token: token to swap from (e.g., NEAR, USDC)
    - from_amount: amount to swap
    - to_token: token to swap to (e.g., NEAR, USDC)
@@ -195,9 +185,10 @@ Instructions:
 Example response format:
 {{
     "tools_needed": [{{
-        "tool_name": "intents",
-        "action": "limit_order",
+        "tool_type": "intents",
+        "operation_type": "limit_order",
         "parameters": {{
+            "topic": "NEAR to USDC",
             "from_token": "NEAR",
             "from_amount": 5.0,
             "to_token": "USDC",
@@ -248,7 +239,7 @@ Example response format:
                 params = tools_data.get("parameters", {})
                 logger.info(f"Extracted parameters: {params}")
                 
-                operation_type = tools_data.get("action", "unknown")
+                content_type = tools_data.get("content_type", "unknown")
                 
             except json.JSONDecodeError as e:
                 logger.error(f"Failed to parse LLM response as JSON: {e}")
@@ -259,7 +250,7 @@ Example response format:
                 raise
             
             # For limit orders, set up monitoring parameters
-            if operation_type == "limit_order":
+            if content_type == "limit_order":
                 # Calculate expiration timestamp
                 expiration_hours = params.get("expiration_hours", 24)
                 expiration_timestamp = int((datetime.now(UTC) + timedelta(hours=expiration_hours)).timestamp())
@@ -281,7 +272,7 @@ Example response format:
                     tool_operation_id=tool_operation_id,
                     schedule_info={
                         "schedule_type": "monitoring",
-                        "operation_type": operation_type,
+                        "operation_type": content_type,
                         "total_items": 1,  # Default to 1 trade
                         "monitoring_params": monitoring_params
                     },
@@ -295,7 +286,7 @@ Example response format:
                     tool_operation_id=tool_operation_id,
                     input_data={
                         "command_info": {
-                            "operation_type": operation_type,
+                            "operation_type": content_type,
                             "parameters": params,
                             "monitoring_params": monitoring_params,
                             "topic": f"{params.get('from_token')} to {params.get('to_token')} at {params.get('min_price')}"
@@ -305,14 +296,14 @@ Example response format:
                     metadata={
                         "schedule_state": ScheduleState.PENDING.value,
                         "schedule_id": schedule_id,
-                        "operation_type": operation_type
+                        "operation_type": content_type
                     }
                 )
                 
                 return {
                     "schedule_id": schedule_id,
                     "tool_operation_id": tool_operation_id,
-                    "operation_type": operation_type,
+                    "operation_type": content_type,
                     "parameters": params,
                     "monitoring_params": monitoring_params,
                     "topic": f"{params.get('from_token')} to {params.get('to_token')} at {params.get('min_price')}"
@@ -326,48 +317,227 @@ Example response format:
                     tool_operation_id=tool_operation_id,
                     input_data={
                         "command_info": {
-                            "operation_type": operation_type,
+                            "operation_type": content_type,
                             "parameters": params,
-                            "topic": f"{operation_type} {params.get('token_symbol', params.get('from_token', 'tokens'))}"
+                            "topic": f"{content_type} {params.get('token_symbol', params.get('from_token', 'tokens'))}"
                         }
                     },
                     metadata={
-                        "operation_type": operation_type
+                        "operation_type": content_type
                     }
                 )
                 
                 return {
                     "tool_operation_id": tool_operation_id,
-                    "operation_type": operation_type,
+                    "operation_type": content_type,
                     "parameters": params,
-                    "topic": f"{operation_type} {params.get('token_symbol', params.get('from_token', 'tokens'))}"
+                    "topic": f"{content_type} {params.get('token_symbol', params.get('from_token', 'tokens'))}"
                 }
 
         except Exception as e:
             logger.error(f"Error in Intents command analysis: {e}", exc_info=True)
             raise
 
-    async def _get_token_price(self, symbol: str) -> Optional[float]:
-        """Get token price using CoinGecko"""
+    async def _generate_content(self, operation_info: Dict) -> Dict:
+        """Generate human-readable content for approval based on operation type"""
         try:
-            if not self.coingecko_client:
-                return None
+            logger.info(f"Generating content for operation: {operation_info}")
+            
+            # Get operation type and parameters
+            operation_type = operation_info.get("operation_type")
+            params = operation_info.get("parameters", {})
+            
+            # Get parent operation to access stored data
+            operation = await self.tool_state_manager.get_operation(self.deps.session_id)
+            if not operation:
+                raise ValueError("No active operation found")
+
+            # Generate LLM description based on operation type
+            generated_content = await self._generate_llm_description(operation_type, params)
+            
+            # Format content based on operation type
+            if operation_type == "deposit":
+                formatted_content = {
+                    "title": generated_content.get("title"),
+                    "description": generated_content.get("description"),
+                    "warnings": generated_content.get("warnings", []),
+                    "expected_outcome": generated_content.get("expected_outcome"),
+                    "operation_details": {
+                        "token_symbol": params.get("token_symbol"),
+                        "amount": params.get("amount"),
+                        "requires_wrap": params.get("token_symbol", "").upper() == "NEAR"
+                    }
+                }
                 
-            # Get CoinGecko ID for the token
-            coingecko_id = await self.coingecko_client._get_coingecko_id(symbol)
-            if not coingecko_id:
-                return None
+            elif operation_type == "withdraw":
+                formatted_content = {
+                    "title": generated_content.get("title"),
+                    "description": generated_content.get("description"),
+                    "warnings": generated_content.get("warnings", []),
+                    "expected_outcome": generated_content.get("expected_outcome"),
+                    "operation_details": {
+                        "token_symbol": params.get("token_symbol"),
+                        "amount": params.get("amount"),
+                        "destination_chain": params.get("destination_chain", "near"),
+                        "destination_address": params.get("destination_address")
+                    }
+                }
                 
-            # Get token price
-            price_data = await self.coingecko_client.get_token_price(coingecko_id)
-            if not price_data or 'price_usd' not in price_data:
-                return None
-                
-            return price_data['price_usd']
+            elif operation_type in ["swap", "limit_order"]:
+                # For swaps/limit orders, include quote information
+                quotes = operation.get("metadata", {}).get("quotes", [])
+                formatted_content = {
+                    "title": generated_content.get("title"),
+                    "description": generated_content.get("description"),
+                    "warnings": generated_content.get("warnings", []),
+                    "expected_outcome": generated_content.get("expected_outcome"),
+                    "operation_details": {
+                        "from_token": params.get("from_token"),
+                        "from_amount": params.get("from_amount"),
+                        "to_token": params.get("to_token"),
+                        "to_chain": params.get("to_chain", "near"),
+                        "quotes": quotes,
+                        "limit_price": params.get("limit_price") if operation_type == "limit_order" else None
+                    }
+                }
+
+            # Return formatted content for approval
+            return {
+                "success": True,
+                "content": formatted_content,
+                "tool_operation_id": operation_info["tool_operation_id"],
+                "operation_type": operation_type,
+                "requires_approval": True,
+                "schedule_id": operation.get("schedule_id")
+            }
             
         except Exception as e:
-            logger.error(f"Error getting token price: {e}")
-            return None
+            logger.error(f"Error generating content for approval: {e}", exc_info=True)
+            raise
+
+    async def _generate_llm_description(self, operation_type: str, params: Dict) -> Dict:
+        """Generate human-readable description using LLM"""
+                prompt = f"""You are a cryptocurrency expert. Generate a detailed description for a deposit operation with the following details:
+
+    - Operation: Deposit {amount} {token_symbol} to intents.near contract
+    - Current time: {datetime.now(UTC).strftime("%Y-%m-%d %H:%M:%S UTC")}
+
+    Include:
+    1. A clear title for the operation
+    2. A detailed description of what will happen
+    3. Any relevant warnings or considerations
+    4. Expected outcome
+
+    Format the response as JSON:
+    {{
+        "title": "Deposit {amount} {token_symbol}",
+        "description": "Detailed description here...",
+        "expected_outcome": "Expected outcome description"
+    }}"""
+
+            elif operation_type == "withdraw":
+                token_symbol = params.get("token_symbol")
+                amount = params.get("amount")
+                destination_chain = params.get("destination_chain", "near")
+                destination_address = params.get("destination_address", "your account")
+                
+                prompt = f"""You are a cryptocurrency expert. Generate a detailed description for a withdrawal operation with the following details:
+
+    - Operation: Withdraw {amount} {token_symbol} from intents.near contract to {destination_address} on {destination_chain} chain
+    - Current time: {datetime.now(UTC).strftime("%Y-%m-%d %H:%M:%S UTC")}
+
+    Include:
+    1. A clear title for the operation
+    2. A detailed description of what will happen
+    3. Any relevant warnings or considerations
+    4. Expected outcome
+
+    Format the response as JSON:
+    {{
+        "title": "Withdraw {amount} {token_symbol} to {destination_chain}",
+        "description": "Detailed description here...",
+        "warnings": ["Warning 1", "Warning 2"],
+        "expected_outcome": "Expected outcome description"
+    }}"""
+
+            elif operation_type == "swap" or operation_type == "limit_order":
+                from_token = params.get("from_token")
+                from_amount = params.get("from_amount")
+                to_token = params.get("to_token")
+                to_chain = params.get("to_chain", "near")
+                limit_price = params.get("limit_price")
+                
+                operation_name = "Limit Order" if limit_price else "Swap"
+                price_condition = f" when price reaches {limit_price} {to_token} per {from_token}" if limit_price else ""
+                
+                prompt = f"""You are a cryptocurrency expert. Generate a detailed description for a {operation_name.lower()} operation with the following details:
+
+    - Operation: {operation_name} {from_amount} {from_token} for {to_token} on {to_chain} chain{price_condition}
+    - Current time: {datetime.now(UTC).strftime("%Y-%m-%d %H:%M:%S UTC")}
+
+    Include:
+    1. A clear title for the operation
+    2. A detailed description of what will happen
+    3. Any relevant warnings or considerations
+    4. Expected outcome
+
+    Format the response as JSON:
+    {{
+        "title": "{operation_name} {from_amount} {from_token} for {to_token}",
+        "description": "Detailed description here...",
+        "warnings": ["Warning 1", "Warning 2"],
+        "expected_outcome": "Expected outcome description"
+    }}"""
+
+            else:
+                prompt = f"""You are a cryptocurrency expert. Generate a detailed description for a {operation_type} operation with the following details:
+
+    - Operation parameters: {json.dumps(params)}
+    - Current time: {datetime.now(UTC).strftime("%Y-%m-%d %H:%M:%S UTC")}
+
+    Include:
+    1. A clear title for the operation
+    2. A detailed description of what will happen
+    3. Any relevant warnings or considerations
+    4. Expected outcome
+
+    Format the response as JSON:
+    {{
+        "title": "Operation title",
+        "description": "Detailed description here...",
+        "warnings": ["Warning 1", "Warning 2"],
+        "expected_outcome": "Expected outcome description"
+    }}"""
+
+            # Call LLM to generate content
+            messages = [
+                {
+                    "role": "system",
+                    "content": "You are a cryptocurrency expert. Generate detailed descriptions for crypto operations in JSON format."
+                },
+                {
+                    "role": "user",
+                    "content": prompt
+                }
+            ]
+
+            logger.info(f"Sending generation prompt to LLM: {messages}")
+            response = await self.llm_service.get_response(
+                prompt=messages,
+                model_type=ModelType.GROQ_LLAMA_3_3_70B,
+                override_config={
+                    "temperature": 0.5,
+                    "max_tokens": 500
+                }
+            )
+            
+            logger.info(f"Raw LLM response: {response}")
+            
+            # Strip markdown code blocks if present
+            response = response.strip()
+            if response.startswith('```') and response.endswith('```'):
+                # Remove the first line (```json) and the last line (```)
+                response = '\n'.join(response.split('\n')[1:-1])
 
     async def _handle_deposit(self, command_info: Dict) -> Dict:
         """Handle deposit operation"""
@@ -737,133 +907,160 @@ Example response format:
                 "error": str(e)
             }
 
-    async def execute_approved_items(self, operation: Dict) -> Dict:
-        """Execute approved operation items"""
+    # Add execute_scheduled_operation method to align with schedule_manager.py expectations
+    async def execute_scheduled_operation(self, operation: Dict) -> Dict:
+        """Execute a scheduled operation when triggered by monitoring service
+        
+        This method is called by ScheduleManager when a scheduled operation
+        is due for execution, either based on time or when monitoring conditions are met.
+        """
         try:
-            # Get all approved items
-            approved_items = await self.tool_state_manager.get_operation_items(
-                tool_operation_id=str(operation["_id"]),
-                state=ToolOperationState.EXECUTING.value,
-                status=OperationStatus.APPROVED.value
-            )
+            logger.info(f"Executing scheduled operation: {operation.get('_id')}")
             
-            if not approved_items:
-                return {
-                    "status": "error",
-                    "response": "No approved items found for execution"
-                }
+            # Extract operation details
+            content = operation.get("content", {})
+            operation_type = content.get("operation_type")
             
-            # Process items in order: deposit first, then swap
-            deposit_items = [item for item in approved_items if item.get("content", {}).get("operation_type") == "deposit"]
-            swap_items = [item for item in approved_items if item.get("content", {}).get("operation_type") == "swap"]
+            # Get the favorable quote if this is a limit order
+            favorable_quote = operation.get("metadata", {}).get("favorable_quote")
             
-            results = []
-            
-            # Execute deposit items first
-            for item in deposit_items:
-                content = item.get("content", {})
-                token_symbol = content.get("token_symbol", "NEAR")
-                amount = content.get("amount", 0)
+            # Execute based on operation type
+            if operation_type == "deposit":
+                token_symbol = content.get("token_symbol")
+                amount = content.get("amount")
                 
-                # Perform deposit
+                # For NEAR deposits, we need to wrap first
                 if token_symbol.upper() == "NEAR":
-                    # First wrap the NEAR
-                    await wrap_near(self.near_account, amount)
-                    await asyncio.sleep(3)  # Wait for wrap to complete
+                    try:
+                        # First wrap the NEAR
+                        wrap_result = await wrap_near(self.near_account, amount)
+                        logger.info(f"Wrapped NEAR: {wrap_result}")
+                        
+                        # Small delay to ensure wrapping completes
+                        await asyncio.sleep(3)
+                    except Exception as e:
+                        logger.error(f"Error wrapping NEAR: {e}")
+                        return {
+                            "success": False,
+                            "message": f"Failed to wrap NEAR: {str(e)}"
+                        }
                 
-                deposit_result = await intent_deposit(self.near_account, token_symbol, amount)
-                results.append({
-                    "item_id": str(item["_id"]),
-                    "operation_type": "deposit",
-                    "result": deposit_result
-                })
+                # Perform the deposit
+                try:
+                    result = await intent_deposit(self.near_account, token_symbol, amount)
+                    logger.info(f"Deposit result: {result}")
+                    
+                    return {
+                        "success": True,
+                        "message": f"Successfully deposited {amount} {token_symbol}",
+                        "result": result
+                    }
+                except Exception as e:
+                    logger.error(f"Error depositing tokens: {e}")
+                    return {
+                        "success": False,
+                        "message": f"Failed to deposit tokens: {str(e)}"
+                    }
+                    
+            elif operation_type == "withdraw":
+                token_symbol = content.get("token_symbol")
+                amount = content.get("amount")
+                destination_address = content.get("destination_address", self.near_account.account_id)
+                destination_chain = content.get("destination_chain", "near")
                 
-                # Update item status
-                await self.db.tool_items.update_one(
-                    {"_id": item["_id"]},
-                    {"$set": {
-                        "status": OperationStatus.EXECUTED.value,
-                        "state": ToolOperationState.COMPLETED.value,
-                        "metadata.executed_at": datetime.now(UTC).isoformat(),
-                        "metadata.execution_result": deposit_result
-                    }}
-                )
-            
-            # Execute swap items
-            for item in swap_items:
-                content = item.get("content", {})
-                from_token = content.get("from_token", "NEAR")
-                from_amount = content.get("from_amount", 0)
-                to_token = content.get("to_token", "USDC")
+                # Perform the withdrawal
+                try:
+                    result = await intent_withdraw(
+                        self.near_account, 
+                        destination_address, 
+                        token_symbol, 
+                        amount, 
+                        network=destination_chain
+                    )
+                    logger.info(f"Withdrawal result: {result}")
+                    
+                    return {
+                        "success": True,
+                        "message": f"Successfully withdrew {amount} {token_symbol} to {destination_address} on {destination_chain}",
+                        "result": result
+                    }
+                except Exception as e:
+                    logger.error(f"Error withdrawing tokens: {e}")
+                    return {
+                        "success": False,
+                        "message": f"Failed to withdraw tokens: {str(e)}"
+                    }
+                    
+            elif operation_type == "swap" or operation_type == "limit_order":
+                from_token = content.get("from_token")
+                from_amount = content.get("from_amount")
+                to_token = content.get("to_token")
                 to_chain = content.get("to_chain", "near")
                 
-                # Perform swap
-                swap_result = await intent_swap(
-                    self.near_account, 
-                    from_token, 
-                    from_amount, 
-                    to_token, 
-                    chain_out=to_chain
-                )
-                results.append({
-                    "item_id": str(item["_id"]),
-                    "operation_type": "swap",
-                    "result": swap_result
-                })
-                
-                # Update item status
-                await self.db.tool_items.update_one(
-                    {"_id": item["_id"]},
-                    {"$set": {
-                        "status": OperationStatus.EXECUTED.value,
-                        "state": ToolOperationState.COMPLETED.value,
-                        "metadata.executed_at": datetime.now(UTC).isoformat(),
-                        "metadata.execution_result": swap_result
-                    }}
-                )
-            
-            # Update operation status
-            await self.tool_state_manager.update_operation(
-                session_id=operation["session_id"],
-                tool_operation_id=str(operation["_id"]),
-                status=OperationStatus.EXECUTED.value,
-                state=ToolOperationState.COMPLETED.value,
-                output_data={
-                    "execution_results": results
+                # Execute the swap
+                try:
+                    # Use the quote hash if available from monitoring service
+                    quote_hash = None
+                    if favorable_quote:
+                        quote_hash = favorable_quote.get("quote_hash")
+                        logger.info(f"Using favorable quote with hash: {quote_hash}")
+                    
+                    swap_result = await intent_swap(
+                        self.near_account, 
+                        from_token, 
+                        from_amount, 
+                        to_token, 
+                        chain_out=to_chain
+                    )
+                    
+                    # Calculate amount received
+                    amount_out = from_decimals(swap_result.get('amount_out', 0), to_token)
+                    
+                    return {
+                        "success": True,
+                        "message": f"Successfully swapped {from_amount} {from_token} for {amount_out} {to_token}",
+                        "result": swap_result
+                    }
+                except Exception as e:
+                    logger.error(f"Error executing swap: {e}")
+                    return {
+                        "success": False,
+                        "message": f"Failed to execute swap: {str(e)}"
+                    }
+            else:
+                return {
+                    "success": False,
+                    "message": f"Unknown operation type: {operation_type}"
                 }
-            )
-            
-            # Construct response based on executed operations
-            response_texts = []
-            
-            for item in deposit_items:
-                content = item.get("content", {})
-                token_symbol = content.get("token_symbol", "NEAR")
-                amount = content.get("amount", 0)
-                response_texts.append(f"Deposited {amount} {token_symbol}")
-            
-            for item in swap_items:
-                content = item.get("content", {})
-                from_token = content.get("from_token", "NEAR")
-                from_amount = content.get("from_amount", 0)
-                to_token = content.get("to_token", "USDC")
-                to_chain = content.get("to_chain", "near")
-                response_texts.append(f"Swapped {from_amount} {from_token} for {to_token} on {to_chain}")
-            
+                
+        except Exception as e:
+            logger.error(f"Error in execute_scheduled_operation: {e}")
             return {
-                "status": "completed",
-                "response": f"Successfully executed operations: {', '.join(response_texts)}",
-                "requires_tts": True,
-                "state": ToolOperationState.COMPLETED.value,
-                "execution_results": results
+                "success": False,
+                "message": f"Error executing scheduled operation: {str(e)}"
             }
+
+    async def _get_token_price(self, symbol: str) -> Optional[float]:
+        """Get token price using CoinGecko"""
+        try:
+            if not self.coingecko_client:
+                return None
+                
+            # Get CoinGecko ID for the token
+            coingecko_id = await self.coingecko_client._get_coingecko_id(symbol)
+            if not coingecko_id:
+                return None
+                
+            # Get token price
+            price_data = await self.coingecko_client.get_token_price(coingecko_id)
+            if not price_data or 'price_usd' not in price_data:
+                return None
+                
+            return price_data['price_usd']
             
         except Exception as e:
-            logger.error(f"Error executing approved items: {e}")
-            return {
-                "status": "error",
-                "response": f"Error executing operations: {str(e)}"
-            }
+            logger.error(f"Error getting token price: {e}")
+            return None
 
     async def _get_asset_id(self, token_symbol: str) -> str:
         """Convert token symbol to defuse asset identifier"""
@@ -890,222 +1087,3 @@ Example response format:
         }
         
         return mappings.get(token_symbol, f"nep141:{token_symbol.lower()}.near")
-
-    async def _generate_content(self, operation_info: Dict) -> Dict:
-        """Generate content for user approval based on operation type"""
-        try:
-            logger.info(f"Generating content for operation: {operation_info}")
-            
-            # Get operation type and parameters
-            operation_type = operation_info.get("operation_type")
-            params = operation_info.get("parameters", {})
-            
-            # Get parent operation to inherit state/status
-            operation = await self.tool_state_manager.get_operation(self.deps.session_id)
-            if not operation:
-                raise ValueError("No active operation found")
-            
-            # Verify operation is in correct state
-            if operation["state"] != ToolOperationState.COLLECTING.value:
-                raise ValueError(f"Operation in invalid state: {operation['state']}")
-            
-            # Check if regenerating
-            is_regenerating = operation.get("metadata", {}).get("approval_state") == ApprovalState.REGENERATING.value
-            
-            saved_items = []
-            
-            # Generate content based on operation type
-            if operation_type == "deposit":
-                token_symbol = params.get("token_symbol")
-                amount = params.get("amount")
-                
-                formatted_content = f"Deposit {amount} {token_symbol} to intents.near contract"
-                
-                # Create deposit item
-                deposit_item = {
-                    "session_id": self.deps.session_id,
-                    "tool_operation_id": operation_info["tool_operation_id"],
-                    "content_type": self.registry.content_type.value,
-                    "state": ToolOperationState.COLLECTING.value,
-                    "status": OperationStatus.PENDING.value,
-                    "content": {
-                        "operation_type": "deposit",
-                        "token_symbol": token_symbol,
-                        "amount": amount,
-                        "formatted_content": formatted_content
-                    },
-                    "metadata": {
-                        "generated_at": datetime.now(UTC).isoformat(),
-                        "parent_operation_state": operation["state"],
-                        "state_history": [{
-                            "state": operation["state"],
-                            "status": OperationStatus.PENDING.value,
-                            "timestamp": datetime.now(UTC).isoformat()
-                        }]
-                    }
-                }
-                
-                # Save item
-                result = await self.db.tool_items.insert_one(deposit_item)
-                item_id = str(result.inserted_id)
-                
-                # Add to pending items list
-                current_pending_items = operation.get("output_data", {}).get("pending_items", [])
-                current_pending_items.append(item_id)
-                
-                # Update parent operation with new pending item
-                await self.tool_state_manager.update_operation(
-                    session_id=self.deps.session_id,
-                    tool_operation_id=operation_info["tool_operation_id"],
-                    content_updates={
-                        "pending_items": current_pending_items
-                    },
-                    metadata={
-                        "item_states": {
-                            item_id: {
-                                "state": operation["state"],
-                                "status": OperationStatus.PENDING.value
-                            }
-                        }
-                    }
-                )
-                
-                saved_item = {**deposit_item, "_id": item_id}
-                saved_items = [saved_item]
-                
-            elif operation_type == "withdraw":
-                token_symbol = params.get("token_symbol")
-                amount = params.get("amount")
-                destination_chain = params.get("destination_chain", "near")
-                
-                formatted_content = f"Withdraw {amount} {token_symbol} from intents.near contract to {destination_chain}"
-                
-                # Create withdraw item
-                withdraw_item = {
-                    "session_id": self.deps.session_id,
-                    "tool_operation_id": operation_info["tool_operation_id"],
-                    "content_type": self.registry.content_type.value,
-                    "state": ToolOperationState.COLLECTING.value,
-                    "status": OperationStatus.PENDING.value,
-                    "content": {
-                        "operation_type": "withdraw",
-                        "token_symbol": token_symbol,
-                        "amount": amount,
-                        "destination_chain": destination_chain,
-                        "formatted_content": formatted_content
-                    },
-                    "metadata": {
-                        "generated_at": datetime.now(UTC).isoformat(),
-                        "parent_operation_state": operation["state"],
-                        "state_history": [{
-                            "state": operation["state"],
-                            "status": OperationStatus.PENDING.value,
-                            "timestamp": datetime.now(UTC).isoformat()
-                        }]
-                    }
-                }
-                
-                # Save item
-                result = await self.db.tool_items.insert_one(withdraw_item)
-                item_id = str(result.inserted_id)
-                
-                # Add to pending items list
-                current_pending_items = operation.get("output_data", {}).get("pending_items", [])
-                current_pending_items.append(item_id)
-                
-                # Update parent operation with new pending item
-                await self.tool_state_manager.update_operation(
-                    session_id=self.deps.session_id,
-                    tool_operation_id=operation_info["tool_operation_id"],
-                    content_updates={
-                        "pending_items": current_pending_items
-                    },
-                    metadata={
-                        "item_states": {
-                            item_id: {
-                                "state": operation["state"],
-                                "status": OperationStatus.PENDING.value
-                            }
-                        }
-                    }
-                )
-                
-                saved_item = {**withdraw_item, "_id": item_id}
-                saved_items = [saved_item]
-                
-            elif operation_type == "swap":
-                # For swap, we need to generate quotes
-                from_token = params.get("from_token")
-                from_amount = params.get("from_amount")
-                to_token = params.get("to_token")
-                to_chain = params.get("to_chain", "near")
-                
-                # Get quotes using existing _generate_quotes function
-                quotes_result = await self._generate_quotes({
-                    "from_token": from_token,
-                    "from_amount": from_amount,
-                    "to_token": to_token,
-                    "to_chain": to_chain,
-                    "tool_operation_id": operation_info["tool_operation_id"]
-                })
-                
-                # Create swap items based on quotes
-                swap_items = quotes_result["items"]
-                
-                # Save items to database
-                saved_items = []
-                for item in swap_items:
-                    # Create the tool item
-                    tool_item = {
-                        "session_id": self.deps.session_id,
-                        "tool_operation_id": operation_info["tool_operation_id"],
-                        "content_type": self.registry.content_type.value,
-                        "state": ToolOperationState.APPROVING.value,
-                        "status": OperationStatus.PENDING.value,
-                        "content": item["content"],
-                        "metadata": item["metadata"]
-                    }
-                    
-                    # Save the tool item
-                    result = await self.db.tool_items.insert_one(tool_item)
-                    item_id = str(result.inserted_id)
-                    
-                    # Add to pending items list
-                    current_pending_items = [item_id]
-                    
-                    # Update parent operation with new pending item
-                    await self.tool_state_manager.update_operation(
-                        session_id=self.deps.session_id,
-                        tool_operation_id=operation_info["tool_operation_id"],
-                        content_updates={
-                            "pending_items": current_pending_items
-                        },
-                        state=ToolOperationState.APPROVING.value,
-                        metadata={
-                            "item_states": {
-                                item_id: {
-                                    "state": ToolOperationState.APPROVING.value,
-                                    "status": OperationStatus.PENDING.value
-                                }
-                            }
-                        }
-                    )
-                    
-                    saved_item = {**tool_item, "_id": item_id}
-                    saved_items.append(saved_item)
-                    logger.info(f"Saved tool item {item_id} with state {ToolOperationState.APPROVING.value}")
-                
-                items = saved_items
-            
-            return {
-                "success": True,
-                "items": items,
-                "tool_operation_id": operation_info["tool_operation_id"],
-                "operation_type": operation_type,
-                "requires_approval": True,
-                "schedule_id": operation.get("schedule_id")
-            }
-            
-        except Exception as e:
-            logger.error(f"Error generating content for approval: {e}", exc_info=True)
-            raise
