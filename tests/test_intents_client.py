@@ -16,7 +16,7 @@ import logging
 
 # Add the src directory to the Python path
 sys.path.append(os.path.join(os.path.dirname(__file__), '..', 'src'))
-from clients.near_Intents_client.intents_client import (
+from clients.near_intents_client.intents_client import (
     intent_deposit, 
     smart_withdraw,
     intent_swap,
@@ -31,8 +31,8 @@ from clients.near_Intents_client.intents_client import (
     MAX_GAS,
     unwrap_near
 )
-from clients.near_Intents_client import config  # Import the config module
-from clients.near_Intents_client.config import (
+from clients.near_intents_client import config  # Import the config module
+from clients.near_intents_client.config import (
     get_token_by_symbol,
     get_defuse_asset_id,
     to_decimals,

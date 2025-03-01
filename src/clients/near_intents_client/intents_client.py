@@ -8,7 +8,7 @@ import random
 import requests
 import near_api
 from . import config
-from clients.near_Intents_client.config import (
+from clients.near_intents_client.config import (
     get_token_id,
     to_asset_id,
     to_decimals,
