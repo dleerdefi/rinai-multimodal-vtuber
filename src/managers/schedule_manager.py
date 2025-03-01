@@ -576,26 +576,41 @@ class ScheduleManager:
     async def execute_operation(self, operation: Dict) -> Dict:
         """Execute operation using appropriate tool from registry"""
         try:
+            # Get content type and tool
             content_type = operation.get('content_type')
             tool = self.tool_registry.get(content_type)
             
             if not tool:
                 raise ValueError(f"No tool found for content type: {content_type}")
 
-            # Check if the tool has a custom adapter
-            if hasattr(tool, 'adapter') and hasattr(tool.adapter, 'execute_scheduled_operation'):
-                result = await tool.adapter.execute_scheduled_operation(operation)
-            # Check if the tool implements execute_scheduled_operation
-            elif hasattr(tool, 'execute_scheduled_operation'):
-                result = await tool.execute_scheduled_operation(operation)
-            # Fall back to the standard execute method
-            elif hasattr(tool, 'execute'):
-                result = await tool.execute(operation)
+            # Log execution attempt
+            logger.info(f"Executing {content_type} operation {operation.get('_id')} using {type(tool).__name__}")
+
+            # Execute using tool's execute_scheduled_operation method
+            result = await tool.execute_scheduled_operation(operation)
+            
+            # Update operation status based on result
+            if result.get('success'):
+                await self.update_item_execution_status(
+                    item_id=str(operation['_id']),
+                    status=OperationStatus.EXECUTED,
+                    api_response=result
+                )
             else:
-                raise ValueError(f"Tool {type(tool).__name__} has no execution method")
+                await self.update_item_execution_status(
+                    item_id=str(operation['_id']),
+                    status=OperationStatus.FAILED,
+                    error=result.get('error', 'Unknown error')
+                )
             
             return result
 
         except Exception as e:
             logger.error(f"Error executing operation: {e}")
+            # Update operation with error status
+            await self.update_item_execution_status(
+                item_id=str(operation['_id']),
+                status=OperationStatus.FAILED,
+                error=str(e)
+            )
             return {'success': False, 'error': str(e)} 

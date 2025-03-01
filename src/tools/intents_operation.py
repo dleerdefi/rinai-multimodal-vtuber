@@ -26,7 +26,11 @@ from src.clients.near_intents_client.intents_client import (
     intent_withdraw,
     intent_swap,
     get_intent_balance,
-    wrap_near
+    wrap_near,
+    IntentRequest,
+    fetch_options,
+    select_best_option,
+    smart_withdraw
 )
 from src.clients.near_intents_client.config import (
     get_token_by_symbol,
@@ -38,16 +42,16 @@ from src.clients.near_intents_client.config import (
 logger = logging.getLogger(__name__)
 
 class IntentsTool(BaseTool):
-    """Tool for NEAR protocol intents operations (deposit, swap, withdraw)"""
+    """Limit order tool for NEAR protocol intents operations (deposit, swap, withdraw)"""
     
     # Static tool configuration
     name = "intents"
-    description = "Perform token operations via NEAR intents (deposit, swap, withdraw)"
+    description = "Perform limit order operations via NEAR intents (includes deposit, swap, withdraw)"
     version = "1.0"
     
     # Tool registry configuration - we'll need to add these enum values
     registry = ToolRegistry(
-        content_type=ContentType.TOKEN_OPERATION,
+        content_type=ContentType.LIMIT_ORDER,
         tool_type=ToolType.INTENTS,
         requires_approval=True,
         requires_scheduling=True,
@@ -86,35 +90,31 @@ class IntentsTool(BaseTool):
         self.db = self.tool_state_manager.db if self.tool_state_manager else None
 
     async def run(self, input_data: str) -> Dict:
-        """Run the intents tool - initial entrypoint"""
+        """Run the intents tool - handles limit order flow"""
         try:
             operation = await self.tool_state_manager.get_operation(self.deps.session_id)
             
             if not operation or operation.get('state') == ToolOperationState.COMPLETED.value:
-                # Initial analysis and command flow
+                # Initial analysis and command flow for limit order
                 command_info = await self._analyze_command(input_data)
                 
-                # Based on command type, execute different flows
-                if command_info["operation_type"] == "deposit":
-                    result = await self._handle_deposit(command_info)
-                    return result
-                    
-                elif command_info["operation_type"] == "withdraw":
-                    result = await self._handle_withdraw(command_info)
-                    return result
-                    
-                elif command_info["operation_type"] == "swap":
-                    # For swaps, we need to generate quotes and get approval
-                    quotes = await self._generate_quotes(command_info)
-                    
-                    # Start approval flow
-                    return await self.approval_manager.start_approval_flow(
-                        session_id=self.deps.session_id,
-                        tool_operation_id=command_info["tool_operation_id"],
-                        items=quotes["items"]
-                    )
+                # Generate content for approval
+                content_result = await self._generate_content(
+                    topic=command_info["topic"],
+                    count=1,  # Always 1 for limit orders
+                    schedule_id=command_info["schedule_id"],
+                    tool_operation_id=command_info["tool_operation_id"]
+                )
+                
+                # Start approval flow
+                return await self.approval_manager.start_approval_flow(
+                    session_id=self.deps.session_id,
+                    tool_operation_id=command_info["tool_operation_id"],
+                    items=content_result["items"]
+                )
             else:
                 # Let orchestrator handle ongoing operations
+                # This includes monitoring service triggers and execution
                 raise ValueError("Operation already in progress - should be handled by orchestrator")
 
         except Exception as e:
@@ -385,8 +385,8 @@ Format the response as JSON:
                 "tool_operation_id": tool_operation_id,
                 "schedule_id": schedule_id,
                 "content_type": self.registry.content_type.value,
-                "state": ToolOperationState.COLLECTING.value,
-                "status": OperationStatus.PENDING.value,
+                "state": operation["state"],
+                "status": operation["status"],
                 "content": {
                     "title": generated_content["title"],
                     "description": generated_content["description"],
@@ -407,8 +407,8 @@ Format the response as JSON:
                     "generated_at": datetime.now(UTC).isoformat(),
                     "monitoring_params": operation.get("input_data", {}).get("command_info", {}).get("monitoring_params", {}),
                     "state_history": [{
-                        "state": ToolOperationState.COLLECTING.value,
-                        "status": OperationStatus.PENDING.value,
+                        "state": operation["state"],
+                        "status": operation["status"],
                         "timestamp": datetime.now(UTC).isoformat()
                     }]
                 }
@@ -429,8 +429,8 @@ Format the response as JSON:
                 metadata={
                     "item_states": {
                         item_id: {
-                            "state": ToolOperationState.COLLECTING.value,
-                            "status": OperationStatus.PENDING.value
+                            "state": operation["state"],
+                            "status": operation["status"]
                         }
                     }
                 }
@@ -598,376 +598,180 @@ Format the response as JSON:
                 "response": f"Error handling withdrawal: {str(e)}"
             }
 
-    async def _generate_quotes(self, command_info: Dict) -> Dict:
-        """Generate quotes for swap operation using Solver Bus"""
-        try:
-            params = command_info.get("parameters", {})
-            from_token = params.get("from_token", "NEAR")
-            from_amount = params.get("from_amount", 0)
-            to_token = params.get("to_token", "USDC")
-            to_chain = params.get("to_chain", "near")
-            
-            # Convert tokens to asset identifiers
-            try:
-                from_asset_id = await self._get_asset_id(from_token)
-                to_asset_id = await self._get_asset_id(to_token)
-            except Exception as e:
-                logger.error(f"Error converting tokens to asset IDs: {e}")
-                from_asset_id = f"nep141:{from_token.lower()}.near"
-                to_asset_id = f"nep141:{to_token.lower()}.near"
-            
-            # Handle deposit if needed
-            deposit_item = None
-            if command_info.get("needs_deposit", False):
-                deposit_amount = command_info.get("deposit_amount", 0)
-                
-                # Create item for deposit approval
-                deposit_item = {
-                    "session_id": self.deps.session_id,
-                    "tool_operation_id": command_info["tool_operation_id"],
-                    "content_type": self.registry.content_type.value,
-                    "state": ToolOperationState.COLLECTING.value,
-                    "status": OperationStatus.PENDING.value,
-                    "content": {
-                        "operation_type": "deposit",
-                        "token_symbol": from_token,
-                        "amount": deposit_amount,
-                        "description": f"Deposit {deposit_amount} {from_token} to enable swap"
-                    },
-                    "metadata": {
-                        "generated_at": datetime.now(UTC).isoformat(),
-                        "step": "deposit"
-                    }
-                }
-                
-                # Save deposit item
-                deposit_result = await self.db.tool_items.insert_one(deposit_item)
-                deposit_item_id = str(deposit_result.inserted_id)
-                deposit_item["_id"] = deposit_item_id
-                
-                # Update operation with deposit item
-                await self.tool_state_manager.update_operation(
-                    session_id=self.deps.session_id,
-                    tool_operation_id=command_info["tool_operation_id"],
-                    metadata={
-                        "needs_deposit": True,
-                        "deposit_amount": deposit_amount,
-                        "deposit_item_id": deposit_item_id
-                    }
-                )
-            
-            # Generate quotes using Solver Bus if available
-            solver_quotes = []
-            if self.solver_bus_client:
-                try:
-                    # Convert amount to proper decimal format
-                    decimal_amount = str(int(from_amount * 10**24))  # Assuming NEAR with 24 decimals
-                    
-                    # Get quotes from Solver Bus
-                    quote_result = await self.solver_bus_client.get_quote(
-                        token_in=from_asset_id,
-                        token_out=to_asset_id,
-                        amount_in=decimal_amount
-                    )
-                    
-                    if quote_result.get("success", False):
-                        solver_quotes = quote_result.get("quotes", [])
-                        logger.info(f"Received {len(solver_quotes)} quotes from Solver Bus")
-                except Exception as e:
-                    logger.error(f"Error getting quotes from Solver Bus: {e}")
-            
-            # Create swap items based on quotes or fallback to CoinGecko estimate
-            swap_items = []
-            
-            if solver_quotes:
-                # Create items from solver quotes
-                for i, quote in enumerate(solver_quotes):
-                    # Extract quote data
-                    quote_hash = quote.get("quote_hash", "")
-                    amount_in = quote.get("amount_in", "0")
-                    amount_out = quote.get("amount_out", "0")
-                    expiration_time = quote.get("expiration_time", 0)
-                    
-                    # Convert amounts to human-readable format
-                    try:
-                        human_amount_in = float(amount_in) / 10**24  # Assuming NEAR with 24 decimals
-                        human_amount_out = float(amount_out) / 10**6  # Assuming USDC with 6 decimals
-                        rate = human_amount_out / human_amount_in if human_amount_in > 0 else 0
-                    except (ValueError, ZeroDivisionError):
-                        human_amount_in = float(amount_in)
-                        human_amount_out = float(amount_out)
-                        rate = 0
-                    
-                    # Format expiration time
-                    expiration_datetime = datetime.fromtimestamp(int(expiration_time))
-                    expiration_str = expiration_datetime.strftime("%Y-%m-%d %H:%M:%S")
-                    
-                    # Create swap item
-                    swap_item = {
-                        "session_id": self.deps.session_id,
-                        "tool_operation_id": command_info["tool_operation_id"],
-                        "content_type": self.registry.content_type.value,
-                        "state": ToolOperationState.COLLECTING.value,
-                        "status": OperationStatus.PENDING.value,
-                        "content": {
-                            "operation_type": "swap",
-                            "from_token": from_token,
-                            "from_amount": human_amount_in,
-                            "to_token": to_token,
-                            "to_chain": to_chain,
-                            "received_amount": human_amount_out,
-                            "exchange_rate": rate,
-                            "quote_hash": quote_hash,
-                            "expiration_time": expiration_str,
-                            "description": f"Swap {human_amount_in} {from_token} for {human_amount_out} {to_token} on {to_chain} (Rate: 1 {from_token} = {rate} {to_token})"
-                        },
-                        "metadata": {
-                            "generated_at": datetime.now(UTC).isoformat(),
-                            "step": "swap",
-                            "source": "solver_bus",
-                            "quote_data": quote
-                        }
-                    }
-                    
-                    # Save swap item
-                    swap_result = await self.db.tool_items.insert_one(swap_item)
-                    swap_item_id = str(swap_result.inserted_id)
-                    swap_item["_id"] = swap_item_id
-                    swap_items.append(swap_item)
-            else:
-                # Fallback to CoinGecko estimate
-                estimated_rate = command_info.get("estimated_rate", 0)
-                estimated_receive = command_info.get("estimated_receive", 0)
-                
-                # Create fallback swap item
-                swap_item = {
-                    "session_id": self.deps.session_id,
-                    "tool_operation_id": command_info["tool_operation_id"],
-                    "content_type": self.registry.content_type.value,
-                    "state": ToolOperationState.COLLECTING.value,
-                    "status": OperationStatus.PENDING.value,
-                    "content": {
-                        "operation_type": "swap",
-                        "from_token": from_token,
-                        "from_amount": from_amount,
-                        "to_token": to_token,
-                        "to_chain": to_chain,
-                        "estimated_rate": estimated_rate,
-                        "estimated_receive": estimated_receive,
-                        "description": f"Swap {from_amount} {from_token} for approximately {estimated_receive} {to_token} on {to_chain} (Estimated only)"
-                    },
-                    "metadata": {
-                        "generated_at": datetime.now(UTC).isoformat(),
-                        "step": "swap",
-                        "source": "coingecko_estimate",
-                        "is_fallback": True
-                    }
-                }
-                
-                # Save swap item
-                swap_result = await self.db.tool_items.insert_one(swap_item)
-                swap_item_id = str(swap_result.inserted_id)
-                swap_item["_id"] = swap_item_id
-                swap_items.append(swap_item)
-            
-            # Update operation with all swap items
-            await self.tool_state_manager.update_operation(
-                session_id=self.deps.session_id,
-                tool_operation_id=command_info["tool_operation_id"],
-                metadata={
-                    "swap_item_ids": [str(item["_id"]) for item in swap_items],
-                    "quote_count": len(swap_items)
-                }
-            )
-            
-            # Prepare items for approval flow
-            items = []
-            
-            # Add deposit item if needed
-            if deposit_item:
-                items.append(deposit_item)
-            
-            # Add swap items
-            items.extend(swap_items)
-            
-            # Create analysis for display
-            analysis = {
-                "total_quotes": len(swap_items),
-                "deposit_required": deposit_item is not None,
-                "quote_source": "solver_bus" if solver_quotes else "coingecko_estimate",
-                "from_token": from_token,
-                "to_token": to_token,
-                "to_chain": to_chain
-            }
-            
-            return {
-                "success": True,
-                "items": items,
-                "tool_operation_id": command_info["tool_operation_id"],
-                "analysis": analysis
-            }
-            
-        except Exception as e:
-            logger.error(f"Error generating quotes: {e}", exc_info=True)
-            return {
-                "success": False,
-                "error": str(e)
-            }
-
-    # Add execute_scheduled_operation method to align with schedule_manager.py expectations
     async def execute_scheduled_operation(self, operation: Dict) -> Dict:
-        """Execute a scheduled operation when triggered by monitoring service
-        
-        This method is called by ScheduleManager when a scheduled operation
-        is due for execution, either based on time or when monitoring conditions are met.
-        """
+        """Execute a scheduled limit order operation following the intents lifecycle"""
         try:
-            logger.info(f"Executing scheduled operation: {operation.get('_id')}")
+            logger.info(f"Executing limit order operation: {operation.get('_id')}")
             
-            # Extract operation details
+            # Extract operation parameters
             content = operation.get("content", {})
-            operation_type = content.get("operation_type")
+            params = operation.get("parameters", {})
+            custom_params = params.get("custom_params", {})
             
-            # Get the favorable quote if this is a limit order
-            favorable_quote = operation.get("metadata", {}).get("favorable_quote")
+            # Get swap parameters
+            swap_params = params.get("swap", {})
+            from_token = swap_params.get("from_token")
+            from_amount = swap_params.get("from_amount")
+            to_token = swap_params.get("to_token")
+            chain_out = swap_params.get("chain_out", "eth")
             
-            # Execute based on operation type
-            if operation_type == "deposit":
-                token_symbol = content.get("token_symbol")
-                amount = content.get("amount")
-                
-                # For NEAR deposits, we need to wrap first
-                if token_symbol.upper() == "NEAR":
-                    try:
-                        # First wrap the NEAR
-                        wrap_result = await wrap_near(self.near_account, amount)
-                        logger.info(f"Wrapped NEAR: {wrap_result}")
-                        
-                        # Small delay to ensure wrapping completes
-                        await asyncio.sleep(3)
-                    except Exception as e:
-                        logger.error(f"Error wrapping NEAR: {e}")
-                        return {
-                            "success": False,
-                            "message": f"Failed to wrap NEAR: {str(e)}"
-                        }
-                
-                # Perform the deposit
-                try:
-                    result = await intent_deposit(self.near_account, token_symbol, amount)
-                    logger.info(f"Deposit result: {result}")
-                    
-                    return {
-                        "success": True,
-                        "message": f"Successfully deposited {amount} {token_symbol}",
-                        "result": result
-                    }
-                except Exception as e:
-                    logger.error(f"Error depositing tokens: {e}")
-                    return {
-                        "success": False,
-                        "message": f"Failed to deposit tokens: {str(e)}"
-                    }
-                    
-            elif operation_type == "withdraw":
-                token_symbol = content.get("token_symbol")
-                amount = content.get("amount")
-                destination_address = content.get("destination_address", self.near_account.account_id)
-                destination_chain = content.get("destination_chain", "near")
-                
-                # Perform the withdrawal
-                try:
-                    result = await intent_withdraw(
-                        self.near_account, 
-                        destination_address, 
-                        token_symbol, 
-                        amount, 
-                        network=destination_chain
-                    )
-                    logger.info(f"Withdrawal result: {result}")
-                    
-                    return {
-                        "success": True,
-                        "message": f"Successfully withdrew {amount} {token_symbol} to {destination_address} on {destination_chain}",
-                        "result": result
-                    }
-                except Exception as e:
-                    logger.error(f"Error withdrawing tokens: {e}")
-                    return {
-                        "success": False,
-                        "message": f"Failed to withdraw tokens: {str(e)}"
-                    }
-                    
-            elif operation_type == "swap" or operation_type == "limit_order":
-                from_token = content.get("from_token")
-                from_amount = content.get("from_amount")
-                to_token = content.get("to_token")
-                to_chain = content.get("to_chain", "near")
-                
-                # Execute the swap
-                try:
-                    # Use the quote hash if available from monitoring service
-                    quote_hash = None
-                    if favorable_quote:
-                        quote_hash = favorable_quote.get("quote_hash")
-                        logger.info(f"Using favorable quote with hash: {quote_hash}")
-                    
-                    swap_result = await intent_swap(
-                        self.near_account, 
-                        from_token, 
-                        from_amount, 
-                        to_token, 
-                        chain_out=to_chain
-                    )
-                    
-                    # Calculate amount received
-                    amount_out = from_decimals(swap_result.get('amount_out', 0), to_token)
-                    
-                    return {
-                        "success": True,
-                        "message": f"Successfully swapped {from_amount} {from_token} for {amount_out} {to_token}",
-                        "result": swap_result
-                    }
-                except Exception as e:
-                    logger.error(f"Error executing swap: {e}")
-                    return {
-                        "success": False,
-                        "message": f"Failed to execute swap: {str(e)}"
-                    }
-            else:
-                return {
-                    "success": False,
-                    "message": f"Unknown operation type: {operation_type}"
-                }
-                
-        except Exception as e:
-            logger.error(f"Error in execute_scheduled_operation: {e}")
-            return {
-                "success": False,
-                "message": f"Error executing scheduled operation: {str(e)}"
-            }
+            # Get withdrawal parameters
+            withdraw_params = params.get("withdraw", {})
+            withdrawal_enabled = withdraw_params.get("enabled", False)
+            destination_address = withdraw_params.get("destination_address")
+            destination_chain = withdraw_params.get("destination_chain", chain_out)
 
-    async def _get_token_price(self, symbol: str) -> Optional[float]:
-        """Get token price using CoinGecko"""
-        try:
-            if not self.coingecko_client:
-                return None
+            execution_steps = []
+            try:
+                # 1. Check initial balance
+                initial_balance = await get_intent_balance(self.near_account, from_token)
+                logger.info(f"Initial {from_token} balance in intents: {initial_balance}")
+                execution_steps.append({
+                    "step": "check_balance",
+                    "result": {"initial_balance": initial_balance}
+                })
+
+                # 2. Handle deposit if needed
+                if initial_balance < from_amount:
+                    needed_amount = from_amount - initial_balance
+                    logger.info(f"Depositing {needed_amount} {from_token}")
+                    
+                    if from_token == "NEAR":
+                        # First wrap NEAR
+                        wrap_result = await wrap_near(self.near_account, needed_amount)
+                        logger.info(f"Wrapped NEAR result: {wrap_result}")
+                        execution_steps.append({
+                            "step": "wrap_near",
+                            "result": wrap_result
+                        })
+                        await asyncio.sleep(3)  # Wait for wrap to complete
+                    
+                    # Then deposit
+                    deposit_result = await intent_deposit(self.near_account, from_token, needed_amount)
+                    logger.info(f"Deposit result: {deposit_result}")
+                    execution_steps.append({
+                        "step": "deposit",
+                        "result": deposit_result
+                    })
+                    await asyncio.sleep(3)  # Wait for deposit to complete
+                    
+                    # Verify deposit
+                    new_balance = await get_intent_balance(self.near_account, from_token)
+                    if new_balance < from_amount:
+                        raise ValueError(f"Deposit verification failed. Balance: {new_balance} {from_token}")
+
+                # 3. Execute swap with solver quote flow
+                logger.info(f"Executing swap: {from_amount} {from_token} -> {to_token}")
                 
-            # Get CoinGecko ID for the token
-            coingecko_id = await self.coingecko_client._get_coingecko_id(symbol)
-            if not coingecko_id:
-                return None
+                # Create IntentRequest and get quotes
+                request = IntentRequest().asset_in(
+                    from_token, 
+                    from_amount
+                ).asset_out(
+                    to_token, 
+                    chain=chain_out
+                )
                 
-            # Get token price
-            price_data = await self.coingecko_client.get_token_price(coingecko_id)
-            if not price_data or 'price_usd' not in price_data:
-                return None
+                # Get and select best quote
+                options = await fetch_options(request)
+                best_option = select_best_option(options)
                 
-            return price_data['price_usd']
-            
+                if not best_option:
+                    raise Exception("No valid quotes received from solver")
+                
+                execution_steps.append({
+                    "step": "get_quotes",
+                    "result": {
+                        "quote_count": len(options),
+                        "best_quote": best_option
+                    }
+                })
+                
+                # Execute swap with best quote
+                swap_result = await intent_swap(
+                    self.near_account,
+                    from_token,
+                    from_amount,
+                    to_token,
+                    chain_out=chain_out
+                )
+                
+                if not swap_result or 'error' in swap_result:
+                    raise Exception(f"Swap failed: {swap_result.get('error', 'Unknown error')}")
+                
+                execution_steps.append({
+                    "step": "swap",
+                    "result": swap_result
+                })
+                
+                # Wait for swap to complete
+                await asyncio.sleep(3)
+                
+                # Calculate received amount
+                received_amount = from_decimals(swap_result.get('amount_out', 0), to_token)
+                logger.info(f"Swap successful. Received {received_amount} {to_token}")
+
+                # 4. Handle withdrawal if enabled
+                if withdrawal_enabled and destination_address:
+                    logger.info(f"Withdrawing {received_amount} {to_token} to {destination_address} on {destination_chain}")
+                    
+                    withdrawal_result = await smart_withdraw(
+                        account=self.near_account,
+                        token=to_token,
+                        amount=received_amount,
+                        destination_address=destination_address,
+                        destination_chain=destination_chain
+                    )
+                    
+                    if not withdrawal_result or 'error' in withdrawal_result:
+                        raise Exception(f"Withdrawal failed: {withdrawal_result.get('error', 'Unknown error')}")
+                    
+                    execution_steps.append({
+                        "step": "withdraw",
+                        "result": withdrawal_result
+                    })
+                    
+                    logger.info(f"Withdrawal successful: {withdrawal_result}")
+                    
+                    # Wait for withdrawal to complete
+                    await asyncio.sleep(3)
+
+                # 5. Final balance check
+                final_balance = await get_intent_balance(self.near_account, to_token)
+                execution_steps.append({
+                    "step": "final_balance",
+                    "result": {"final_balance": final_balance}
+                })
+
+                return {
+                    'success': True,
+                    'execution_steps': execution_steps,
+                    'final_result': {
+                        'from_token': from_token,
+                        'from_amount': from_amount,
+                        'to_token': to_token,
+                        'received_amount': received_amount,
+                        'destination_chain': destination_chain if withdrawal_enabled else chain_out,
+                        'withdrawal_executed': withdrawal_enabled
+                    },
+                    'execution_time': datetime.now(UTC).isoformat()
+                }
+
+            except Exception as e:
+                logger.error(f"Error in execution steps: {e}", exc_info=True)
+                return {
+                    'success': False,
+                    'error': str(e),
+                    'execution_steps': execution_steps,  # Include steps completed before error
+                    'execution_time': datetime.now(UTC).isoformat()
+                }
+
         except Exception as e:
-            logger.error(f"Error getting token price: {e}")
-            return None
+            logger.error(f"Error in execute_scheduled_operation: {e}", exc_info=True)
+            return {
+                'success': False,
+                'error': str(e)
+            }
 
     async def _get_asset_id(self, token_symbol: str) -> str:
         """Convert token symbol to defuse asset identifier"""

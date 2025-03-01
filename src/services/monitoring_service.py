@@ -9,6 +9,7 @@ from typing import Dict, List, Optional, Any
 from src.db.db_schema import RinDB
 from src.db.enums import OperationStatus, ToolOperationState
 from src.managers.tool_state_manager import ToolStateManager
+from src.managers.schedule_manager import ScheduleManager
 from src.clients.near_intents_client.intents_client import (
     intent_swap,
     get_intent_balance,
@@ -30,14 +31,15 @@ logger = logging.getLogger(__name__)
 class LimitOrderMonitoringService:
     """Service for monitoring and executing limit orders when conditions are met"""
     
-    def __init__(self, mongo_uri: str, orchestrator=None):
+    def __init__(self, mongo_uri: str, schedule_manager: ScheduleManager = None):
         self.mongo_client = AsyncIOMotorClient(mongo_uri)
         self.db = RinDB(self.mongo_client)
         self.tool_state_manager = ToolStateManager(db=self.db)
+        self.schedule_manager = schedule_manager
         
         # Will be injected
         self.near_account = None
-        self.solver_bus_client = None
+        self.coingecko_client = None
         
         self.running = False
         self._task = None
@@ -46,12 +48,15 @@ class LimitOrderMonitoringService:
     async def inject_dependencies(self, **services):
         """Inject required services"""
         self.near_account = services.get("near_account")
-        self.solver_bus_client = services.get("solver_bus_client")
+        self.coingecko_client = services.get("coingecko_client")
+        self.schedule_manager = services.get("schedule_manager")
         
         if not self.near_account:
             logger.error("NEAR account dependency not injected")
-        if not self.solver_bus_client:
-            logger.warning("Solver Bus client dependency not injected, will use fallback quote method")
+        if not self.coingecko_client:
+            logger.error("CoinGecko client dependency not injected")
+        if not self.schedule_manager:
+            logger.error("Schedule manager dependency not injected")
 
     async def start(self):
         """Start the limit order monitoring service"""
@@ -101,7 +106,7 @@ class LimitOrderMonitoringService:
                 await asyncio.sleep(60)  # Longer wait on error
 
     async def _check_limit_order(self, order):
-        """Check if a limit order's conditions are met"""
+        """Check if a limit order's conditions are met using CoinGecko USD prices"""
         try:
             order_id = str(order.get('_id'))
             content = order.get("content", {})
@@ -111,10 +116,9 @@ class LimitOrderMonitoringService:
             from_token = content.get("from_token")
             from_amount = content.get("from_amount")
             to_token = content.get("to_token")
-            to_chain = content.get("to_chain", "eth")  # Default to ETH chain for USDC
-            min_price = content.get("min_price")
+            target_price_usd = content.get("target_price_usd")  # Price in USD we're waiting for
             
-            logger.info(f"Checking limit order {order_id}: {from_amount} {from_token} -> {to_token} at min price {min_price}")
+            logger.info(f"Checking limit order {order_id}: {from_amount} {from_token} target price ${target_price_usd}")
             
             # Check if order has expired
             expiration_timestamp = params.get("expiration_timestamp")
@@ -122,90 +126,32 @@ class LimitOrderMonitoringService:
                 await self._expire_limit_order(order)
                 return
             
-            # Check balance to ensure we have enough funds
+            # Get current USD price from CoinGecko
             try:
-                current_balance = await get_intent_balance(self.near_account, from_token)
-                if current_balance < from_amount:
-                    logger.warning(f"Insufficient balance for limit order {order_id}. Have {current_balance} {from_token}, need {from_amount}")
-                    
-                    # Update order with warning
-                    await self.db.tool_items.update_one(
-                        {"_id": ObjectId(order_id)},
-                        {"$set": {
-                            "parameters.custom_params.last_checked_timestamp": int(time.time()),
-                            "metadata.last_warning": f"Insufficient balance: {current_balance} {from_token}",
-                            "metadata.last_warning_time": datetime.now(UTC).isoformat()
-                        }}
-                    )
-                    return
-            except Exception as e:
-                logger.error(f"Error checking balance for limit order {order_id}: {e}")
-            
-            # Get current quote using the approach from test_solver_quotes_simple.py
-            try:
-                # Create intent request using the proper class
-                request = IntentRequest()
-                request.asset_in(from_token, from_amount)
-                request.asset_out(to_token, chain=to_chain)
-                
-                logger.info(f"Getting quotes for {from_amount} {from_token} to {to_token}")
-                logger.info(f"Asset IDs: {request.asset_in['asset']} -> {request.asset_out['asset']}")
-                
-                # Get quotes using the fetch_options function that works
-                solver_quotes = fetch_options(request)
-                
-                if not solver_quotes:
-                    logger.info(f"No quotes available for limit order {order_id}")
-                    
-                    # Update last checked timestamp
-                    await self.db.tool_items.update_one(
-                        {"_id": ObjectId(order_id)},
-                        {"$set": {
-                            "parameters.custom_params.last_checked_timestamp": int(time.time()),
-                            "metadata.last_check_result": "No quotes available"
-                        }}
-                    )
+                # Get CoinGecko ID for the token
+                coingecko_id = await self.coingecko_client._get_coingecko_id(from_token)
+                if not coingecko_id:
+                    logger.error(f"Could not find CoinGecko ID for {from_token}")
                     return
                 
-                # Find best quote using the existing function
-                best_option = select_best_option(solver_quotes)
-                
-                if not best_option:
-                    logger.warning(f"No valid quotes for limit order {order_id}")
-                    
-                    # Update last checked timestamp
-                    await self.db.tool_items.update_one(
-                        {"_id": ObjectId(order_id)},
-                        {"$set": {
-                            "parameters.custom_params.last_checked_timestamp": int(time.time()),
-                            "metadata.last_check_result": "No valid quotes found"
-                        }}
-                    )
+                # Get current price
+                price_data = await self.coingecko_client.get_token_price(coingecko_id)
+                if not price_data or 'price_usd' not in price_data:
+                    logger.error(f"Could not get price data for {from_token}")
                     return
                 
-                # Calculate current price
-                from_token_info = get_token_by_symbol(from_token)
-                to_token_info = get_token_by_symbol(to_token)
+                current_price = price_data['price_usd']
                 
-                from_decimals_val = from_token_info.get('decimals', 24) if from_token_info else 24
-                to_decimals_val = to_token_info.get('decimals', 6) if to_token_info else 6
+                logger.info(f"Current {from_token} price: ${current_price}, Target: ${target_price_usd}")
                 
-                human_amount_in = float(best_option['amount_in']) / (10 ** from_decimals_val)
-                human_amount_out = float(best_option['amount_out']) / (10 ** to_decimals_val)
-                
-                current_price = human_amount_out / human_amount_in if human_amount_in > 0 else 0
-                
-                logger.info(f"Limit order {order_id} current price: {current_price}, min price: {min_price}")
-                
-                # Update best quote seen if this is better
+                # Update best price seen if this is better
                 if current_price > params.get("best_price_seen", 0):
                     await self.db.tool_items.update_one(
                         {"_id": ObjectId(order_id)},
                         {"$set": {
                             "parameters.custom_params.best_price_seen": current_price,
-                            "parameters.custom_params.best_quote_seen": best_option,
                             "parameters.custom_params.last_checked_timestamp": int(time.time()),
-                            "metadata.last_check_result": f"New best price: {current_price}"
+                            "metadata.last_check_result": f"New best price: ${current_price}"
                         }}
                     )
                 else:
@@ -214,76 +160,41 @@ class LimitOrderMonitoringService:
                         {"_id": ObjectId(order_id)},
                         {"$set": {
                             "parameters.custom_params.last_checked_timestamp": int(time.time()),
-                            "metadata.last_check_result": f"Current price: {current_price}"
+                            "metadata.last_check_result": f"Current price: ${current_price}"
                         }}
                     )
                 
                 # Check if price condition is met
-                if current_price >= min_price:
-                    logger.info(f"Limit order {order_id} conditions met! Current price: {current_price}, Min price: {min_price}")
+                if current_price >= target_price_usd:
+                    logger.info(f"Limit order {order_id} conditions met! Current price: ${current_price}, Target: ${target_price_usd}")
                     
-                    # Store the quote for execution
-                    await self.db.tool_items.update_one(
-                        {"_id": ObjectId(order_id)},
-                        {"$set": {
-                            "parameters.custom_params.execution_quote": best_option,
-                            "parameters.custom_params.execution_price": current_price,
-                            "parameters.custom_params.quote_payload": {
-                                "from_token": from_token,
-                                "from_amount": from_amount,
-                                "to_token": to_token,
-                                "to_chain": to_chain,
-                                "quote_asset_in": best_option.get('defuse_asset_identifier_in'),
-                                "quote_asset_out": best_option.get('defuse_asset_identifier_out'),
-                                "amount_in": best_option.get('amount_in'),
-                                "amount_out": best_option.get('amount_out'),
-                                "quote_hash": best_option.get('quote_hash')
-                            },
-                            "parameters.custom_params.swap_payload": {
-                                "from_token": from_token,
-                                "from_amount": from_amount,
-                                "to_token": to_token,
-                                "to_chain": to_chain
-                            }
-                        }}
-                    )
-                    
-                    # Execute the order
-                    await self._execute_limit_order(order, best_option)
+                    # Signal the schedule manager that conditions are met
+                    await self.schedule_manager.execute_scheduled_operation(order)
                 
             except Exception as e:
-                logger.error(f"Error processing quotes for limit order {order_id}: {e}", exc_info=True)
+                logger.error(f"Error checking price for limit order {order_id}: {e}")
                 
                 # Update with error
                 await self.db.tool_items.update_one(
                     {"_id": ObjectId(order_id)},
                     {"$set": {
                         "parameters.custom_params.last_checked_timestamp": int(time.time()),
-                        "metadata.last_error": f"Error processing quotes: {str(e)}",
+                        "metadata.last_error": f"Error checking price: {str(e)}",
                         "metadata.last_error_time": datetime.now(UTC).isoformat(),
                         "metadata.error_count": order.get("metadata", {}).get("error_count", 0) + 1
                     }}
                 )
             
         except Exception as e:
-            logger.error(f"Error checking limit order: {e}", exc_info=True)
+            logger.error(f"Error in _check_limit_order: {e}", exc_info=True)
 
-    async def _execute_limit_order(self, order, quote):
-        """Execute a limit order when conditions are met"""
+    async def _execute_limit_order(self, order):
+        """Signal schedule manager to execute the limit order"""
         try:
             order_id = str(order.get('_id'))
             content = order.get("content", {})
-            params = order.get("parameters", {}).get("custom_params", {})
             
-            # Extract order parameters
-            from_token = content.get("from_token")
-            from_amount = content.get("from_amount")
-            to_token = content.get("to_token")
-            to_chain = content.get("to_chain", "eth")
-            
-            logger.info(f"Executing limit order {order_id}: {from_amount} {from_token} -> {to_token}")
-            
-            # Update order status to executing
+            # Update order status to indicate price conditions met
             await self.db.tool_items.update_one(
                 {"_id": ObjectId(order_id)},
                 {"$set": {
@@ -292,138 +203,11 @@ class LimitOrderMonitoringService:
                 }}
             )
             
-            # Execute the swap using the stored quote
-            try:
-                # First try using the quote hash and publish intent
-                try:
-                    # Get the quote payload from the database
-                    quote_payload = params.get("quote_payload", {})
-                    if not quote_payload:
-                        logger.warning(f"No quote payload found for order {order_id}, using provided quote")
-                        quote_payload = {
-                            "from_token": from_token,
-                            "from_amount": from_amount,
-                            "to_token": to_token,
-                            "to_chain": to_chain,
-                            "quote_asset_in": quote.get('defuse_asset_identifier_in'),
-                            "quote_asset_out": quote.get('defuse_asset_identifier_out'),
-                            "amount_in": quote.get('amount_in'),
-                            "amount_out": quote.get('amount_out'),
-                            "quote_hash": quote.get('quote_hash')
-                        }
-                    
-                    # Create the quote
-                    signed_quote = await create_token_diff_quote(
-                        self.near_account,
-                        quote_payload.get("from_token", from_token),
-                        quote_payload.get("amount_in", quote.get('amount_in')),
-                        quote_payload.get("to_token", to_token),
-                        quote_payload.get("amount_out", quote.get('amount_out')),
-                        quote_asset_in=quote_payload.get("quote_asset_in", quote.get('defuse_asset_identifier_in')),
-                        quote_asset_out=quote_payload.get("quote_asset_out", quote.get('defuse_asset_identifier_out'))
-                    )
-                    
-                    # Publish the intent
-                    signed_intent = {
-                        "signed_data": signed_quote,
-                        "quote_hashes": [quote_payload.get("quote_hash", quote.get('quote_hash'))]
-                    }
-                    
-                    swap_result = await publish_intent(signed_intent)
-                    
-                    logger.info(f"Limit order {order_id} executed with quote hash: {swap_result}")
-                    
-                    # Update order status
-                    await self.db.tool_items.update_one(
-                        {"_id": ObjectId(order_id)},
-                        {"$set": {
-                            "status": OperationStatus.EXECUTED.value,
-                            "state": ToolOperationState.COMPLETED.value,
-                            "executed_time": datetime.now(UTC),
-                            "api_response": {
-                                "success": True,
-                                "timestamp": datetime.now(UTC).isoformat(),
-                                "result": swap_result
-                            },
-                            "metadata.execution_result": swap_result,
-                            "metadata.execution_completed_at": datetime.now(UTC).isoformat(),
-                            "metadata.execution_method": "quote_hash"
-                        }}
-                    )
-                    
-                    return swap_result
-                    
-                except Exception as e:
-                    logger.warning(f"Failed to execute limit order {order_id} with quote hash: {e}")
-                    
-                    # Fall back to direct swap method
-                    logger.info(f"Falling back to direct swap for limit order {order_id}")
-                    
-                    # Get the swap payload from the database
-                    swap_payload = params.get("swap_payload", {})
-                    if not swap_payload:
-                        logger.warning(f"No swap payload found for order {order_id}, using original parameters")
-                        swap_payload = {
-                            "from_token": from_token,
-                            "from_amount": from_amount,
-                            "to_token": to_token,
-                            "to_chain": to_chain
-                        }
-                    
-                    swap_result = await intent_swap(
-                        self.near_account,
-                        swap_payload.get("from_token", from_token),
-                        swap_payload.get("from_amount", from_amount),
-                        swap_payload.get("to_token", to_token),
-                        chain_out=swap_payload.get("to_chain", to_chain)
-                    )
-                    
-                    logger.info(f"Limit order {order_id} executed with direct swap: {swap_result}")
-                    
-                    # Update order status
-                    await self.db.tool_items.update_one(
-                        {"_id": ObjectId(order_id)},
-                        {"$set": {
-                            "status": OperationStatus.EXECUTED.value,
-                            "state": ToolOperationState.COMPLETED.value,
-                            "executed_time": datetime.now(UTC),
-                            "api_response": {
-                                "success": True,
-                                "timestamp": datetime.now(UTC).isoformat(),
-                                "result": swap_result
-                            },
-                            "metadata.execution_result": swap_result,
-                            "metadata.execution_completed_at": datetime.now(UTC).isoformat(),
-                            "metadata.execution_method": "direct_swap"
-                        }}
-                    )
-                    
-                    return swap_result
-                    
-            except Exception as e:
-                logger.error(f"Error executing limit order {order_id}: {e}", exc_info=True)
-                
-                # Update order with error
-                await self.db.tool_items.update_one(
-                    {"_id": ObjectId(order_id)},
-                    {"$set": {
-                        "status": OperationStatus.FAILED.value,
-                        "metadata.execution_error": str(e),
-                        "metadata.execution_error_time": datetime.now(UTC).isoformat()
-                    }}
-                )
-                
-                return {
-                    "success": False,
-                    "error": str(e)
-                }
-                
+            # Signal schedule manager to execute the operation
+            await self.schedule_manager.execute_scheduled_operation(order)
+            
         except Exception as e:
-            logger.error(f"Error in _execute_limit_order: {e}", exc_info=True)
-            return {
-                "success": False,
-                "error": str(e)
-            }
+            logger.error(f"Error executing limit order: {e}", exc_info=True)
 
     async def _execute_direct_swap(self, order):
         """Execute a limit order using direct swap method"""
@@ -619,3 +403,18 @@ class LimitOrderMonitoringService:
                 "success": False,
                 "error": str(e)
             }
+
+    async def _check_price_with_coingecko(self, from_token: str, to_token: str) -> Optional[float]:
+        try:
+            # Get prices for both tokens
+            from_price = await self.coingecko_client.get_token_price(from_token)
+            to_price = await self.coingecko_client.get_token_price(to_token)
+            
+            if from_price and to_price:
+                # Calculate relative price
+                relative_price = to_price["price_usd"] / from_price["price_usd"]
+                return relative_price
+            return None
+        except Exception as e:
+            logger.error(f"Error checking CoinGecko price: {e}")
+            return None
