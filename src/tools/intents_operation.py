@@ -495,92 +495,69 @@ Do not include any text outside of this JSON structure."""
         try:
             logger.info(f"Executing limit order operation: {operation.get('_id')}")
             
-            # Extract operation parameters
+            # Extract operation parameters from the correct location
             content = operation.get("content", {})
-            params = operation.get("parameters", {})
-            custom_params = params.get("custom_params", {})
+            operation_details = content.get("operation_details", {})
             
-            # Get swap parameters
-            swap_params = params.get("swap", {})
-            from_token = swap_params.get("from_token")
-            from_amount = swap_params.get("from_amount")
-            to_token = swap_params.get("to_token")
-            chain_out = swap_params.get("chain_out", "eth")
+            # Create new variables to ensure correct types
+            from_token = str(operation_details.get("from_token", ""))
+            from_amount = float(operation_details.get("from_amount", 0))
+            to_token = str(operation_details.get("to_token", ""))
+            chain_out = str(operation_details.get("to_chain", "eth"))
             
-            # Get withdrawal parameters
-            withdraw_params = params.get("withdraw", {})
-            withdrawal_enabled = withdraw_params.get("enabled", False)
-            destination_address = withdraw_params.get("destination_address")
-            destination_chain = withdraw_params.get("destination_chain", chain_out)
+            logger.info(f"Executing swap with parameters: from_token='{from_token}', "
+                       f"from_amount={from_amount}, to_token='{to_token}', chain_out='{chain_out}'")
+            
+            # Validate required parameters
+            if not from_token or from_amount <= 0 or not to_token:
+                raise ValueError(f"Missing or invalid parameters: from_token={from_token}, from_amount={from_amount}, to_token={to_token}")
 
             execution_steps = []
             try:
-                # 1. Check initial balance
-                initial_balance = await get_intent_balance(self.near_account, from_token)
-                logger.info(f"Initial {from_token} balance in intents: {initial_balance}")
+                # IMPORTANT: Remove 'await' - this is not an async function
+                logger.info(f"Checking balance for token: '{from_token}'")
+                initial_balance = get_intent_balance(self.near_account, from_token)
+                initial_balance_float = float(initial_balance) if initial_balance is not None else 0
+                
+                logger.info(f"Initial {from_token} balance in intents: {initial_balance_float}")
                 execution_steps.append({
                     "step": "check_balance",
-                    "result": {"initial_balance": initial_balance}
+                    "result": {"initial_balance": initial_balance_float}
                 })
 
-                # 2. Handle deposit if needed
-                if initial_balance < from_amount:
-                    needed_amount = from_amount - initial_balance
+                # Handle deposit if needed
+                if initial_balance_float < from_amount:
+                    needed_amount = from_amount - initial_balance_float
                     logger.info(f"Depositing {needed_amount} {from_token}")
                     
                     if from_token == "NEAR":
-                        # First wrap NEAR
-                        wrap_result = await wrap_near(self.near_account, needed_amount)
+                        # IMPORTANT: Remove 'await' here too
+                        wrap_result = wrap_near(self.near_account, needed_amount)
                         logger.info(f"Wrapped NEAR result: {wrap_result}")
                         execution_steps.append({
                             "step": "wrap_near",
                             "result": wrap_result
                         })
-                        await asyncio.sleep(3)  # Wait for wrap to complete
+                        await asyncio.sleep(3)  # Keep this await - asyncio.sleep is async
                     
-                    # Then deposit
-                    deposit_result = await intent_deposit(self.near_account, from_token, needed_amount)
+                    # IMPORTANT: Remove 'await' here too
+                    deposit_result = intent_deposit(self.near_account, from_token, needed_amount)
                     logger.info(f"Deposit result: {deposit_result}")
                     execution_steps.append({
                         "step": "deposit",
                         "result": deposit_result
                     })
-                    await asyncio.sleep(3)  # Wait for deposit to complete
+                    await asyncio.sleep(3)  # Keep this await
                     
-                    # Verify deposit
-                    new_balance = await get_intent_balance(self.near_account, from_token)
-                    if new_balance < from_amount:
-                        raise ValueError(f"Deposit verification failed. Balance: {new_balance} {from_token}")
+                    # IMPORTANT: Remove 'await' here too
+                    new_balance = get_intent_balance(self.near_account, from_token)
+                    new_balance_float = float(new_balance) if new_balance is not None else 0
+                    if new_balance_float < from_amount:
+                        raise ValueError(f"Deposit verification failed. Balance: {new_balance_float} {from_token}")
 
-                # 3. Execute swap with solver quote flow
+                # Execute swap - remove 'await' here too
                 logger.info(f"Executing swap: {from_amount} {from_token} -> {to_token}")
-                
-                # Create IntentRequest and get quotes
-                request = IntentRequest().asset_in(
-                    from_token, 
-                    from_amount
-                ).asset_out(
-                    to_token, 
-                    chain=chain_out
-                )
-                
-                # Get and select best quote
-                options = await fetch_options(request)
-                best_option = select_best_option(options)
-                
-                if not best_option:
-                    raise Exception("No valid quotes received from solver")
-                
-                execution_steps.append({
-                    "step": "get_quotes",
-                    "result": {
-                        "quote_count": len(options),
-                        "best_quote": best_option
-                    }
-                })
-                
-                # Execute swap with best quote
-                swap_result = await intent_swap(
+                swap_result = intent_swap(
                     self.near_account,
                     from_token,
                     from_amount,
@@ -599,20 +576,20 @@ Do not include any text outside of this JSON structure."""
                 # Wait for swap to complete
                 await asyncio.sleep(3)
                 
-                # Calculate received amount
+                # Calculate received amount using from_decimals
                 received_amount = from_decimals(swap_result.get('amount_out', 0), to_token)
                 logger.info(f"Swap successful. Received {received_amount} {to_token}")
 
                 # 4. Handle withdrawal if enabled
-                if withdrawal_enabled and destination_address:
-                    logger.info(f"Withdrawing {received_amount} {to_token} to {destination_address} on {destination_chain}")
+                if operation_details.get("destination_address"):
+                    logger.info(f"Withdrawing {received_amount} {to_token} to {operation_details['destination_address']} on {operation_details['destination_chain']}")
                     
                     withdrawal_result = await smart_withdraw(
                         account=self.near_account,
                         token=to_token,
                         amount=received_amount,
-                        destination_address=destination_address,
-                        destination_chain=destination_chain
+                        destination_address=operation_details['destination_address'],
+                        destination_chain=operation_details['destination_chain']
                     )
                     
                     if not withdrawal_result or 'error' in withdrawal_result:
@@ -629,7 +606,7 @@ Do not include any text outside of this JSON structure."""
                     await asyncio.sleep(3)
 
                 # 5. Final balance check
-                final_balance = await get_intent_balance(self.near_account, to_token)
+                final_balance = get_intent_balance(self.near_account, to_token)
                 execution_steps.append({
                     "step": "final_balance",
                     "result": {"final_balance": final_balance}
@@ -643,8 +620,8 @@ Do not include any text outside of this JSON structure."""
                         'from_amount': from_amount,
                         'to_token': to_token,
                         'received_amount': received_amount,
-                        'destination_chain': destination_chain if withdrawal_enabled else chain_out,
-                        'withdrawal_executed': withdrawal_enabled
+                        'destination_chain': operation_details.get('destination_chain', chain_out),
+                        'withdrawal_executed': bool(operation_details.get('destination_address'))
                     },
                     'execution_time': datetime.now(UTC).isoformat()
                 }

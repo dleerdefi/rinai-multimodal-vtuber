@@ -3,9 +3,29 @@ import requests
 from typing import Optional, Dict
 import aiohttp
 import asyncio
-from functools import lru_cache
+from functools import lru_cache, wraps
 
 logger = logging.getLogger(__name__)
+
+def sync_lru_cache(maxsize=128, typed=False):
+    """A synchronous LRU cache decorator that works with async functions.
+    It caches the results, not the coroutines themselves."""
+    def decorator(fn):
+        cached_func = lru_cache(maxsize=maxsize, typed=typed)(lambda *args, **kwargs: None)
+        
+        @wraps(fn)
+        async def wrapper(*args, **kwargs):
+            cache_key = args + tuple(sorted(kwargs.items()))
+            cached_result = cached_func(*cache_key)
+            if cached_result is not None:
+                return cached_result
+                
+            # Call the original function and cache its result
+            result = await fn(*args, **kwargs)
+            cached_func.__wrapped__(*cache_key, result)
+            return result
+        return wrapper
+    return decorator
 
 class CoinGeckoClient:
     def __init__(self, api_key: str):
@@ -36,6 +56,9 @@ class CoinGeckoClient:
             "UNI": "uniswap",
             "AAVE": "aave",
         }
+
+        # Cache for token IDs
+        self._id_cache = {}
 
     async def __aenter__(self):
         self.session = aiohttp.ClientSession()
@@ -82,6 +105,13 @@ class CoinGeckoClient:
                     "price_change_24h": token_data.get("usd_24h_change")
                 }
                 
+        except aiohttp.ClientError as e:
+            logger.error(f"CoinGecko API connection error: {e}")
+            # Ensure session is closed on connection error
+            if self.session:
+                await self.session.close()
+                self.session = None
+            return None
         except Exception as e:
             logger.error(f"CoinGecko API error: {e}")
             return None
@@ -117,13 +147,18 @@ class CoinGeckoClient:
             logger.error(f"CoinGecko search error for {query}: {e}")
             return None
 
-    @lru_cache(maxsize=1000)
+    @sync_lru_cache(maxsize=1000)
     async def _get_coingecko_id(self, symbol: str) -> Optional[str]:
         """Get CoinGecko ID for a token symbol"""
         try:
+            # Check cache first
+            if symbol in self._id_cache:
+                return self._id_cache[symbol]
+                
             # First check our known mappings
             if symbol in self.SYMBOL_TO_COINGECKO:
-                return self.SYMBOL_TO_COINGECKO[symbol]
+                self._id_cache[symbol] = self.SYMBOL_TO_COINGECKO[symbol]
+                return self._id_cache[symbol]
                 
             # Try to search for the token
             search_data = await self.search_token(symbol)
@@ -132,7 +167,8 @@ class CoinGeckoClient:
                 for coin in search_data["coins"]:
                     if coin.get("symbol", "").upper() == symbol.upper():
                         logger.info(f"Found CoinGecko ID for {symbol}: {coin['id']}")
-                        return coin["id"]
+                        self._id_cache[symbol] = coin['id']
+                        return self._id_cache[symbol]
             
             logger.debug(f"No matching token found for symbol: {symbol}")
             return None

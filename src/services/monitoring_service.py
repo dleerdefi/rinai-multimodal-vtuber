@@ -155,16 +155,14 @@ class LimitOrderMonitoringService:
         try:
             order_id = str(order.get('_id'))
             content = order.get("content", {})
-            params = order.get("parameters", {}).get("custom_params", {})
-            
-            # Extract order parameters from the correct location
             operation_details = content.get("operation_details", {})
+            params = order.get("parameters", {}).get("custom_params", {})
             
             # Get values from operation_details
             from_token = operation_details.get("from_token")
-            from_amount = operation_details.get("from_amount")
+            from_amount = str(operation_details.get("from_amount"))  # Convert to string
             to_token = operation_details.get("to_token")
-            target_price_usd = operation_details.get("target_price_usd")
+            target_price_usd = float(operation_details.get("target_price_usd", 0))  # Ensure float for comparison
             
             logger.info(f"Checking limit order {order_id}: {from_amount} {from_token} target price ${target_price_usd}")
             
@@ -199,7 +197,7 @@ class LimitOrderMonitoringService:
                     logger.error(f"Could not get price data for {from_token}")
                     return
                 
-                current_price = price_data['price_usd']
+                current_price = float(price_data['price_usd'])  # Ensure float for comparison
                 
                 logger.info(f"Current {from_token} price: ${current_price}, Target: ${target_price_usd}")
                 
@@ -235,6 +233,8 @@ class LimitOrderMonitoringService:
                     
                     # Execute using the tool's execute_scheduled_operation method
                     try:
+                        # Ensure numeric values are strings for the NEAR API
+                        order['content']['operation_details']['from_amount'] = str(from_amount)
                         result = await tool.execute_scheduled_operation(order)
                         logger.info(f"Execution result: {result}")
                         
