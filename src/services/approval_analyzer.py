@@ -200,9 +200,9 @@ There are {len(current_items)} items to analyze. Return ONLY valid JSON in this 
                 
             review_text += "\nWould you like to:\n"
             review_text += "1. Approve all items\n"
-            review_text += "2. Approve specific items (e.g., 'approve items 1 and 3')\n"
+            review_text += "2. Approve specific items\n"
             review_text += "3. Regenerate all items\n"
-            review_text += "4. Regenerate specific items (e.g., 'regenerate item 2')\n"
+            review_text += "4. Regenerate specific items\n"
             review_text += "5. Cancel the operation\n"
             
             return review_text

@@ -318,10 +318,10 @@ class ScheduleManager:
                 start_time = current_time + timedelta(minutes=1)
                 
             # Get interval between items
-            interval_minutes = schedule_info.get("interval_minutes", 2.5)
+            interval_minutes = schedule_info.get("interval_minutes", 1)
             if not isinstance(interval_minutes, (int, float)) or interval_minutes <= 0:
-                logger.warning(f"Invalid interval: {interval_minutes}, using default of 2.5 minutes")
-                interval_minutes = 2.5
+                logger.warning(f"Invalid interval: {interval_minutes}, using default of 1 minute")
+                interval_minutes = 1
                 
             logger.info(f"Scheduling items starting at {start_time.isoformat()} with {interval_minutes} minute intervals")
             

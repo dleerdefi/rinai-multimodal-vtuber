@@ -144,7 +144,7 @@ Required parameters for limit order:
    - from_amount: amount to swap
    - to_token: token to swap to (e.g., NEAR, USDC)
    - target_price_usd: target price in USD per from_token
-   - to_chain: chain for the output token (optional, defaults to "eth")
+   - to_chain: chain for the output token (optional, defaults to "ethereum")
    - expiration_hours: hours until order expires (optional, defaults to 24)
    - slippage: slippage tolerance percentage (optional, defaults to 0.5)
 
@@ -167,11 +167,11 @@ Example response format:
             "from_amount": 5.0,
             "to_token": "USDC",
             "target_price_usd": 3.0,
-            "to_chain": "eth",
+            "to_chain": "ethereum",
             "expiration_hours": 24,
             "slippage": 0.5,
             "destination_address": "0x7fe4A51B1e610dcf87f2669B03Ef9d4b66b85ca8", # optional
-            "destination_chain": "eth" # optional
+            "destination_chain": "ethereum" # optional
         }},
         "priority": 1
     }}],
@@ -304,12 +304,12 @@ Example response format:
                         "from_token": params["from_token"],
                         "from_amount": params["from_amount"],
                         "to_token": params["to_token"],
-                        "chain_out": params.get("to_chain", "eth")
+                        "chain_out": params.get("to_chain", "ethereum")
                     },
                     "withdraw": {
                         "enabled": bool(params.get("destination_address")),
                         "destination_address": params.get("destination_address"),
-                        "destination_chain": params.get("destination_chain", "eth")
+                        "destination_chain": params.get("destination_chain", "ethereum")
                     }
                 }
             }
@@ -338,8 +338,8 @@ Example response format:
 Operation Details:
 - Swap {params['from_amount']} {params['from_token']} for {params['to_token']}
 - Target Price: ${params['target_price_usd']} per {params['from_token']}
-- Output Chain: {params.get('to_chain', 'eth')}
-- Destination: {params.get('destination_address', 'default wallet')} on {params.get('destination_chain', 'eth')}
+- Output Chain: {params.get('to_chain', 'ethereum')}
+- Destination: {params.get('destination_address', 'default wallet')} on {params.get('destination_chain', 'ethereum')}
 - Expires in: {params.get('expiration_hours', 24)} hours
 
 Include:
@@ -440,9 +440,9 @@ Do not include any text outside of this JSON structure."""
                         "from_amount": params["from_amount"],
                         "to_token": params["to_token"],
                         "target_price_usd": params["target_price_usd"],
-                        "to_chain": params.get("to_chain", "eth"),
+                        "to_chain": params.get("to_chain", "ethereum"),
                         "destination_address": params.get("destination_address"),
-                        "destination_chain": params.get("destination_chain", "eth"),
+                        "destination_chain": params.get("destination_chain", "ethereum"),
                         "expiration_hours": params.get("expiration_hours", 24)
                     }
                 },
@@ -503,7 +503,7 @@ Do not include any text outside of this JSON structure."""
             from_token = str(operation_details.get("from_token", ""))
             from_amount = float(operation_details.get("from_amount", 0))
             to_token = str(operation_details.get("to_token", ""))
-            chain_out = str(operation_details.get("to_chain", "eth"))
+            chain_out = str(operation_details.get("to_chain", "ethereum"))
             
             logger.info(f"Executing swap with parameters: from_token='{from_token}', "
                        f"from_amount={from_amount}, to_token='{to_token}', chain_out='{chain_out}'")
@@ -584,7 +584,7 @@ Do not include any text outside of this JSON structure."""
                 if operation_details.get("destination_address"):
                     logger.info(f"Withdrawing {received_amount} {to_token} to {operation_details['destination_address']} on {operation_details['destination_chain']}")
                     
-                    withdrawal_result = await smart_withdraw(
+                    withdrawal_result = smart_withdraw(
                         account=self.near_account,
                         token=to_token,
                         amount=received_amount,

@@ -232,7 +232,7 @@ class IntentRequest(object):
         }
         return self
 
-    def asset_out(self, asset_name, amount=None, chain="eth"):
+    def asset_out(self, asset_name, amount=None, chain="ethereum"):
         self.asset_out = {
             "asset": config.to_asset_id(asset_name, chain),
             "amount": config.to_decimals(amount, asset_name) if amount else None,
@@ -311,7 +311,7 @@ def select_best_option(options):
     return best_option
 
 
-def intent_swap(account, token_in: str, amount_in: float, token_out: str, chain_out: str = "eth") -> dict:
+def intent_swap(account, token_in: str, amount_in: float, token_out: str, chain_out: str = "ethereum") -> dict:
     """Execute a token swap using intents."""
     # Validate tokens exist on respective chains
     if not config.get_token_by_symbol(token_in):
@@ -366,7 +366,7 @@ def get_intent_balance(account, token, chain="near"):
     Args:
         account: NEAR account
         token: Token symbol (e.g., 'USDC', 'NEAR', 'ETH')
-        chain: Chain name (e.g., 'near', 'eth') - defaults to 'near'
+        chain: Chain name (e.g., 'near', 'ethereum') - defaults to 'near'
     Returns:
         float: The balance in human-readable format
     """
@@ -404,7 +404,7 @@ def smart_withdraw(account, token: str, amount: float, destination_address: str 
         amount: Amount to withdraw
         destination_address: Address to withdraw to (defaults to account.account_id)
         destination_chain: Chain to withdraw to (defaults to "near")
-        source_chain: Chain where token currently is (e.g., "eth" for ETH-USDC)
+        source_chain: Chain where token currently is (e.g., "ethereum" for ETH-USDC)
     """
     if not destination_chain:
         destination_chain = "near"
@@ -428,7 +428,7 @@ def withdraw_same_chain(account, token: str, amount: float, destination_address:
         source_chain = "near"
     elif source_chain is None:
         # Check balances to determine source chain
-        for chain in ["eth", "near", "arbitrum", "solana"]:
+        for chain in ["ethereum", "near", "arbitrum", "solana"]:
             balance = get_intent_balance(account, token, chain=chain)
             if balance >= amount:
                 source_chain = chain
@@ -509,7 +509,7 @@ def withdraw_cross_chain(account, token: str, amount: float, destination_chain: 
     if not destination_address:
         if destination_chain == "solana":
             destination_address = os.getenv('SOLANA_ACCOUNT_ID')
-        elif destination_chain in ["eth", "arbitrum", "base"]:
+        elif destination_chain in ["ethereum", "arbitrum", "base"]:
             destination_address = os.getenv('ETHEREUM_ACCOUNT_ID')
             
     if not destination_address:
@@ -593,4 +593,4 @@ if __name__ == "__main__":
     # Withdraw to external address.
     account1 = account("<>")
     # print(intent_withdraw(account1, "<near account>", "USDC", 1))
-    print(intent_withdraw(account1, "<eth address>", "USDC", 1, network='eth'))
+    print(intent_withdraw(account1, "<eth address>", "USDC", 1, network='ethereum'))

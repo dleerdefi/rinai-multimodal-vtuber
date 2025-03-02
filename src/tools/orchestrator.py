@@ -479,7 +479,7 @@ class Orchestrator:
                 
                 return {
                     "status": "success", 
-                    "response": f"Great! I've scheduled {count} tweets about {topic}. They will be posted according to your schedule.",
+                    "response": f"Great! I've scheduled {count} items about {topic}. They will be posted according to your schedule.",
                     "requires_tts": True,
                     "state": ToolOperationState.EXECUTING.value,
                     "status": OperationStatus.SCHEDULED.value
@@ -642,7 +642,7 @@ class Orchestrator:
                             # Return with "completed" status to trigger state transition
                             return {
                                 "status": "completed",  # Signal completion for state transition
-                                "response": f"Great! I've scheduled {count} tweets about {topic}. They will be posted according to your schedule.",
+                                "response": f"Great! I've scheduled {count} items about {topic}. They will be posted according to your schedule.",
                                 "requires_tts": True,
                                 "state": ToolOperationState.COMPLETED.value  # Include the state
                             }
@@ -705,7 +705,7 @@ class Orchestrator:
                                 # Return with "completed" status to trigger state transition
                                 return {
                                     "status": "completed",  # Signal completion for state transition
-                                    "response": f"Great! I've scheduled {count} tweets about {topic}. They will be posted according to your schedule.",
+                                    "response": f"Great! I've scheduled {count} items about {topic}. They will be posted according to your schedule.",
                                     "requires_tts": True,
                                     "state": ToolOperationState.COMPLETED.value  # Include the state
                                 }

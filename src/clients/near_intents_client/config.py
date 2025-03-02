@@ -15,7 +15,7 @@ TOKENS = [
                 "address": "17208628f84f5d6ad33f0da3bbbeb27ffcb398eac501a31bd6ad2011e36133a1",
                 "defuse_asset_id": "nep141:17208628f84f5d6ad33f0da3bbbeb27ffcb398eac501a31bd6ad2011e36133a1"
             },
-            "eth": {
+            "ethereum": {
                 "token_id": "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48",
                 "address": "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48",
                 "defuse_asset_id": "nep141:eth-0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48.omft.near",
@@ -92,7 +92,7 @@ TOKENS = [
                 "address": "usdt.tether-token.near",
                 "defuse_asset_id": "nep141:usdt.tether-token.near"
             },
-            "eth": {
+            "ethereum": {
                 "token_id": "0xdAC17F958D2ee523a2206206994597C13D831ec7",
                 "address": "0xdAC17F958D2ee523a2206206994597C13D831ec7",
                 "defuse_asset_id": "nep141:eth-0xdac17f958d2ee523a2206206994597c13d831ec7.omft.near",
@@ -132,7 +132,7 @@ TOKENS = [
         "unified_asset_id": "eth",
         "icon": "https://s2.coinmarketcap.com/static/img/coins/128x128/1027.png",
         "chains": {
-            "eth": {
+            "ethereum": {
                 "token_id": "native",
                 "address": "native",
                 "type": "native",
@@ -193,7 +193,7 @@ TOKENS = [
                 "address": "0x8BEc47865aDe3B172A928df8f990Bc7f2A3b9f79",
                 "defuse_asset_id": "nep141:aaaaaa20d9e0e2461697782ef11675f668207961.factory.bridge.near"
             },
-            "eth": {
+            "ethereum": {
                 "token_id": "0xAaAAAA20D9E0e2461697782ef11675f668207961",
                 "address": "0xAaAAAA20D9E0e2461697782ef11675f668207961",
                 "defuse_asset_id": "nep141:eth-0xaaaaaa20d9e0e2461697782ef11675f668207961.omft.near",
@@ -211,7 +211,7 @@ TOKENS = [
         "unified_asset_id": "turbo",
         "icon": "https://s2.coinmarketcap.com/static/img/coins/128x128/24911.png",
         "chains": {
-            "eth": {
+            "ethereum": {
                 "token_id": "0xA35923162C49cF95e6BF26623385eb431ad920D3",
                 "address": "0xA35923162C49cF95e6BF26623385eb431ad920D3",
                 "defuse_asset_id": "nep141:eth-0xa35923162c49cf95e6bf26623385eb431ad920d3.omft.near",
@@ -313,7 +313,7 @@ TOKENS = [
     "decimals": 18,
     "icon": "https://s2.coinmarketcap.com/static/img/coins/128x128/24478.png",
     "chains": {
-        "eth": {
+        "ethereum": {
             "token_id": "0x6982508145454Ce325dDbE47a25d4ec3d2311933",
             "address": "0x6982508145454Ce325dDbE47a25d4ec3d2311933",
             "defuse_asset_id": "nep141:eth-0x6982508145454ce325ddbe47a25d4ec3d2311933.omft.near",
@@ -330,7 +330,7 @@ TOKENS = [
     "decimals": 18,
     "icon": "https://s2.coinmarketcap.com/static/img/coins/128x128/5994.png",
     "chains": {
-        "eth": {
+        "ethereum": {
             "token_id": "0x95aD61b0a150d79219dCF64E1E6Cc01f0B64C4cE",
             "address": "0x95aD61b0a150d79219dCF64E1E6Cc01f0B64C4cE",
             "defuse_asset_id": "nep141:eth-0x95ad61b0a150d79219dcf64e1e6cc01f0b64c4ce.omft.near",
@@ -347,7 +347,7 @@ TOKENS = [
     "decimals": 18,
     "icon": "https://s2.coinmarketcap.com/static/img/coins/128x128/1975.png",
     "chains": {
-        "eth": {
+        "ethereum": {
             "token_id": "0x514910771AF9Ca656af840dff83E8264EcF986CA",
             "address": "0x514910771AF9Ca656af840dff83E8264EcF986CA",
             "defuse_asset_id": "nep141:eth-0x514910771af9ca656af840dff83e8264ecf986ca.omft.near",
@@ -364,7 +364,7 @@ TOKENS = [
     "decimals": 18,
     "icon": "https://s2.coinmarketcap.com/static/img/coins/128x128/7083.png",
     "chains": {
-        "eth": {
+        "ethereum": {
             "token_id": "0x1f9840a85d5aF5bf1D1762F925BDADdC4201F984",
             "address": "0x1f9840a85d5aF5bf1D1762F925BDADdC4201F984",
             "defuse_asset_id": "nep141:eth-0x1f9840a85d5af5bf1d1762f925bdaddc4201f984.omft.near",
@@ -398,7 +398,7 @@ TOKENS = [
     "decimals": 18,
     "icon": "https://s2.coinmarketcap.com/static/img/coins/128x128/7278.png",
     "chains": {
-        "eth": {
+        "ethereum": {
             "token_id": "0x7Fc66500c84A76Ad7e9c93437bFc5Ac33E2DDaE9",
             "address": "0x7Fc66500c84A76Ad7e9c93437bFc5Ac33E2DDaE9",
             "defuse_asset_id": "nep141:eth-0x7fc66500c84a76ad7e9c93437bfc5ac33e2ddae9.omft.near",
