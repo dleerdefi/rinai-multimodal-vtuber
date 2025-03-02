@@ -23,14 +23,14 @@ from src.managers.schedule_manager import ScheduleManager
 from src.clients.coingecko_client import CoinGeckoClient
 from src.clients.near_intents_client.intents_client import (
     intent_deposit, 
-    intent_withdraw,
+    smart_withdraw,
     intent_swap,
     get_intent_balance,
     wrap_near,
     IntentRequest,
     fetch_options,
     select_best_option,
-    smart_withdraw
+    create_token_diff_quote
 )
 from src.clients.near_intents_client.config import (
     get_token_by_symbol,
@@ -134,7 +134,7 @@ class IntentsTool(BaseTool):
             tool_operation_id = str(operation['_id'])
             
             # Get LLM analysis
-            prompt = f"""You are a blockchain intents analyzer. Determine the limit order parameters.
+            prompt = f"""You are a blockchain intents analyzer. Determine the limit order parameters for buying or selling a token based on the user's command.
 
 Command: "{command}"
 
@@ -143,7 +143,7 @@ Required parameters for limit order:
    - from_token: token to swap from (e.g., NEAR, USDC)
    - from_amount: amount to swap
    - to_token: token to swap to (e.g., NEAR, USDC)
-   - min_price: minimum price in to_token per from_token
+   - target_price_usd: target price in USD per from_token
    - to_chain: chain for the output token (optional, defaults to "eth")
    - expiration_hours: hours until order expires (optional, defaults to 24)
    - slippage: slippage tolerance percentage (optional, defaults to 0.5)
@@ -170,7 +170,7 @@ Example response format:
             "to_chain": "eth",
             "expiration_hours": 24,
             "slippage": 0.5,
-            "destination_address": "0x1234567890123456789012345678901234567890", # optional
+            "destination_address": "0x7fe4A51B1e610dcf87f2669B03Ef9d4b66b85ca8", # optional
             "destination_chain": "eth" # optional
         }},
         "priority": 1
@@ -197,8 +197,8 @@ Example response format:
                 prompt=messages,
                 model_type=ModelType.GROQ_LLAMA_3_3_70B,
                 override_config={
-                    "temperature": 0.1,
-                    "max_tokens": 150
+                    "temperature": 0.15,
+                    "max_tokens": 500
                 }
             )
             
@@ -330,8 +330,9 @@ Example response format:
             
             # Get the parameters from _analyze_command
             params = operation.get("input_data", {}).get("command_info", {}).get("parameters", {})
+            logger.info(f"Using parameters for content generation: {params}")
             
-            # Generate description using LLM
+            # Generate description using LLM with improved prompt
             prompt = f"""You are a cryptocurrency expert. Generate a detailed description for a limit order with the following parameters:
 
 Operation Details:
@@ -347,18 +348,20 @@ Include:
 3. Important warnings about market volatility and risks
 4. Expected outcome when price target is met
 
-Format the response as JSON:
+IMPORTANT: Your response MUST be valid JSON in the following format:
 {{
     "title": "Limit Order Summary",
     "description": "Detailed description here...",
     "warnings": ["Warning 1", "Warning 2"],
     "expected_outcome": "Expected outcome description"
-}}"""
+}}
+
+Do not include any text outside of this JSON structure."""
 
             messages = [
                 {
                     "role": "system",
-                    "content": "You are a cryptocurrency expert. Generate clear, detailed descriptions for limit orders."
+                    "content": "You are a cryptocurrency expert. Generate clear, detailed descriptions for limit orders. Return ONLY valid JSON with no markdown formatting or additional text."
                 },
                 {
                     "role": "user",
@@ -366,18 +369,58 @@ Format the response as JSON:
                 }
             ]
 
-            # Get LLM response
+            # Log the prompt being sent
+            logger.info(f"Sending content generation prompt to LLM")
+
+            # Get LLM response with increased max_tokens and lower temperature
             response = await self.llm_service.get_response(
                 prompt=messages,
                 model_type=ModelType.GROQ_LLAMA_3_3_70B,
                 override_config={
-                    "temperature": 0.5,
-                    "max_tokens": 500
+                    "temperature": 0.15,  # Lower temperature for more predictable output
+                    "max_tokens": 800    # Increased token limit
                 }
             )
             
-            # Parse LLM response
-            generated_content = json.loads(response)
+            # Log the raw response for debugging
+            logger.info(f"Raw LLM response for content generation: {response}")
+            
+            # Clean up response - remove any markdown formatting
+            cleaned_response = response.strip()
+            if cleaned_response.startswith('```') and cleaned_response.endswith('```'):
+                # Remove markdown code blocks
+                cleaned_response = '\n'.join(cleaned_response.split('\n')[1:-1])
+            
+            # Remove any non-JSON text before or after the JSON structure
+            if '{' in cleaned_response and '}' in cleaned_response:
+                start_idx = cleaned_response.find('{')
+                end_idx = cleaned_response.rfind('}') + 1
+                cleaned_response = cleaned_response[start_idx:end_idx]
+            
+            logger.info(f"Cleaned response: {cleaned_response}")
+            
+            # Try to parse the response as JSON with robust error handling
+            try:
+                generated_content = json.loads(cleaned_response)
+                logger.info(f"Successfully parsed JSON content: {generated_content}")
+            except json.JSONDecodeError as e:
+                logger.error(f"Failed to parse LLM response as JSON: {e}")
+                
+                # Try to use the parse_strict_json utility if available
+                try:
+                    generated_content = parse_strict_json(cleaned_response)
+                    logger.info(f"Successfully parsed with parse_strict_json: {generated_content}")
+                except Exception as parse_error:
+                    logger.error(f"Failed to parse with parse_strict_json: {parse_error}")
+                    
+                    # Last resort: create minimal content structure
+                    logger.warning("Using minimal content structure as last resort")
+                    generated_content = {
+                        "title": f"Limit Order: {params['from_token']} to {params['to_token']} at ${params['target_price_usd']}",
+                        "description": f"This limit order will execute when {params['from_token']} reaches ${params['target_price_usd']}.",
+                        "warnings": ["Cryptocurrency prices are volatile", "No guarantee target price will be reached"],
+                        "expected_outcome": f"Exchange {params['from_amount']} {params['from_token']} for {params['to_token']}."
+                    }
             
             # Create tool item for approval
             tool_item = {
@@ -386,12 +429,12 @@ Format the response as JSON:
                 "schedule_id": schedule_id,
                 "content_type": self.registry.content_type.value,
                 "state": operation["state"],
-                "status": operation["status"],
+                "status": OperationStatus.PENDING.value,  # Individual item status
                 "content": {
-                    "title": generated_content["title"],
-                    "description": generated_content["description"],
-                    "warnings": generated_content["warnings"],
-                    "expected_outcome": generated_content["expected_outcome"],
+                    "title": generated_content.get("title", f"Limit Order: {params['from_token']} to {params['to_token']}"),
+                    "description": generated_content.get("description", ""),
+                    "warnings": generated_content.get("warnings", []),
+                    "expected_outcome": generated_content.get("expected_outcome", ""),
                     "operation_details": {
                         "from_token": params["from_token"],
                         "from_amount": params["from_amount"],
@@ -405,10 +448,10 @@ Format the response as JSON:
                 },
                 "metadata": {
                     "generated_at": datetime.now(UTC).isoformat(),
-                    "monitoring_params": operation.get("input_data", {}).get("command_info", {}).get("monitoring_params", {}),
+                    "scheduling_type": "monitored",
                     "state_history": [{
                         "state": operation["state"],
-                        "status": operation["status"],
+                        "status": OperationStatus.PENDING.value,
                         "timestamp": datetime.now(UTC).isoformat()
                     }]
                 }
@@ -430,12 +473,13 @@ Format the response as JSON:
                     "item_states": {
                         item_id: {
                             "state": operation["state"],
-                            "status": operation["status"]
+                            "status": OperationStatus.PENDING.value
                         }
                     }
                 }
             )
 
+            logger.info(f"Successfully created tool item {item_id} for approval")
             return {
                 "items": [tool_item],
                 "schedule_id": schedule_id,
@@ -620,3 +664,17 @@ Format the response as JSON:
                 'success': False,
                 'error': str(e)
             }
+
+    def can_handle(self, command_text: str, tool_type: Optional[str] = None) -> bool:
+        """Check if this tool can handle the given command
+        
+        This method relies on the tool_type passed from the trigger detector
+        rather than duplicating keyword detection logic.
+        """
+        # If tool_type is explicitly specified as 'intents', handle it
+        if tool_type and tool_type.lower() == self.registry.tool_type.value.lower():
+            logger.info(f"IntentsTool handling command based on explicit tool_type: {tool_type}")
+            return True
+        
+        # Otherwise, don't try to detect keywords here - that's the trigger detector's job
+        return False

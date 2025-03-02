@@ -329,6 +329,10 @@ class ScheduleManager:
             for i, item in enumerate(items):
                 scheduled_time = start_time + timedelta(minutes=i * interval_minutes)
                 
+                # Check if this is a limit order
+                is_limit_order = item.get('content_type') == ContentType.LIMIT_ORDER.value
+                
+                # Build update data - ADDING scheduling_type field
                 await self.db.tool_items.update_one(
                     {"_id": item["_id"]},
                     {"$set": {
@@ -336,6 +340,7 @@ class ScheduleManager:
                         "scheduled_time": scheduled_time,
                         "execution_order": i + 1,
                         "metadata.schedule_state": ScheduleState.ACTIVE.value,
+                        "metadata.scheduling_type": "monitored" if is_limit_order else "time_based",
                         "metadata.schedule_state_history": [{
                             "state": ScheduleState.ACTIVE.value,
                             "timestamp": datetime.now(UTC).isoformat(),
@@ -344,7 +349,7 @@ class ScheduleManager:
                     }}
                 )
                 
-                logger.info(f"Scheduled item {item['_id']} for execution at {scheduled_time.isoformat()}")
+                logger.info(f"Scheduled item {item['_id']} for execution at {scheduled_time.isoformat()}, type: {'monitored' if is_limit_order else 'time_based'}")
 
             # 5. Fix state history format - ensure it's an array
             # First check if state_history exists and is an array

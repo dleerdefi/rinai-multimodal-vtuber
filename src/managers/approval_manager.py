@@ -576,8 +576,8 @@ Format the response as JSON:
         self,
         session_id: str,
         tool_operation_id: str,
-        success: bool,
-        tool_type: str
+        success: bool = False,  # Default to False for exit
+        tool_type: str = None
     ) -> Dict:
         """Handle exit from approval flow"""
         try:
@@ -608,20 +608,33 @@ Format the response as JSON:
                 )
                 logger.info(f"Cancelled {len(current_items)} pending items")
 
-            # Update the operation state
-            await self.tool_state_manager.update_operation_state(
-                tool_operation_id, 
-                ToolOperationState.COMPLETED if success else ToolOperationState.CANCELLED
+            # Update the operation state - use the proper method
+            await self.tool_state_manager.update_operation(
+                session_id=session_id,
+                tool_operation_id=tool_operation_id,
+                state=ToolOperationState.CANCELLED.value,
+                step="cancelled",
+                metadata={
+                    "cancelled_at": datetime.now(UTC).isoformat(),
+                    "cancel_reason": "User requested exit"
+                }
             )
             
-            # Get exit details
-            exit_details = await self._get_tool_exit_details(tool_type)
+            # Get exit details - fix the _get_tool_exit_details call
+            exit_details = self._get_default_exit_details(success)
+            if tool_type:
+                tool_exit_details = await self._get_tool_exit_details(tool_type)
+                if tool_exit_details:
+                    exit_details = tool_exit_details.get(
+                        "success" if success else "cancelled",
+                        exit_details
+                    )
             
             # Return a response that includes status="exit" to trigger state transition
             return {
-                "response": exit_details.get("exit_message", "Operation complete."),
-                "status": "completed" if success else "cancelled",  # Use completed/cancelled for proper state transition
-                "state": "completed" if success else "cancelled",
+                "response": exit_details.get("exit_message", "Operation cancelled."),
+                "status": "cancelled",  # Use cancelled for proper state transition
+                "state": "cancelled",
                 "tool_type": tool_type
             }
 

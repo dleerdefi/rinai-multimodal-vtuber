@@ -37,6 +37,7 @@ from src.db.mongo_manager import MongoManager
 from src.services.schedule_service import ScheduleService
 from src.managers.agent_state_manager import AgentStateManager
 from src.db.enums import AgentState
+from src.services.monitoring_service import LimitOrderMonitoringService
 
 class RinAgent:
     def __init__(self, mongo_uri: str):
@@ -74,6 +75,9 @@ class RinAgent:
 
         # Add ScheduleService initialization
         self.schedule_service = ScheduleService(mongo_uri)
+        
+        # Add MonitoringService initialization
+        self.monitoring_service = LimitOrderMonitoringService(mongo_uri)
         
         # Initialize tool_state_manager with schedule service
         self.tool_state_manager = None  # Will be initialized in initialize()
@@ -122,8 +126,20 @@ class RinAgent:
                 logger.error(f"Failed to initialize orchestrator: {e}")
                 raise  # Orchestrator is critical, so we raise the error
             
+            # Set monitoring service in orchestrator
+            self.orchestrator.set_monitoring_service(self.monitoring_service)
+            
+            # Inject dependencies into monitoring service
+            await self.monitoring_service.inject_dependencies(
+                schedule_manager=self.orchestrator.schedule_manager,
+                coingecko_client=self.orchestrator.coingecko_client
+            )
+            
             # Start schedule service
             await self.schedule_service.start()
+            
+            # Start monitoring service
+            await self.monitoring_service.start()
             
             logger.info("Successfully initialized RinAgent and connected to all services")
         except Exception as e:
@@ -538,6 +554,10 @@ RESPONSE GUIDELINES:
             # Stop schedule service
             if hasattr(self, 'schedule_service'):
                 await self.schedule_service.stop()
+            
+            # Stop monitoring service
+            if hasattr(self, 'monitoring_service'):
+                await self.monitoring_service.stop()
             
             logger.info("Successfully cleaned up all resources")
         except Exception as e:

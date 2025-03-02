@@ -62,9 +62,11 @@ class ScheduleService:
                 current_time = datetime.now(UTC)
                 
                 # Get all scheduled items due for execution
+                # IMPORTANT: Only get time-based scheduled items, not monitored ones
                 due_items = await self.db.tool_items.find({
                     "status": OperationStatus.SCHEDULED.value,
-                    "scheduled_time": {"$lte": current_time}
+                    "scheduled_time": {"$lte": current_time},
+                    "metadata.scheduling_type": {"$ne": "monitored"}  # Skip monitored items
                 }).to_list(None)
                 
                 if due_items:

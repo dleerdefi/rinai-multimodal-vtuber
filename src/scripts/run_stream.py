@@ -60,7 +60,11 @@ def load_config():
             'mongo_uri': config['mongodb']['uri'],
             'enable_speech_input': config.get('enable_speech_input', False),
             'enable_youtube_chat': config.get('enable_youtube_chat', False),
-            'youtube_stream_id': config.get('youtube_stream_id')
+            'youtube_stream_id': config.get('youtube_stream_id'),
+            'near_account_id': config['near']['account_id'],
+            'near_private_key': config['near']['private_key'],
+            'near_network': config.get('near', {}).get('network', 'testnet'),
+            'coingecko_api_key': config['keys'][0].get('COINGECKO_API_KEY')
         }
         
         console.print("[green]Configuration loaded successfully")

@@ -26,5 +26,10 @@
     ],
     "enable_speech_input": true,
     "enable_youtube_chat": true,
-    "youtube_stream_id": "${YOUTUBE_STREAM_ID}"
+    "youtube_stream_id": "${YOUTUBE_STREAM_ID}",
+    "near": {
+        "account_id": "${NEAR_ACCOUNT_ID}",
+        "private_key": "${NEAR_PRIVATE_KEY}",
+        "network": "mainnet"
+    }
 } 

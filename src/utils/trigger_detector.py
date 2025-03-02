@@ -1,5 +1,6 @@
 import re
 from typing import Dict, List, Optional
+from src.db.enums import ToolType  # Add this import
 
 class TriggerDetector:
     def __init__(self):
@@ -138,6 +139,23 @@ class TriggerDetector:
             ]
         }
 
+        # Add specific Limit Order Tool Triggers
+        self.tool_triggers['intents'] = {
+            'keywords': [
+                'limit order', 'buy when', 'sell when', 'price reaches',
+                'target price', 'execute when', 'trigger price', 'when price hits',
+                'automated trade', 'conditional order', 'swap at'
+            ],
+            'phrases': [
+                'create limit order', 'set up limit order', 'buy when price reaches',
+                'sell when price reaches', 'execute trade at price', 'when price hits',
+                'trade automatically at', 'set target price', 'create order to buy',
+                'create order to sell', 'swap when price', 'exchange at price',
+                'sell tokens when', 'buy tokens when', 'trade NEAR when', 'trade ETH when',
+                'trade BTC when', 'trade USDC when', 'trade SOL when', 'trade USDT when'
+            ]
+        }
+
     def should_use_tools(self, message: str) -> bool:
         """Check if message should trigger tool usage"""
         message = message.lower()
@@ -223,32 +241,37 @@ class TriggerDetector:
         """Determine specific tool type needed"""
         message = message.lower()
         
-        # Check Twitter patterns first
-        if self.should_use_twitter(message):
-            return "twitter"  # This matches agent.py's check
+        # Check for limit order patterns FIRST (most specific)
+        if any(keyword.lower() in message for keyword in self.tool_triggers['intents']['keywords']) or \
+           any(phrase.lower() in message for phrase in self.tool_triggers['intents']['phrases']):
+            return ToolType.INTENTS.value  # Return proper enum value
         
-        # Rest of the tool checks remain unchanged
+        # Check Twitter patterns AFTER intents
+        if self.should_use_twitter(message):
+            return ToolType.TWITTER.value  # Return proper enum value
+        
+        # Rest of the tool checks with proper enum values
         if any(keyword.lower() in message for keyword in self.tool_triggers['time']['keywords']) or \
            any(phrase.lower() in message for phrase in self.tool_triggers['time']['phrases']):
-            return "time_tools"
+            return ToolType.TIME.value
         
         if any(keyword.lower() in message for keyword in self.tool_triggers['weather']['keywords']) or \
            any(phrase.lower() in message for phrase in self.tool_triggers['weather']['phrases']):
-            return "weather_tools"
+            return ToolType.WEATHER.value
         
         # Check crypto triggers
         if any(keyword.lower() in message for keyword in self.tool_triggers['crypto']['keywords']) or \
            any(phrase.lower() in message for phrase in self.tool_triggers['crypto']['phrases']):
-            return "crypto_data"
-            
+            return ToolType.CRYPTO.value
+        
         # Check search triggers
         if any(keyword.lower() in message for keyword in self.tool_triggers['search']['keywords']) or \
            any(phrase.lower() in message for phrase in self.tool_triggers['search']['phrases']):
-            return "perplexity_search"
-            
+            return ToolType.SEARCH.value
+        
         # Add calendar check
         if any(keyword.lower() in message for keyword in self.tool_triggers['calendar']['keywords']) or \
            any(phrase.lower() in message for phrase in self.tool_triggers['calendar']['phrases']):
-            return "calendar_tool"
-            
+            return ToolType.CALENDAR.value
+        
         return None 

@@ -7,7 +7,7 @@ from bson.objectid import ObjectId
 from typing import Dict, List, Optional, Any
 
 from src.db.db_schema import RinDB
-from src.db.enums import OperationStatus, ToolOperationState
+from src.db.enums import OperationStatus, ToolOperationState, ContentType
 from src.managers.tool_state_manager import ToolStateManager
 from src.managers.schedule_manager import ScheduleManager
 from src.clients.near_intents_client.intents_client import (
@@ -25,6 +25,8 @@ from src.clients.near_intents_client.config import (
     to_decimals,
     from_decimals
 )
+from src.clients.coingecko_client import CoinGeckoClient
+from src.clients.near_account_helper import get_near_account
 
 logger = logging.getLogger(__name__)
 
@@ -41,6 +43,9 @@ class LimitOrderMonitoringService:
         self.near_account = None
         self.coingecko_client = None
         
+        # Add tool registry similar to schedule_service
+        self._tools = {}
+        
         self.running = False
         self._task = None
         self._check_interval = 30  # Default check interval in seconds
@@ -51,12 +56,51 @@ class LimitOrderMonitoringService:
         self.coingecko_client = services.get("coingecko_client")
         self.schedule_manager = services.get("schedule_manager")
         
+        # Get the IntentsTool from the services
+        intents_tool = services.get("intents_tool")
+        if intents_tool:
+            # Register the tool by its content type
+            self._tools[ContentType.LIMIT_ORDER.value] = intents_tool
+            self._tools['limit_order'] = intents_tool  # Add string version for flexibility
+            logger.info("Registered IntentsTool for limit order monitoring")
+        
         if not self.near_account:
-            logger.error("NEAR account dependency not injected")
+            logger.error("NEAR account dependency not injected - limit order execution will fail")
+        else:
+            logger.info("NEAR account dependency successfully injected")
         if not self.coingecko_client:
             logger.error("CoinGecko client dependency not injected")
         if not self.schedule_manager:
             logger.error("Schedule manager dependency not injected")
+
+    def _get_tool_for_content(self, content_type: str) -> Optional[Any]:
+        """Get appropriate tool for content type"""
+        try:
+            # Normalize content type string
+            if isinstance(content_type, ContentType):
+                content_type = content_type.value
+            
+            # Check registry for tool
+            tool = self._tools.get(content_type)
+            
+            # If not found, log more detailed information
+            if not tool:
+                logger.error(f"No tool found for content type: {content_type}")
+                logger.error(f"Available content types in tool registry: {list(self._tools.keys())}")
+                
+                # Try to get the tool from schedule_manager's tool_registry as fallback
+                if self.schedule_manager and hasattr(self.schedule_manager, 'tool_registry'):
+                    tool = self.schedule_manager.tool_registry.get(content_type)
+                    if tool:
+                        logger.info(f"Found tool for content type {content_type} in schedule_manager's tool_registry")
+                        # Cache it for future use
+                        self._tools[content_type] = tool
+                        return tool
+            
+            return tool
+        except Exception as e:
+            logger.error(f"Error getting tool for content type {content_type}: {e}")
+            return None
 
     async def start(self):
         """Start the limit order monitoring service"""
@@ -75,11 +119,12 @@ class LimitOrderMonitoringService:
                 # Get current time
                 current_time = datetime.now(UTC)
                 
-                # Get all active limit orders
+                # Get all active limit orders - SPECIFICALLY those marked as monitored
                 active_orders = await self.db.tool_items.find({
-                    "content.operation_type": "limit_order",
+                    "content_type": ContentType.LIMIT_ORDER.value,
                     "status": OperationStatus.SCHEDULED.value,
-                    "state": ToolOperationState.EXECUTING.value
+                    "state": ToolOperationState.EXECUTING.value,
+                    "metadata.scheduling_type": "monitored"  # Only get monitored items
                 }).to_list(None)
                 
                 if active_orders:
@@ -112,14 +157,30 @@ class LimitOrderMonitoringService:
             content = order.get("content", {})
             params = order.get("parameters", {}).get("custom_params", {})
             
-            # Extract order parameters
-            from_token = content.get("from_token")
-            from_amount = content.get("from_amount")
-            to_token = content.get("to_token")
-            target_price_usd = content.get("target_price_usd")  # Price in USD we're waiting for
+            # Extract order parameters from the correct location
+            operation_details = content.get("operation_details", {})
+            
+            # Get values from operation_details
+            from_token = operation_details.get("from_token")
+            from_amount = operation_details.get("from_amount")
+            to_token = operation_details.get("to_token")
+            target_price_usd = operation_details.get("target_price_usd")
             
             logger.info(f"Checking limit order {order_id}: {from_amount} {from_token} target price ${target_price_usd}")
             
+            # Check if we have the required parameters
+            if not from_token or not target_price_usd:
+                logger.error(f"Missing required parameters for limit order {order_id}: from_token={from_token}, target_price_usd={target_price_usd}")
+                await self.db.tool_items.update_one(
+                    {"_id": ObjectId(order_id)},
+                    {"$set": {
+                        "parameters.custom_params.last_checked_timestamp": int(time.time()),
+                        "metadata.last_error": f"Missing required parameters: from_token={from_token}, target_price_usd={target_price_usd}",
+                        "metadata.last_error_time": datetime.now(UTC).isoformat()
+                    }}
+                )
+                return
+
             # Check if order has expired
             expiration_timestamp = params.get("expiration_timestamp")
             if expiration_timestamp and time.time() > expiration_timestamp:
@@ -128,13 +189,11 @@ class LimitOrderMonitoringService:
             
             # Get current USD price from CoinGecko
             try:
-                # Get CoinGecko ID for the token
                 coingecko_id = await self.coingecko_client._get_coingecko_id(from_token)
                 if not coingecko_id:
                     logger.error(f"Could not find CoinGecko ID for {from_token}")
                     return
                 
-                # Get current price
                 price_data = await self.coingecko_client.get_token_price(coingecko_id)
                 if not price_data or 'price_usd' not in price_data:
                     logger.error(f"Could not get price data for {from_token}")
@@ -168,8 +227,39 @@ class LimitOrderMonitoringService:
                 if current_price >= target_price_usd:
                     logger.info(f"Limit order {order_id} conditions met! Current price: ${current_price}, Target: ${target_price_usd}")
                     
-                    # Signal the schedule manager that conditions are met
-                    await self.schedule_manager.execute_scheduled_operation(order)
+                    # Get the appropriate tool for execution
+                    tool = self._get_tool_for_content(order.get('content_type'))
+                    if not tool:
+                        logger.error(f"No tool found for content type: {order.get('content_type')}")
+                        return
+                    
+                    # Execute using the tool's execute_scheduled_operation method
+                    try:
+                        result = await tool.execute_scheduled_operation(order)
+                        logger.info(f"Execution result: {result}")
+                        
+                        if result.get('success'):
+                            await self.db.tool_items.update_one(
+                                {"_id": ObjectId(order_id)},
+                                {"$set": {
+                                    "status": OperationStatus.EXECUTED.value,
+                                    "state": ToolOperationState.COMPLETED.value,
+                                    "executed_time": datetime.now(UTC),
+                                    "api_response": result,
+                                    "metadata.execution_result": result,
+                                    "metadata.execution_completed_at": datetime.now(UTC).isoformat()
+                                }}
+                            )
+                    except Exception as exec_error:
+                        logger.error(f"Error executing limit order {order_id}: {exec_error}")
+                        await self.db.tool_items.update_one(
+                            {"_id": ObjectId(order_id)},
+                            {"$set": {
+                                "status": OperationStatus.FAILED.value,
+                                "metadata.execution_error": str(exec_error),
+                                "metadata.execution_error_time": datetime.now(UTC).isoformat()
+                            }}
+                        )
                 
             except Exception as e:
                 logger.error(f"Error checking price for limit order {order_id}: {e}")

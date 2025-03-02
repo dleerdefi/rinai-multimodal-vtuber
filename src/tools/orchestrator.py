@@ -29,10 +29,12 @@ from src.tools.post_tweets import TwitterTool
 from src.clients.coingecko_client import CoinGeckoClient
 from src.clients.perplexity_client import PerplexityClient
 from src.clients.google_calendar_client import GoogleCalendarClient
+from src.clients.near_account_helper import get_near_account
 
 # Service imports
 from src.services.llm_service import LLMService, ModelType
 from src.services.schedule_service import ScheduleService
+from src.services.monitoring_service import LimitOrderMonitoringService
 
 # Manager imports
 from src.managers.tool_state_manager import ToolStateManager, ToolOperationState
@@ -68,6 +70,7 @@ class Orchestrator:
         self.deps = deps or AgentDependencies(session_id="default")
         self.tools = {}
         self.schedule_service = None  # Initialize as None
+        self.monitoring_service = None  # Add monitoring service reference
         
         # Initialize core services first
         self.llm_service = LLMService({
@@ -102,8 +105,22 @@ class Orchestrator:
             llm_service=self.llm_service
         )
         
-        # Register TwitterTool last after all managers are initialized
+        # Initialize CoinGecko client for price monitoring
+        self.coingecko_client = CoinGeckoClient(api_key=os.getenv('COINGECKO_API_KEY'))
+        
+        # Initialize NEAR account
+        self.near_account = get_near_account()
+        if not self.near_account:
+            logger.warning("NEAR account could not be initialized - limit orders will not work")
+        else:
+            logger.info("NEAR account initialized successfully")
+        
+        # Register tools
         self._register_twitter_tool()
+        self._register_intents_tool()
+        
+        # Log registered tools for debugging
+        logger.info(f"Registered tools: {list(self.tools.keys())}")
 
     def _register_twitter_tool(self): # register all tools?
         """Register only TwitterTool for testing"""
@@ -143,6 +160,16 @@ class Orchestrator:
         """Set the schedule service instance"""
         self.schedule_service = schedule_service
 
+    def set_monitoring_service(self, monitoring_service):
+        """Set the monitoring service instance"""
+        self.monitoring_service = monitoring_service
+        
+        # Inject monitoring service into schedule manager
+        if self.schedule_manager:
+            self.schedule_manager.inject_services(
+                monitoring_service=monitoring_service
+            )
+
     async def initialize(self):
         """Initialize async components"""
         # Initialize tools if any
@@ -153,11 +180,20 @@ class Orchestrator:
         # Start schedule service if it exists
         if self.schedule_service:
             await self.schedule_service.start()
+        
+        # Start monitoring service if it exists
+        if self.monitoring_service:
+            await self.monitoring_service.start()
 
     async def cleanup(self):
         """Cleanup async resources"""
         # Stop schedule service
-        await self.schedule_service.stop()
+        if self.schedule_service:
+            await self.schedule_service.stop()
+        
+        # Stop monitoring service
+        if self.monitoring_service:
+            await self.monitoring_service.stop()
         
         # Cleanup all tools
         for tool in self.tools.values():
@@ -717,3 +753,37 @@ class Orchestrator:
                 "status": "exit",  # Signal exit on error
                 "state": "error"
             }
+
+    def _register_intents_tool(self):
+        """Register IntentsTool for limit order operations"""
+        try:
+            # Import IntentsTool here to avoid circular imports
+            from src.tools.intents_operation import IntentsTool
+            
+            # Get registry requirements from IntentsTool
+            registry = IntentsTool.registry
+
+            # Initialize tool with deps
+            tool = IntentsTool(deps=self.deps)
+            
+            # Inject required services - importantly, pass the NEAR account
+            tool.inject_dependencies(
+                tool_state_manager=self.tool_state_manager,
+                llm_service=self.llm_service,
+                approval_manager=self.approval_manager,
+                schedule_manager=self.schedule_manager,
+                coingecko_client=self.coingecko_client,
+                near_account=self.near_account  # This is the critical injection
+            )
+
+            # Register tool with the exact key that will be looked up
+            self.tools[registry.tool_type.value] = tool
+            
+            # Also register in schedule_manager's tool_registry for scheduled operations
+            self.schedule_manager.tool_registry[registry.content_type.value] = tool
+            
+            logger.info(f"Successfully registered IntentsTool with key: {registry.tool_type.value}")
+            
+        except Exception as e:
+            logger.error(f"Failed to register IntentsTool: {e}")
+            logger.exception("IntentsTool registration failed with exception:")  # Log full traceback

@@ -228,3 +228,26 @@ class SchedulableToolInterface(ABC):
     async def execute_scheduled_operation(self, operation: Dict[str, Any]) -> Dict[str, Any]:
         """Execute a scheduled operation"""
         pass
+
+class LimitOrderToolParameters(BaseModel):
+    """Parameters for limit order operations"""
+    from_token: str = Field(description="Token to sell (e.g., NEAR, ETH)")
+    from_amount: float = Field(description="Amount to sell")
+    to_token: str = Field(description="Token to buy (e.g., USDC, ETH)")
+    target_price_usd: float = Field(description="Target price in USD")
+    to_chain: str = Field(
+        default="eth",
+        description="Destination chain for the output token"
+    )
+    expiration_hours: int = Field(
+        default=24,
+        description="Hours until order expires"
+    )
+    destination_address: Optional[str] = Field(
+        default=None,
+        description="Optional destination address for withdrawal"
+    )
+    destination_chain: Optional[str] = Field(
+        default=None,
+        description="Optional destination chain for withdrawal"
+    )
