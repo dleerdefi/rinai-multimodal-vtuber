@@ -187,97 +187,128 @@ class RinAgent:
                     logger.error(f"State manager error: {state_result['error']}")
                     return "Gomen ne~ I had a little technical difficulty! (⌒_⌒;)"
 
-                # If we have a response from state manager, use it
-                if state_result.get("response"):
-                    # Store the interaction with state metadata
+                # Continue with normal chat flow only if no tool operation is active
+                if self.state_manager.current_state == AgentState.NORMAL_CHAT:
+                    # 1. Check for tool triggers first
+                    tool_type = self.trigger_detector.get_specific_tool_type(message)
+                    if tool_type:
+                        logger.info(f"[TOOLS] Detected tool type: {tool_type}")
+                        try:
+                            # Use handle_tool_operation instead of process_command
+                            tool_result = await self.orchestrator.handle_tool_operation(
+                                message=message,
+                                session_id=session_id,
+                                tool_type=tool_type
+                            )
+                            
+                            if tool_result and isinstance(tool_result, dict):
+                                response = tool_result.get("response")
+                                if response:
+                                    await self._store_interaction(
+                                        session_id=session_id,
+                                        message=message,
+                                        response=response,
+                                        metadata={
+                                            'tool_type': tool_type,
+                                            'operation_state': tool_result.get('state')
+                                        }
+                                    )
+                                    return response
+                                    
+                        except Exception as e:
+                            logger.error(f"[TOOLS] Error in tool operation: {e}")
+                            return "Gomen ne~ I had a little technical difficulty! (⌒_⌒;)"
+                    
+                    # 2. Check for memory/RAG triggers
+                    use_memory = self.trigger_detector.should_use_memory(message)
+                    rag_guidance = None
+                    if use_memory and self.response_enricher:
+                        try:
+                            rag_guidance = await self.response_enricher.enrich_response(message)
+                            logger.info(f"Memory guidance received: {rag_guidance[:100]}...")
+                        except Exception as e:
+                            logger.warning(f"Memory lookup failed: {e}")
+                            rag_guidance = "Consider this a fresh conversation."
+
+                    # 3. Generate response for normal chat or completed tool operation
+                    tool_results = None
+                    if state_result.get("status") in ["completed", "cancelled", "exit"]:
+                        tool_results = state_result.get("operation_summary")
+                    
+                    response = await self._generate_response(
+                        message=message,
+                        session=self.sessions[session_id],
+                        session_id=session_id,
+                        tool_results=tool_results,
+                        rag_guidance=rag_guidance,
+                        role=role,
+                        interaction_type=interaction_type
+                    )
+
+                    # 4. Store interaction
                     await self._store_interaction(
                         session_id=session_id,
                         message=message,
-                        response=state_result["response"],
+                        response=response,
                         metadata={
                             'state': state_result.get('state'),
-                            'tool_type': state_result.get('tool_type')
+                            'tool_type': state_result.get('tool_type'),
+                            'operation_status': state_result.get('status')
                         }
                     )
+                    
+                    return response
+
+                # Handle state manager response for ongoing tool operations
+                if state_result.get("requires_chat_response"):
+                    # Get operation summary and RAG guidance
+                    operation_summary = state_result.get("operation_summary", {})
+                    
+                    # Check for memory/RAG even during tool operations
+                    rag_guidance = None
+                    if self.response_enricher:
+                        try:
+                            rag_guidance = await self.response_enricher.enrich_response(message)
+                            logger.info(f"Memory guidance received during tool operation: {rag_guidance[:100]}...")
+                        except Exception as e:
+                            logger.warning(f"Memory lookup failed during tool operation: {e}")
+                            rag_guidance = None
+                    
+                    # Generate response incorporating both operation summary and RAG
+                    response = await self._generate_response(
+                        message=message,
+                        session=self.sessions[session_id],
+                        session_id=session_id,
+                        tool_results=operation_summary,
+                        rag_guidance=rag_guidance,
+                        role=role,
+                        interaction_type=interaction_type
+                    )
+                    
+                    # Store interaction with operation metadata
+                    await self._store_interaction(
+                        session_id=session_id,
+                        message=message,
+                        response=response,
+                        metadata={
+                            'state': state_result.get('state'),
+                            'tool_type': state_result.get('tool_type'),
+                            'operation_id': operation_summary.get('operation_id')
+                        }
+                    )
+                    
+                    return response
+
+                # If we have a direct response from state manager, use it
+                if state_result.get("response"):
                     return state_result["response"]
 
-                # If no response but we're in TOOL_OPERATION, wait for tool result
-                if self.state_manager.current_state == AgentState.TOOL_OPERATION:
-                    logger.info("[AGENT] Waiting for tool operation result...")
-                    return "Processing your request..."
+                # Default ongoing message for tool operations
+                return "Still processing your request..."
 
             except Exception as e:
                 logger.error(f"Error in state management: {e}", exc_info=True)
                 return "Gomen ne~ I had a little technical difficulty! (⌒_⌒;)"
-
-            # Only proceed with normal chat if we're in NORMAL_CHAT state
-            if self.state_manager.current_state == AgentState.NORMAL_CHAT:
-                # Get conversation history
-                history = await self.context_manager.get_combined_context(session_id, message)
-                if history:
-                    self.sessions[session_id]['messages'] = history
-
-            # Continue with normal chat flow only if no tool operation is active
-            if self.state_manager.current_state == AgentState.NORMAL_CHAT:
-                # 1. Check for tool triggers first
-                tool_type = self.trigger_detector.get_specific_tool_type(message)
-                if tool_type:
-                    logger.info(f"[TOOLS] Detected tool type: {tool_type}")
-                    try:
-                        # Use handle_tool_operation instead of process_command
-                        result = await self.orchestrator.handle_tool_operation(
-                            message=message,
-                            session_id=session_id,
-                            tool_type=tool_type
-                        )
-                        
-                        if result and isinstance(result, dict):
-                            response = result.get("response")
-                            if response:
-                                await self._store_interaction(
-                                    session_id=session_id,
-                                    message=message,
-                                    response=response,
-                                    metadata={
-                                        'tool_type': tool_type,
-                                        'operation_state': result.get('state')
-                                    }
-                                )
-                                return response
-                                
-                    except Exception as e:
-                        logger.error(f"[TOOLS] Error in tool operation: {e}")
-                        return "Gomen ne~ I had a little technical difficulty! (⌒_⌒;)"
-                
-                # 2. Check for memory/RAG triggers
-                use_memory = self.trigger_detector.should_use_memory(message)
-                rag_guidance = None
-                if use_memory and self.response_enricher:
-                    try:
-                        rag_guidance = await self.response_enricher.enrich_response(message)
-                        logger.info(f"Memory guidance received: {rag_guidance[:100]}...")
-                    except Exception as e:
-                        logger.warning(f"Memory lookup failed: {e}")
-                        rag_guidance = "Consider this a fresh conversation."
-
-                # 3. Generate final response
-                # If tool operation completed successfully, use its results
-                tool_results = result.get("tool_results") if result.get("status") == "completed" else None
-                
-                response = await self._generate_response(
-                    message=message,
-                    session=self.sessions[session_id],
-                    session_id=session_id,
-                    tool_results=tool_results,
-                    rag_guidance=rag_guidance,
-                    role=role,
-                    interaction_type=interaction_type
-                )
-
-                # 4. Store interaction
-                await self._store_interaction(session_id, message, response)
-                
-                return response
 
         except Exception as e:
             logger.error(f"[ERROR] Failed to generate response: {e}", exc_info=True)

@@ -392,22 +392,31 @@ class Orchestrator:
                 )
                 raise
 
-            # If we get to this point, check if the operation is in a terminal state
-            # and ensure we return the proper status
-            if operation and operation.get("state") in ["completed", "cancelled", "error"]:
-                # Map operation state to response status for proper state transitions
-                status_mapping = {
-                    "completed": "completed",
-                    "cancelled": "cancelled", 
-                    "error": "exit"  # Map error to exit for state transition
-                }
+            # When operation reaches a terminal state
+            if operation and operation.get("state") in [ToolOperationState.COMPLETED.value, 
+                                                      ToolOperationState.CANCELLED.value, 
+                                                      ToolOperationState.ERROR.value]:
+                # Get operation details
+                operation_data = await self.tool_state_manager.get_operation_by_id(str(operation['_id']))
                 
-                # Ensure the response includes the status for state transitions
+                # Generate operation summary
+                summary = await self._generate_operation_summary(
+                    operation_data=operation_data,
+                    message=message,
+                    tool_type=tool_type
+                )
+
                 return {
-                    "response": result,
-                    "status": status_mapping.get(operation.get("state"), "ongoing"),
+                    "status": operation.get("state").lower(),
                     "state": operation.get("state"),
-                    "tool_type": tool_type
+                    "tool_type": tool_type,
+                    "requires_chat_response": True,
+                    "operation_summary": {
+                        "summary": summary,
+                        "operation_id": str(operation['_id']),
+                        "execution_type": "background" if operation_data.get('metadata', {}).get('schedule_state') else "immediate",
+                        "raw_data": operation_data
+                    }
                 }
             
             # For ongoing operations
@@ -787,3 +796,32 @@ class Orchestrator:
         except Exception as e:
             logger.error(f"Failed to register IntentsTool: {e}")
             logger.exception("IntentsTool registration failed with exception:")  # Log full traceback
+
+    async def _generate_operation_summary(self, operation_data: Dict, message: str, tool_type: str) -> str:
+        """Generate a consistent summary for completed operations"""
+        summary_prompt = f"""Summarize this tool operation result for the user:
+Operation Type: {tool_type}
+Status: {operation_data.get('state')}
+Input Command: {message}
+
+Operation Details:
+- Initial Request: {operation_data.get('input_data', {}).get('command')}
+- Execution State: {operation_data.get('state')}
+- Schedule Status: {operation_data.get('metadata', {}).get('schedule_state', 'immediate')}
+
+Generated Content:
+{json.dumps(operation_data.get('content_updates', {}), indent=2)}
+
+Final Result:
+{json.dumps(operation_data.get('output_data', {}), indent=2)}
+
+Format the summary to:
+1. Confirm what was set up/scheduled
+2. Explain what will happen next
+3. Provide any relevant immediate results
+4. Note any background processes that will continue"""
+
+        return await self.llm_service.get_response(
+            prompt=[{"role": "user", "content": summary_prompt}],
+            model_type=ModelType.CLAUDE_3_5_SONNET
+        )

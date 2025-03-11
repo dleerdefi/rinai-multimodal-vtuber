@@ -156,24 +156,22 @@ class LimitOrderMonitoringService:
             order_id = str(order.get('_id'))
             content = order.get("content", {})
             operation_details = content.get("operation_details", {})
-            params = order.get("parameters", {}).get("custom_params", {})
+            params = order.get("parameters", {}).get("custom_params", {})  # Get params first
             
-            # Get values from operation_details
-            from_token = operation_details.get("from_token")
-            from_amount = str(operation_details.get("from_amount"))  # Convert to string
-            to_token = operation_details.get("to_token")
-            target_price_usd = float(operation_details.get("target_price_usd", 0))  # Ensure float for comparison
+            # Get the reference token for price monitoring
+            token_to_monitor = operation_details.get("reference_token")
+            target_price_usd = float(operation_details.get("target_price_usd", 0))
             
-            logger.info(f"Checking limit order {order_id}: {from_amount} {from_token} target price ${target_price_usd}")
+            logger.info(f"Checking limit order {order_id}: monitoring {token_to_monitor} price target ${target_price_usd}")
             
             # Check if we have the required parameters
-            if not from_token or not target_price_usd:
-                logger.error(f"Missing required parameters for limit order {order_id}: from_token={from_token}, target_price_usd={target_price_usd}")
+            if not token_to_monitor or not target_price_usd:
+                logger.error(f"Missing required parameters for limit order {order_id}: token_to_monitor={token_to_monitor}, target_price_usd={target_price_usd}")
                 await self.db.tool_items.update_one(
                     {"_id": ObjectId(order_id)},
                     {"$set": {
                         "parameters.custom_params.last_checked_timestamp": int(time.time()),
-                        "metadata.last_error": f"Missing required parameters: from_token={from_token}, target_price_usd={target_price_usd}",
+                        "metadata.last_error": f"Missing required parameters: token_to_monitor={token_to_monitor}, target_price_usd={target_price_usd}",
                         "metadata.last_error_time": datetime.now(UTC).isoformat()
                     }}
                 )
@@ -187,19 +185,19 @@ class LimitOrderMonitoringService:
             
             # Get current USD price from CoinGecko
             try:
-                coingecko_id = await self.coingecko_client._get_coingecko_id(from_token)
+                coingecko_id = await self.coingecko_client._get_coingecko_id(token_to_monitor)
                 if not coingecko_id:
-                    logger.error(f"Could not find CoinGecko ID for {from_token}")
+                    logger.error(f"Could not find CoinGecko ID for {token_to_monitor}")
                     return
                 
                 price_data = await self.coingecko_client.get_token_price(coingecko_id)
                 if not price_data or 'price_usd' not in price_data:
-                    logger.error(f"Could not get price data for {from_token}")
+                    logger.error(f"Could not get price data for {token_to_monitor}")
                     return
                 
                 current_price = float(price_data['price_usd'])  # Ensure float for comparison
                 
-                logger.info(f"Current {from_token} price: ${current_price}, Target: ${target_price_usd}")
+                logger.info(f"Current {token_to_monitor} price: ${current_price}, Target: ${target_price_usd}")
                 
                 # Update best price seen if this is better
                 if current_price > params.get("best_price_seen", 0):
@@ -233,6 +231,9 @@ class LimitOrderMonitoringService:
                     
                     # Execute using the tool's execute_scheduled_operation method
                     try:
+                        # Get from_amount from operation_details
+                        from_amount = operation_details.get("from_amount")
+                        
                         # Ensure numeric values are strings for the NEAR API
                         order['content']['operation_details']['from_amount'] = str(from_amount)
                         result = await tool.execute_scheduled_operation(order)

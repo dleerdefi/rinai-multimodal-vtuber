@@ -234,50 +234,72 @@ class ToolStateManager:
         api_response: Optional[Dict] = None,
         step: str = "completed"
     ) -> Dict:
-        """End an operation with success or failure"""
+        """End a tool operation and clean up its state"""
         try:
-            # Get current operation if tool_operation_id not provided
-            if not tool_operation_id:
-                operation = await self.get_operation(session_id)
-                if not operation:
-                    raise ValueError(f"No active operation found for session {session_id}")
-                tool_operation_id = str(operation["_id"])
-            else:
-                # Get operation by ID if provided
+            # Get operation by tool_operation_id if provided, otherwise by session
+            operation = None
+            if tool_operation_id:
                 operation = await self.get_operation_by_id(tool_operation_id)
                 if not operation:
-                    raise ValueError(f"No operation found with ID {tool_operation_id}")
+                    operation = await self.get_operation(session_id)
             
-            logger.info(f"Ending operation {tool_operation_id} with success={success}")
+            if not operation:
+                logger.warning(f"No operation found to end for session {session_id}")
+                return {"error": "No active operation found"}
+
+            current_state = operation.get("state")
+            current_status = operation.get("status", "unknown")
             
-            # Update operation state
+            # Determine final states
+            final_state = self._determine_final_state(success, current_state)
+            final_status = self._determine_final_status(
+                success=success,
+                requires_scheduling=bool(operation.get("metadata", {}).get("requires_scheduling")),
+                current_status=current_status
+            )
+
+            # First, clean up any existing scheduled operations
+            try:
+                await self.db.scheduled_operations.delete_many({
+                    "tool_operation_id": str(operation["_id"])
+                })
+                logger.info(f"Cleaned up scheduled operations for {operation['_id']}")
+            except Exception as e:
+                logger.error(f"Error cleaning up scheduled operations: {e}")
+            
+            # Update operation with final state
             update_data = {
-                "state": ToolOperationState.COMPLETED.value if success else ToolOperationState.ERROR.value,
+                "state": final_state,
+                "status": final_status,
                 "step": step,
-                "metadata.completion_time": datetime.now(UTC).isoformat(),
-                "metadata.final_status": "success" if success else "error"
+                "end_reason": "completed" if success else "error",
+                "last_updated": datetime.now(UTC)
             }
             
             if api_response:
-                update_data["output_data.api_response"] = api_response
-                
-                # Ensure content_type is set if provided in api_response
-                if api_response.get("content_type"):
-                    update_data["metadata.content_type"] = api_response.get("content_type")
-            
-            # Update operation
-            await self.db.tool_operations.update_one(
-                {"_id": ObjectId(tool_operation_id)},
-                {"$set": update_data}
+                update_data["output_data"] = api_response
+
+            # Update operation in database
+            result = await self.db.tool_operations.find_one_and_update(
+                {"_id": operation["_id"]},
+                {"$set": update_data},
+                return_document=True
             )
+
+            # Clear session state if this was the active operation
+            session_operation = await self.get_operation(session_id)
+            if session_operation and str(session_operation["_id"]) == str(operation["_id"]):
+                await self.db.tool_operations.update_one(
+                    {"session_id": session_id},
+                    {"$set": {"active": False}}
+                )
             
-            # Get updated operation
-            updated_operation = await self.get_operation_by_id(tool_operation_id)
-            return updated_operation
-            
+            logger.info(f"Operation {operation['_id']} ended with state={final_state}, status={final_status}")
+            return result
+
         except Exception as e:
-            logger.error(f"Error ending operation: {e}")
-            raise
+            logger.error(f"Error ending operation: {e}", exc_info=True)
+            return {"error": str(e)}
 
     def _determine_final_state(self, success: bool, current_state: str) -> str:
         """Determine final ToolOperationState based on success and current state"""

@@ -42,11 +42,79 @@ class AgentStateManager:
         self.current_state = next_state
         return True
 
+    async def handle_exit(self, session_id: str, message: str = "exit") -> Dict:
+        """Handle exit operations across all components"""
+        try:
+            logger.info(f"Handling exit for session {session_id}")
+            
+            # Get current operation if exists
+            operation = await self.tool_state_manager.get_operation(session_id)
+            if not operation:
+                logger.info("No active operation to exit")
+                await self._transition_state(AgentAction.CANCEL_TOOL, "Exit requested - no active operation")
+                return {
+                    "state": self.current_state.value,
+                    "status": "exit",
+                    "response": "Returning to normal chat.",
+                    "requires_chat_response": True
+                }
+
+            # Get operation details
+            tool_type = operation.get('tool_type')
+            operation_id = str(operation['_id'])
+            
+            # Handle exit through orchestrator
+            exit_result = await self.orchestrator.handle_tool_operation(
+                message=message,
+                session_id=session_id,
+                tool_type=tool_type
+            )
+            
+            # End operation with appropriate status
+            await self.tool_state_manager.end_operation(
+                session_id=session_id,
+                tool_operation_id=operation_id,
+                success=False,
+                step="cancelled",
+                api_response={
+                    "status": "cancelled",
+                    "reason": "User requested exit"
+                }
+            )
+            
+            # Transition state
+            await self._transition_state(AgentAction.CANCEL_TOOL, "User requested exit")
+            self._current_tool_type = None
+            
+            # Return result for chat generation
+            return {
+                "state": self.current_state.value,
+                "status": "exit",
+                "response": exit_result.get("response", "Operation cancelled. What would you like to do?"),
+                "requires_chat_response": True,
+                "operation_summary": {
+                    "summary": "Operation was cancelled at your request.",
+                    "operation_id": operation_id,
+                    "status": "cancelled",
+                    "tool_type": tool_type
+                }
+            }
+
+        except Exception as e:
+            logger.error(f"Error handling exit: {e}")
+            await self._transition_state(AgentAction.ERROR, str(e))
+            self._current_tool_type = None
+            return self._create_error_response(str(e))
+
     async def handle_agent_state(self, message: str, session_id: str) -> Dict:
         """Main state handling method"""
         try:
             if not message:
                 return self._create_error_response("Invalid message received")
+
+            # Handle exit commands globally
+            if message.lower() in ["exit", "quit", "cancel", "stop"]:
+                return await self.handle_exit(session_id, message)
 
             # Store initial state
             initial_state = self.current_state
@@ -95,24 +163,39 @@ class AgentStateManager:
                     )
                     
                     if isinstance(result, dict):
-                        # Only transition state if explicitly completed/cancelled
                         operation_status = result.get("status", "").lower()
                         
-                        # Check for both "completed" and "cancelled" status, as well as "exit" status
-                        if operation_status in ["completed", "cancelled", "exit"]:
-                            action = AgentAction.COMPLETE_TOOL if operation_status in ["completed", "exit"] else AgentAction.CANCEL_TOOL
+                        # Handle operation completion
+                        if operation_status in ["completed", "cancelled", "error", "exit"]:
+                            # Get operation summary if available
+                            operation_summary = result.get("operation_summary", {})
+                            
+                            # Transition state based on status
+                            action = AgentAction.COMPLETE_TOOL if operation_status == "completed" else AgentAction.CANCEL_TOOL
                             await self._transition_state(action, f"Operation {operation_status}")
+                            
+                            # Clear tool type as operation is complete
                             self._current_tool_type = None
-                            logger.info(f"Transitioned to {self.current_state} after operation {operation_status}")
+                            
+                            # Return with summary for chat context
+                            return {
+                                "state": self.current_state.value,
+                                "status": operation_status,
+                                "requires_chat_response": True,
+                                "operation_summary": operation_summary,
+                                "response": operation_summary.get("summary") if operation_summary else result.get("response")
+                            }
                         
+                        # For ongoing operations
                         return {
                             **result,
                             "state": self.current_state.value,
-                            "response": result.get("response", "Processing your request...")
+                            "tool_type": self._current_tool_type
                         }
+
                 except Exception as e:
                     logger.error(f"Error in tool operation: {e}")
-                    # Let approval_manager handle the error state transition
+                    await self._transition_state(AgentAction.ERROR, str(e))
                     return self._create_error_response(str(e))
 
             # Default response for NORMAL_CHAT

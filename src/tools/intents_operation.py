@@ -92,6 +92,16 @@ class IntentsTool(BaseTool):
     async def run(self, input_data: str) -> Dict:
         """Run the intents tool - handles limit order flow"""
         try:
+            # First check if this is an approval response
+            if any(keyword in input_data.lower() for keyword in ["approve", "regenerate", "cancel"]):
+                # Let approval manager handle the response
+                return await self.approval_manager.process_approval_response(
+                    message=input_data,
+                    session_id=self.deps.session_id,
+                    content_type=self.registry.content_type.value,
+                    tool_operation_id=None  # Will be retrieved from current operation
+                )
+
             operation = await self.tool_state_manager.get_operation(self.deps.session_id)
             
             if not operation or operation.get('state') == ToolOperationState.COMPLETED.value:
@@ -133,50 +143,52 @@ class IntentsTool(BaseTool):
                 
             tool_operation_id = str(operation['_id'])
             
-            # Get LLM analysis
+            # Update prompt to be more explicit about direction and price reference
             prompt = f"""You are a blockchain intents analyzer. Determine the limit order parameters for buying or selling a token based on the user's command.
 
 Command: "{command}"
 
 Required parameters for limit order:
-   - topic: what to swap (e.g., NEAR to USDC, USDC to NEAR)
-   - from_token: token to swap from (e.g., NEAR, USDC)
-   - from_amount: amount to swap
-   - to_token: token to swap to (e.g., NEAR, USDC)
-   - target_price_usd: target price in USD per from_token
-   - to_chain: chain for the output token (optional, defaults to "ethereum")
+   - topic: what to swap (e.g., "NEAR to USDC")
+   - from_token: token being sold (e.g., "NEAR")
+   - from_amount: amount of from_token to sell
+   - to_token: token being bought (e.g., "USDC")
+   - target_price_usd: target price in USD per reference_token
+   - reference_token: token that the target price refers to
+   - to_chain: destination chain for the to_token
    - expiration_hours: hours until order expires (optional, defaults to 24)
    - slippage: slippage tolerance percentage (optional, defaults to 0.5)
 
-Instructions:
-- Return ONLY valid JSON matching the example format
-- Extract all token symbols, amounts, addresses, and chains if specified
-- For limit_order, min_price should be the minimum amount of to_token per from_token
-- If the user specifies a price like "$3.00 / NEAR", set min_price to 3.0
-- Follow the exact schema provided
-- Include NO additional text or markdown
+IMPORTANT RULES:
+- When command says "at $X per TOKEN", TOKEN is the reference_token for pricing
+- Direction matters: "swap A for B" means A is from_token and B is to_token
+- If buying a token at $X per unit, that token is the reference_token
+- Chain specification (e.g., "on Solana") refers to the to_chain
 
-Example response format:
+Example 1: "limit order swap 5 NEAR for USDC at $3.00 per NEAR"
+Should parse as:
 {{
-    "tools_needed": [{{
-        "tool_name": "intents",
-        "action": "limit_order",
-        "parameters": {{
-            "topic": "NEAR to USDC",
-            "from_token": "NEAR",
-            "from_amount": 5.0,
-            "to_token": "USDC",
-            "target_price_usd": 3.0,
-            "to_chain": "ethereum",
-            "expiration_hours": 24,
-            "slippage": 0.5,
-            "destination_address": "0x7fe4A51B1e610dcf87f2669B03Ef9d4b66b85ca8", # optional
-            "destination_chain": "ethereum" # optional
-        }},
-        "priority": 1
-    }}],
-    "reasoning": "User requested a limit order to swap 5 NEAR to USDC when the price reaches $3.00 per NEAR"
-}}"""
+    "from_token": "NEAR",
+    "from_amount": 5.0,
+    "to_token": "USDC",
+    "target_price_usd": 3.0,
+    "reference_token": "NEAR",
+    "to_chain": "ethereum"
+}}
+
+Example 2: "limit order swap 1 USDC for NEAR at $2.20 per NEAR"
+Should parse as:
+{{
+    "from_token": "USDC",
+    "from_amount": 1.0,
+    "to_token": "NEAR",
+    "target_price_usd": 2.20,
+    "reference_token": "NEAR",
+    "to_chain": "near"
+}}
+
+Return ONLY valid JSON matching the example format.
+"""
 
             messages = [
                 {
@@ -205,18 +217,105 @@ Example response format:
             logger.info(f"Raw LLM response: {response}")
             
             try:
-                # Parse response and extract key parameters
-                parsed_data = json.loads(response)
-                logger.info(f"Parsed JSON data: {parsed_data}")
+                # Parse response and use it directly as parameters
+                params = json.loads(response)
+                logger.info(f"Parsed JSON data: {params}")
                 
-                tools_data = parsed_data.get("tools_needed", [{}])[0]
-                logger.info(f"Extracted tools_data: {tools_data}")
+                # Validate required fields
+                required_fields = ['from_token', 'from_amount', 'to_token', 'target_price_usd', 'reference_token']
+                missing_fields = [field for field in required_fields if field not in params]
+                if missing_fields:
+                    raise ValueError(f"Missing required fields: {missing_fields}")
                 
-                params = tools_data.get("parameters", {})
-                logger.info(f"Extracted parameters: {params}")
+                # Set up monitoring parameters
+                monitoring_params = {
+                    "check_interval_seconds": 60,
+                    "last_checked_timestamp": int(datetime.now(UTC).timestamp()),
+                    "best_price_seen": 0,
+                    "expiration_timestamp": int((datetime.now(UTC) + timedelta(hours=params.get("expiration_hours", 24))).timestamp()),
+                    "max_checks": 1000,
+                    "reference_token": params["reference_token"]  # Add reference token to monitoring params
+                }
                 
-                content_type = tools_data.get("content_type", "unknown")
+                # Create topic string using reference token for price
+                topic = f"Limit order: {params['from_token']} to {params['to_token']} at ${params['target_price_usd']} per {params['reference_token']}"
                 
+                # Create schedule FIRST
+                schedule_id = await self.schedule_manager.initialize_schedule(
+                    tool_operation_id=tool_operation_id,
+                    schedule_info={
+                        "schedule_type": "monitoring",
+                        "operation_type": "limit_order",
+                        "total_items": 1,
+                        "monitoring_params": monitoring_params
+                    },
+                    content_type=self.registry.content_type.value,
+                    session_id=self.deps.session_id
+                )
+                
+                # THEN update operation with the schedule_id
+                await self.tool_state_manager.update_operation(
+                    session_id=self.deps.session_id,
+                    tool_operation_id=tool_operation_id,
+                    input_data={
+                        "command_info": {
+                            "operation_type": "limit_order",
+                            "parameters": params,
+                            "monitoring_params": monitoring_params,
+                            "topic": topic
+                        },
+                        "schedule_id": schedule_id
+                    },
+                    metadata={
+                        "schedule_state": ScheduleState.PENDING.value,
+                        "schedule_id": schedule_id,
+                        "operation_type": "limit_order"
+                    }
+                )
+                
+                # FINALLY return all required information
+                return {
+                    "tool_operation_id": tool_operation_id,
+                    "topic": topic,
+                    "item_count": 1,
+                    "schedule_id": schedule_id,
+                    
+                    # Required by approval_manager
+                    "tool_registry": {
+                        "requires_approval": True,
+                        "requires_scheduling": True,
+                        "content_type": self.registry.content_type.value,
+                        "tool_type": self.registry.tool_type.value
+                    },
+                    
+                    # Required by schedule_manager
+                    "schedule_info": {
+                        "schedule_type": "monitoring",
+                        "operation_type": "limit_order",
+                        "total_items": 1,
+                        "monitoring_params": monitoring_params
+                    },
+                    
+                    # Limit order specific parameters
+                    "parameters": {
+                        "price_oracle": {
+                            "symbol": params["reference_token"],
+                            "target_price_usd": params["target_price_usd"]
+                        },
+                        "swap": {
+                            "from_token": params["from_token"],
+                            "from_amount": params["from_amount"],
+                            "to_token": params["to_token"],
+                            "chain_out": params.get("to_chain", "ethereum")
+                        },
+                        "withdraw": {
+                            "enabled": bool(params.get("destination_address")),
+                            "destination_address": params.get("destination_address"),
+                            "destination_chain": params.get("destination_chain", "ethereum")
+                        }
+                    }
+                }
+
             except json.JSONDecodeError as e:
                 logger.error(f"Failed to parse LLM response as JSON: {e}")
                 logger.error(f"Raw response that failed parsing: {response}")
@@ -224,95 +323,6 @@ Example response format:
             except Exception as e:
                 logger.error(f"Error processing LLM response: {e}")
                 raise
-            
-            # Set up monitoring parameters
-            monitoring_params = {
-                "check_interval_seconds": 60,
-                "last_checked_timestamp": int(datetime.now(UTC).timestamp()),
-                "best_price_seen": 0,
-                "expiration_timestamp": int((datetime.now(UTC) + timedelta(hours=params.get("expiration_hours", 24))).timestamp()),
-                "max_checks": 1000
-            }
-            
-            # Create schedule for monitoring service
-            schedule_id = await self.schedule_manager.initialize_schedule(
-                tool_operation_id=tool_operation_id,
-                schedule_info={
-                    "schedule_type": "monitoring",
-                    "operation_type": "limit_order",
-                    "total_items": 1,
-                    "monitoring_params": monitoring_params
-                },
-                content_type=self.registry.content_type.value,
-                session_id=self.deps.session_id
-            )
-            
-            # Create topic string for display and tracking
-            topic = f"Limit order: {params['from_token']} to {params['to_token']} at ${params['target_price_usd']}"
-            
-            # Update operation with all necessary info
-            await self.tool_state_manager.update_operation(
-                session_id=self.deps.session_id,
-                tool_operation_id=tool_operation_id,
-                input_data={
-                    "command_info": {
-                        "operation_type": "limit_order",
-                        "parameters": params,
-                        "monitoring_params": monitoring_params,
-                        "topic": topic
-                    },
-                    "schedule_id": schedule_id
-                },
-                metadata={
-                    "schedule_state": ScheduleState.PENDING.value,
-                    "schedule_id": schedule_id,
-                    "operation_type": "limit_order"
-                }
-            )
-            
-            # Return all required information for orchestrator and managers
-            return {
-                # Required by orchestrator
-                "tool_operation_id": tool_operation_id,
-                "topic": topic,
-                "item_count": 1,
-                "schedule_id": schedule_id,
-                
-                # Required by approval_manager
-                "tool_registry": {
-                    "requires_approval": True,
-                    "requires_scheduling": True,
-                    "content_type": self.registry.content_type.value,
-                    "tool_type": self.registry.tool_type.value
-                },
-                
-                # Required by schedule_manager
-                "schedule_info": {
-                    "schedule_type": "monitoring",
-                    "operation_type": "limit_order",
-                    "total_items": 1,
-                    "monitoring_params": monitoring_params
-                },
-                
-                # Limit order specific parameters
-                "parameters": {
-                    "price_oracle": {
-                        "symbol": params["from_token"],
-                        "target_price_usd": params["target_price_usd"]
-                    },
-                    "swap": {
-                        "from_token": params["from_token"],
-                        "from_amount": params["from_amount"],
-                        "to_token": params["to_token"],
-                        "chain_out": params.get("to_chain", "ethereum")
-                    },
-                    "withdraw": {
-                        "enabled": bool(params.get("destination_address")),
-                        "destination_address": params.get("destination_address"),
-                        "destination_chain": params.get("destination_chain", "ethereum")
-                    }
-                }
-            }
 
         except Exception as e:
             logger.error(f"Error in limit order analysis: {e}", exc_info=True)
@@ -440,6 +450,7 @@ Do not include any text outside of this JSON structure."""
                         "from_amount": params["from_amount"],
                         "to_token": params["to_token"],
                         "target_price_usd": params["target_price_usd"],
+                        "reference_token": params["reference_token"],
                         "to_chain": params.get("to_chain", "ethereum"),
                         "destination_address": params.get("destination_address"),
                         "destination_chain": params.get("destination_chain", "ethereum"),
@@ -538,7 +549,7 @@ Do not include any text outside of this JSON structure."""
                             "step": "wrap_near",
                             "result": wrap_result
                         })
-                        await asyncio.sleep(3)  # Keep this await - asyncio.sleep is async
+                        await asyncio.sleep(15)  # Keep this await - asyncio.sleep is async
                     
                     # IMPORTANT: Remove 'await' here too
                     deposit_result = intent_deposit(self.near_account, from_token, needed_amount)
@@ -547,7 +558,7 @@ Do not include any text outside of this JSON structure."""
                         "step": "deposit",
                         "result": deposit_result
                     })
-                    await asyncio.sleep(3)  # Keep this await
+                    await asyncio.sleep(15)  # Keep this await
                     
                     # IMPORTANT: Remove 'await' here too
                     new_balance = get_intent_balance(self.near_account, from_token)
@@ -574,7 +585,7 @@ Do not include any text outside of this JSON structure."""
                 })
                 
                 # Wait for swap to complete
-                await asyncio.sleep(3)
+                await asyncio.sleep(15)
                 
                 # Calculate received amount using from_decimals
                 received_amount = from_decimals(swap_result.get('amount_out', 0), to_token)
@@ -603,7 +614,7 @@ Do not include any text outside of this JSON structure."""
                     logger.info(f"Withdrawal successful: {withdrawal_result}")
                     
                     # Wait for withdrawal to complete
-                    await asyncio.sleep(3)
+                    await asyncio.sleep(15)
 
                 # 5. Final balance check
                 final_balance = get_intent_balance(self.near_account, to_token)

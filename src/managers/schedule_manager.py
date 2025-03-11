@@ -229,17 +229,17 @@ class ScheduleManager:
                 if not session_id:
                     raise ValueError(f"No session_id found for operation {tool_operation_id}")
 
-            # Create schedule using db_schema's method
+            # Clean up any existing schedule for this operation
+            existing = await self.db.scheduled_operations.find_one({"tool_operation_id": tool_operation_id})
+            if existing:
+                logger.info(f"Found existing schedule for operation {tool_operation_id}, cleaning up...")
+                await self.db.scheduled_operations.delete_one({"tool_operation_id": tool_operation_id})
+
+            # Create new schedule
             schedule_id = await self.db.create_scheduled_operation(
                 tool_operation_id=tool_operation_id,
                 content_type=content_type,
                 schedule_info=schedule_info
-            )
-
-            # Initialize state_history as an array
-            await self.db.scheduled_operations.update_one(
-                {"_id": ObjectId(schedule_id)},
-                {"$set": {"state_history": []}}
             )
 
             # Track state transition

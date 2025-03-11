@@ -189,16 +189,43 @@ There are {len(current_items)} items to analyze. Return ONLY valid JSON in this 
             review_text = "Here are the items for your review:\n\n"
             
             for i, item in enumerate(items, 1):
-                # Handle both direct content and nested content structure
-                if isinstance(item.get('content'), str):
-                    content = item['content']
+                logger.info(f"Processing item {i} structure: {json.dumps(item.get('content', {}), indent=2)}")
+                
+                # Handle limit order content structure
+                content = item.get('content', {})
+                if isinstance(content, dict):
+                    # Format limit order details
+                    review_text += f"Item {i}:\n"
+                    review_text += f"Title: {content.get('title', 'No title')}\n"
+                    review_text += f"Description: {content.get('description', 'No description')}\n"
+                    
+                    # Add warnings if present
+                    warnings = content.get('warnings', [])
+                    if warnings:
+                        review_text += "\nWarnings:\n"
+                        for warning in warnings:
+                            review_text += f"- {warning}\n"
+                    
+                    # Add expected outcome
+                    review_text += f"\nExpected Outcome: {content.get('expected_outcome', 'No outcome specified')}\n"
+                    
+                    # Add operation details if present
+                    op_details = content.get('operation_details', {})
+                    if op_details:
+                        review_text += "\nOperation Details:\n"
+                        review_text += f"- From: {op_details.get('from_amount')} {op_details.get('from_token')}\n"
+                        review_text += f"- To: {op_details.get('to_token')}\n"
+                        review_text += f"- Target Price: ${op_details.get('target_price_usd')} per {op_details.get('from_token')}\n"
+                        review_text += f"- Chain: {op_details.get('to_chain', 'ethereum')}\n"
+                        if op_details.get('destination_address'):
+                            review_text += f"- Withdrawal to: {op_details['destination_address']} on {op_details.get('destination_chain', 'ethereum')}\n"
                 else:
-                    content = item.get('content', {}).get('raw_content', '')
+                    # Fallback for simple string content
+                    review_text += f"Item {i}:\n{content}\n"
                 
-                logger.info(f"Formatting item {i}: {content[:50]}...")
-                review_text += f"Item {i}:\n{content}\n\n"
+                review_text += "\n"
                 
-            review_text += "\nWould you like to:\n"
+            review_text += "Would you like to:\n"
             review_text += "1. Approve all items\n"
             review_text += "2. Approve specific items\n"
             review_text += "3. Regenerate all items\n"
