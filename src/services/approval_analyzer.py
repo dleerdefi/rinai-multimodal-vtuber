@@ -3,7 +3,7 @@ import json
 import logging
 from typing import Dict, List, Any, Optional
 from src.services.llm_service import LLMService, ModelType
-from src.db.enums import OperationStatus
+from src.db.enums import OperationStatus, ContentType
 
 logger = logging.getLogger(__name__)
 
@@ -19,27 +19,45 @@ class ApprovalAnalyzer:
         """Analyze user's approval response"""
         try:
             logger.info(f"Analyzing approval response: {user_response}")
-            # Build presentation of items
             presentation = self.format_items_for_review(current_items)
             
             prompt = [
                 {
                     "role": "system",
-                    "content": "Analyze user instructions on how to proceed with the proposed items and return structured JSON."
+                    "content": """You analyze user responses about content approval. Handle natural language responses flexibly.
+
+Key actions to detect:
+- Full approval: "looks good", "approve all", "yes", etc.
+- Partial approval: "approve first one", "like 1 and 3", etc.
+- Rejection/Regeneration: "reject this", "redo item 2", "regenerate", etc.
+- Exit/Cancel: "stop", "cancel", "quit", etc.
+
+Always return structured JSON with the appropriate action and indices.
+Extract both the action and any specific feedback about WHY items were rejected."""
                 },
                 {
                     "role": "user",
-                    "content": f"""Context: Previous items presented:
-{presentation}
+                    "content": f"""Context: User is reviewing {len(current_items)} items.
 
-User response: "{user_response}"
+User's response: "{user_response}"
 
-There are {len(current_items)} items to analyze. Return ONLY valid JSON in this exact format:
+Return JSON in this format:
 {{
-    "action": "full_approval" | "partial_approval" | "regenerate_all" | "exit" | "cancel" | "stop" | "error",
-    "approved_indices": [list of approved item numbers from 1 to {len(current_items)}],
-    "regenerate_indices": [list of item numbers to regenerate from 1 to {len(current_items)}],
-    "feedback": "explanation of the action taken"
+    "action": "full_approval" | "partial_approval" | "regenerate_all" | "exit",
+    "approved_indices": [item numbers approved],
+    "regenerate_indices": [item numbers to regenerate],
+    "feedback": "explanation of action taken",
+    "revision_instructions": "specific feedback about what to change or fix in regenerated items"
+}}
+
+Example:
+Input: "reject these because we need tweets about swordfish not anglerfish"
+Output: {{
+    "action": "regenerate_all",
+    "approved_indices": [],
+    "regenerate_indices": [1, 2],
+    "feedback": "All items rejected for regeneration",
+    "revision_instructions": "Generate tweets about swordfish instead of anglerfish"
 }}"""
                 }
             ]
@@ -183,7 +201,7 @@ There are {len(current_items)} items to analyze. Return ONLY valid JSON in this 
         }
 
     def format_items_for_review(self, items: List[Dict]) -> str:
-        """Format items for user review"""
+        """Format items for user review with content-type specific handling"""
         try:
             logger.info(f"Formatting {len(items)} items for review")
             review_text = "Here are the items for your review:\n\n"
@@ -191,40 +209,24 @@ There are {len(current_items)} items to analyze. Return ONLY valid JSON in this 
             for i, item in enumerate(items, 1):
                 logger.info(f"Processing item {i} structure: {json.dumps(item.get('content', {}), indent=2)}")
                 
-                # Handle limit order content structure
                 content = item.get('content', {})
-                if isinstance(content, dict):
-                    # Format limit order details
-                    review_text += f"Item {i}:\n"
-                    review_text += f"Title: {content.get('title', 'No title')}\n"
-                    review_text += f"Description: {content.get('description', 'No description')}\n"
-                    
-                    # Add warnings if present
-                    warnings = content.get('warnings', [])
-                    if warnings:
-                        review_text += "\nWarnings:\n"
-                        for warning in warnings:
-                            review_text += f"- {warning}\n"
-                    
-                    # Add expected outcome
-                    review_text += f"\nExpected Outcome: {content.get('expected_outcome', 'No outcome specified')}\n"
-                    
-                    # Add operation details if present
-                    op_details = content.get('operation_details', {})
-                    if op_details:
-                        review_text += "\nOperation Details:\n"
-                        review_text += f"- From: {op_details.get('from_amount')} {op_details.get('from_token')}\n"
-                        review_text += f"- To: {op_details.get('to_token')}\n"
-                        review_text += f"- Target Price: ${op_details.get('target_price_usd')} per {op_details.get('from_token')}\n"
-                        review_text += f"- Chain: {op_details.get('to_chain', 'ethereum')}\n"
-                        if op_details.get('destination_address'):
-                            review_text += f"- Withdrawal to: {op_details['destination_address']} on {op_details.get('destination_chain', 'ethereum')}\n"
+                content_type = item.get('content_type')
+                
+                review_text += f"Item {i}:\n"
+                
+                if content_type == ContentType.LIMIT_ORDER.value:
+                    # Format limit order content
+                    review_text += self._format_limit_order(content)
+                elif content_type == ContentType.TWEET.value:
+                    # Format tweet content
+                    review_text += self._format_tweet(content)
                 else:
-                    # Fallback for simple string content
-                    review_text += f"Item {i}:\n{content}\n"
+                    # Generic content formatting
+                    review_text += self._format_generic_content(content)
                 
                 review_text += "\n"
                 
+            # Add standard options menu
             review_text += "Would you like to:\n"
             review_text += "1. Approve all items\n"
             review_text += "2. Approve specific items\n"
@@ -236,4 +238,61 @@ There are {len(current_items)} items to analyze. Return ONLY valid JSON in this 
 
         except Exception as e:
             logger.error(f"Error formatting items for review: {e}")
-            return f"Error formatting items: {str(e)}" 
+            return f"Error formatting items: {str(e)}"
+
+    def _format_limit_order(self, content: Dict) -> str:
+        """Format limit order specific content"""
+        text = ""
+        text += f"Title: {content.get('title', 'No title')}\n"
+        text += f"Description: {content.get('description', 'No description')}\n"
+        
+        warnings = content.get('warnings', [])
+        if warnings:
+            text += "\nWarnings:\n"
+            for warning in warnings:
+                text += f"- {warning}\n"
+        
+        text += f"\nExpected Outcome: {content.get('expected_outcome', 'No outcome specified')}\n"
+        
+        op_details = content.get('operation_details', {})
+        if op_details:
+            text += "\nOperation Details:\n"
+            text += f"- From: {op_details.get('from_amount')} {op_details.get('from_token')}\n"
+            text += f"- To: {op_details.get('to_token')}\n"
+            text += f"- Target Price: ${op_details.get('target_price_usd')} per {op_details.get('reference_token')}\n"
+            text += f"- Chain: {op_details.get('to_chain', 'ethereum')}\n"
+            if op_details.get('destination_address'):
+                text += f"- Withdrawal to: {op_details['destination_address']} on {op_details.get('destination_chain', 'ethereum')}\n"
+        
+        return text
+
+    def _format_tweet(self, content: Dict) -> str:
+        """Format tweet specific content"""
+        text = ""
+        if content.get('raw_content'):
+            text += f"Tweet: {content['raw_content']}\n"
+        elif content.get('formatted_content'):
+            text += f"Tweet: {content['formatted_content']}\n"
+        
+        # Add any tweet-specific metadata
+        metadata = content.get('metadata', {})
+        if metadata:
+            if metadata.get('estimated_engagement'):
+                text += f"Estimated Engagement: {metadata['estimated_engagement']}\n"
+            if metadata.get('scheduled_time'):
+                text += f"Scheduled Time: {metadata['scheduled_time']}\n"
+        
+        return text
+
+    def _format_generic_content(self, content: Dict) -> str:
+        """Format generic content when specific formatter not available"""
+        if isinstance(content, dict):
+            # Try to extract meaningful fields
+            text = ""
+            for key, value in content.items():
+                if key not in ['metadata', 'version']:  # Skip technical fields
+                    text += f"{key.replace('_', ' ').title()}: {value}\n"
+            return text
+        else:
+            # Fallback for simple string content
+            return f"{content}\n" 

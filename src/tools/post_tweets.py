@@ -274,10 +274,19 @@ Example response format:
             logger.error(f"Error in Twitter command analysis: {e}", exc_info=True)
             raise
 
-    async def _generate_content(self, topic: str, count: int, schedule_id: str = None, tool_operation_id: str = None) -> Dict:
+    async def _generate_content(
+        self, 
+        topic: str, 
+        count: int, 
+        schedule_id: str = None, 
+        tool_operation_id: str = None,
+        revision_instructions: str = None
+    ) -> Dict:
         """Generate tweet content and save as tool items"""
         try:
             logger.info(f"Starting tweet generation: {count} tweets about {topic}")
+            if revision_instructions:
+                logger.info(f"With revision instructions: {revision_instructions}")
             
             # Get parent operation to inherit state/status
             operation = await self.tool_state_manager.get_operation(self.deps.session_id)
@@ -292,24 +301,38 @@ Example response format:
             is_regenerating = operation.get("metadata", {}).get("approval_state") == ApprovalState.REGENERATING.value
             logger.info(f"Generating tweets in {'regeneration' if is_regenerating else 'initial'} mode")
             
-            # Generate tweets using LLM
-            prompt = f"""You are a professional social media manager. Generate {count} engaging tweets about {topic}.
+            # Modify prompt based on whether we have revision instructions
+            base_prompt = f"""You are a professional social media manager. Generate {count} engaging tweets about {topic}."""
+            
+            if revision_instructions:
+                base_prompt += f"\n\nImportant revision instructions: {revision_instructions}"
+            
+            prompt = f"""{base_prompt}
 
 Guidelines:
 - Each tweet should be unique and engaging
 - Include relevant hashtags
-- Keep within Twitter's character limit
+- Keep within Twitter's character limit (280 characters)
 - Vary the style and tone
 - Make them informative yet conversational
 - Include emojis where appropriate
+- No hashtags, just the content
+- Smart subtle intelligent tweets, be original and creative
+- Ensure proper JSON formatting with commas between items
 
-Format the response as JSON:
+Return ONLY valid JSON in this exact format:
 {{
     "items": [
         {{
-            "content": "Tweet text here",
+            "content": "First tweet text",
             "metadata": {{
                 "estimated_engagement": "high/medium/low"
+            }}
+        }},
+        {{
+            "content": "Second tweet text",
+            "metadata": {{
+                "estimated_engagement": "medium"
             }}
         }}
     ]
@@ -318,7 +341,7 @@ Format the response as JSON:
             messages = [
                 {
                     "role": "system",
-                    "content": "You are a professional social media manager. Generate engaging tweets in JSON format."
+                    "content": "You are a professional social media manager. Generate engaging tweets in strict JSON format with no trailing commas."
                 },
                 {
                     "role": "user",
@@ -326,27 +349,57 @@ Format the response as JSON:
                 }
             ]
 
-            logger.info(f"Sending generation prompt to LLM: {messages}")
+            logger.info(f"Sending generation prompt to LLM")
             response = await self.llm_service.get_response(
                 prompt=messages,
                 model_type=ModelType.GROQ_LLAMA_3_3_70B,
                 override_config={
                     "temperature": 0.7,
-                    "max_tokens": 1000
+                    "max_tokens": 1000,
+                    "response_format": {"type": "json_object"}  # Request JSON format
                 }
             )
             
             logger.info(f"Raw LLM response: {response}")
             
-            # Strip markdown code blocks if present
-            response = response.strip()
-            if response.startswith('```') and response.endswith('```'):
-                # Remove the first line (```json) and the last line (```)
-                response = '\n'.join(response.split('\n')[1:-1])
-            
-            generated_items = json.loads(response)
-            logger.info(f"Parsed generated items: {generated_items}")
-            
+            # Clean and parse the response
+            try:
+                # Strip any markdown formatting
+                cleaned_response = response.strip()
+                if cleaned_response.startswith('```') and cleaned_response.endswith('```'):
+                    cleaned_response = '\n'.join(cleaned_response.split('\n')[1:-1])
+                if cleaned_response.startswith('```json'):
+                    cleaned_response = cleaned_response[7:]
+                
+                # Remove any trailing commas before closing braces
+                cleaned_response = cleaned_response.replace(',}', '}').replace(',]', ']')
+                
+                # Parse JSON
+                generated_items = json.loads(cleaned_response)
+                logger.info(f"Successfully parsed generated items")
+                
+                if not generated_items.get('items'):
+                    raise ValueError("No items found in generated content")
+                    
+            except json.JSONDecodeError as e:
+                logger.error(f"JSON parsing error: {e}")
+                logger.error(f"Problematic response: {cleaned_response}")
+                # Attempt basic error recovery
+                try:
+                    # Try to extract content between curly braces
+                    import re
+                    content_match = re.search(r'\{\s*"items"\s*:\s*\[(.*)\]\s*\}', cleaned_response, re.DOTALL)
+                    if content_match:
+                        items_str = content_match.group(1)
+                        # Fix common JSON issues
+                        items_str = items_str.replace(',,', ',').replace(',]', ']').replace(',}', '}')
+                        generated_items = {"items": json.loads(f"[{items_str}]")}
+                    else:
+                        raise ValueError("Could not extract valid JSON structure")
+                except Exception as recovery_error:
+                    logger.error(f"Recovery attempt failed: {recovery_error}")
+                    raise ValueError("Failed to parse tweet content") from e
+
             # Transform and save items with proper state inheritance
             saved_items = []
             current_pending_items = operation.get("output_data", {}).get("pending_items", [])
@@ -519,7 +572,8 @@ Format the response as JSON:
                 topic=topic, 
                 count=regenerate_count, 
                 schedule_id=operation.get("input_data", {}).get("schedule_id"), 
-                tool_operation_id=tool_operation_id
+                tool_operation_id=tool_operation_id,
+                revision_instructions=analysis.get("revision_instructions")
             )
 
         except Exception as e:

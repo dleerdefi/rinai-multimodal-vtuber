@@ -36,12 +36,13 @@ class ToolStateManager:
             ToolOperationState.COLLECTING.value: [
                 ToolOperationState.APPROVING.value,
                 ToolOperationState.EXECUTING.value,
-                ToolOperationState.ERROR.value  # Allow error from collecting
+                ToolOperationState.ERROR.value  
             ],
             ToolOperationState.APPROVING.value: [
                 ToolOperationState.EXECUTING.value,
                 ToolOperationState.CANCELLED.value,
-                ToolOperationState.ERROR.value  # Allow error from approving
+                ToolOperationState.ERROR.value,
+                ToolOperationState.COLLECTING.value # Allow collecting from approving for regeneration
             ],
             ToolOperationState.EXECUTING.value: [
                 ToolOperationState.COMPLETED.value,
