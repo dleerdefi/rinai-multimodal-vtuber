@@ -282,17 +282,9 @@ class Orchestrator:
             operation = await self.tool_state_manager.get_operation(session_id)
             logger.info(f"Retrieved operation for session {session_id}: {operation['_id'] if operation else None}")
             
-            # If operation exists, check its state to determine flow
+            # If operation exists, delegate to _handle_ongoing_operation
             if operation:
-                current_state = operation.get('state')
-                logger.info(f"Operation {operation['_id']} in state: {current_state}")
-                
-                if current_state == ToolOperationState.APPROVING.value:
-                    # Handle approval response through approval manager
-                    logger.info(f"Processing approval response for operation {operation['_id']}")
-                    return await self._handle_ongoing_operation(operation, message)
-                
-                # ... handle other states ...
+                return await self._handle_ongoing_operation(operation, message)
 
             # If no operation, start new one
             operation = await self.tool_state_manager.start_operation(
@@ -372,7 +364,7 @@ class Orchestrator:
                     )
                     
                     if tool.registry.requires_scheduling:
-                        return await self._handle_scheduled_operation(operation, message)
+                        return await self._handle_scheduled_operation(operation, generation_result["items"])
                     else:
                         # Execute immediately
                         result = await tool.run(message)
@@ -445,7 +437,7 @@ class Orchestrator:
             except Exception as end_error:
                 logger.error(f"Failed to end operation with error: {end_error}")
             
-            # Ensure errors also trigger state transition by returning exit status
+            # Ensure errors also trigger state transition
             return {
                 "error": str(e),
                 "response": f"I encountered an error: {str(e)}",
@@ -453,53 +445,36 @@ class Orchestrator:
                 "state": "error"
             }
 
-    async def _handle_scheduled_operation(self, operation: Dict, message: str) -> Dict:
-        """Initialize and activate a schedule for operation"""
+    async def _handle_scheduled_operation(self, operation: Dict, approved_items: List[Dict]) -> Dict:
         try:
-            logger.info(f"Handling scheduled operation for {operation['_id']}")
-            
-            # 1. Initialize schedule if not exists
+            # Get schedule info from operation
+            schedule_info = operation.get('input_data', {}).get('command_info', {})
             schedule_id = operation.get('metadata', {}).get('schedule_id')
+            
             if not schedule_id:
-                logger.error("No schedule ID found for scheduled operation")
-                return {"status": "error", "response": "Schedule information missing"}
-
-            # 2. Activate schedule (moves items to SCHEDULED status)
+                raise ValueError("No schedule ID found for operation")
+            
+            # Activate schedule with approved items
             success = await self.schedule_manager.activate_schedule(
                 tool_operation_id=str(operation['_id']),
                 schedule_id=schedule_id
             )
-
+            
             if success:
-                # 3. Update operation state to EXECUTING with schedule info
-                await self.tool_state_manager.update_operation(
-                    session_id=operation['session_id'],
-                    tool_operation_id=str(operation['_id']),
-                    state=ToolOperationState.EXECUTING.value,
-                    metadata={
-                        "schedule_state": ScheduleState.ACTIVE.value,
-                        "schedule_id": schedule_id
-                    }
-                )
-                
-                # Get schedule details for user-friendly response
-                schedule_info = operation.get('input_data', {}).get('command_info', {})
-                topic = schedule_info.get('topic', 'your content')
-                count = schedule_info.get('item_count', 'multiple items')
-                
                 return {
-                    "status": "success", 
-                    "response": f"Great! I've scheduled {count} items about {topic}. They will be posted according to your schedule.",
-                    "requires_tts": True,
-                    "state": ToolOperationState.EXECUTING.value,
-                    "status": OperationStatus.SCHEDULED.value
+                    "success": True,
+                    "response": "Schedule activated successfully",
+                    "schedule_id": schedule_id
                 }
-
-            return {"status": "error", "response": "Failed to schedule operation"}
-
+            
+            return {
+                "success": False,
+                "error": "Failed to activate schedule"
+            }
+            
         except Exception as e:
-            logger.error(f"Error in _handle_scheduled_operation: {e}")
-            return {"status": "error", "response": str(e)}
+            logger.error(f"Error handling scheduled operation: {e}")
+            return {"success": False, "error": str(e)}
 
     async def _handle_approval_flow(self, operation: Dict, message: str, items: List[Dict]) -> Dict:
         """Handle operations requiring approval"""
@@ -518,7 +493,7 @@ class Orchestrator:
                 
                 if requires_scheduling:
                     # Handle scheduling for approved items
-                    schedule_result = await self._handle_scheduled_operation(operation, message)
+                    schedule_result = await self._handle_scheduled_operation(operation, items)
                     return schedule_result
                 else:
                     # Execute approved items immediately
@@ -543,7 +518,11 @@ class Orchestrator:
             current_state = operation.get('state')
             tool_type = operation.get('tool_type')
             logger.info(f"Handling ongoing operation {operation['_id']} in state {current_state}")
-            
+
+            # Get original count from initial command
+            original_count = operation.get('input_data', {}).get('command_info', {}).get('item_count', 0)
+            logger.info(f"Original requested count: {original_count}")
+
             # Get the tool instance
             tool = self.tools.get(tool_type)
             if not tool:
@@ -587,7 +566,7 @@ class Orchestrator:
                             self.approval_manager.handle_regenerate_all(
                                 session_id=session_id,
                                 tool_operation_id=tool_operation_id,
-                                analysis=analysis  # Pass the analysis here
+                                analysis=analysis
                             ),
                         "exit": lambda tool_operation_id, session_id, **kwargs:
                             self.approval_manager.handle_exit(
@@ -599,111 +578,84 @@ class Orchestrator:
                     }
                 )
 
-                # Check result status to determine next action
-                if approval_result.get("error"):
-                    logger.error(f"Error in approval flow: {approval_result['error']}")
-                    return {
-                        "error": approval_result["error"],
-                        "response": f"I encountered an error: {approval_result['error']}",
-                        "status": "ongoing",  # Keep as ongoing instead of exit
-                        "state": current_state  # Maintain current state
-                    }
-                
-                elif approval_result.get("status") == OperationStatus.APPROVED.value:
-                    logger.info(f"Approval successful for operation {operation['_id']}")
-                    
-                    # Update step to "scheduling"
-                    await self.tool_state_manager.update_operation(
-                        session_id=operation['session_id'],
+                # Check if we need to generate new content
+                if approval_result.get("status") == "regeneration_needed":
+                    # Keep existing regeneration logic
+                    collecting_items = await self.tool_state_manager.get_operation_items(
                         tool_operation_id=str(operation['_id']),
-                        step="scheduling"
+                        state=ToolOperationState.COLLECTING.value
                     )
                     
-                    # Check if scheduling is required
-                    if tool.registry.requires_scheduling:
-                        logger.info(f"Tool requires scheduling, proceeding to schedule flow")
-                        return await self._handle_scheduled_operation(operation, message)
-                    else:
-                        # Execute approved items immediately
-                        execution_result = await tool.execute_approved_items(operation)
-                        await self.tool_state_manager.end_operation(
-                            session_id=operation['session_id'],
-                            tool_operation_id=str(operation['_id']),
-                            success=True,
-                            api_response=execution_result
-                        )
-                        return execution_result
-                
-                elif approval_result.get("status") == "regeneration_needed":
-                    logger.info(f"Regeneration needed for operation {operation['_id']}")
-                    
-                    # Extract revision instructions from the analysis result
-                    revision_instructions = approval_result.get("data", {}).get("analysis", {}).get("revision_instructions")
-                    logger.info(f"Revision instructions from analysis: {revision_instructions}")
-                    
-                    # First mark current items as CANCELLED/REJECTED through approval_manager
-                    cancel_result = await self.approval_manager.handle_regenerate_all(
-                        session_id=operation['session_id'],
-                        tool_operation_id=str(operation['_id']),
-                        analysis=approval_result.get("data", {}).get("analysis", {})
-                    )
-                    
-                    if cancel_result.get("error"):
-                        logger.error(f"Error cancelling items: {cancel_result['error']}")
-                        return cancel_result
-                    
-                    # Now the operation should be in COLLECTING state
-                    operation = await self.tool_state_manager.get_operation_by_id(str(operation['_id']))
-                    if not operation:
-                        raise ValueError(f"Operation not found after regeneration request")
-                    
-                    # Get the tool type from the original operation
-                    tool_type = operation.get('tool_type')
-                    if not tool_type:
-                        raise ValueError("No tool type found in operation")
-                    
-                    # Get the tool instance
-                    tool = self.tools.get(tool_type)
-                    if not tool:
-                        raise ValueError(f"Tool not found for type {tool_type}")
-                    
-                    # Generate new content with revision instructions
-                    try:
+                    if collecting_items:
+                        # Generate new content for existing items
                         generation_result = await tool._generate_content(
-                            topic=operation.get("input_data", {}).get("command_info", {}).get("topic"),
-                            count=operation.get("input_data", {}).get("command_info", {}).get("item_count"),
-                            schedule_id=operation.get("input_data", {}).get("schedule_id"),
-                            tool_operation_id=str(operation['_id']),
-                            revision_instructions=revision_instructions
+                            topic=operation.get('input_data', {}).get('topic'),
+                            count=len(collecting_items),  # Use existing items count
+                            revision_instructions=approval_result.get("data", {}).get("analysis", {}).get("revision_instructions"),
+                            schedule_id=operation.get('metadata', {}).get('schedule_id'),
+                            tool_operation_id=str(operation['_id'])
                         )
                         
-                        # Move operation back to APPROVING state and start new approval flow
-                        await self.tool_state_manager.update_operation(
-                            session_id=operation['session_id'],
-                            tool_operation_id=str(operation['_id']),
-                            state=ToolOperationState.APPROVING.value
-                        )
-                        
-                        # Start new approval flow with generated items
+                        # Update existing items with new content
+                        for item, new_content in zip(collecting_items, generation_result["items"]):
+                            await self.tool_state_manager.update_tool_item(
+                                tool_operation_id=str(operation['_id']),
+                                item_id=str(item['_id']),
+                                content=new_content,
+                                state=ToolOperationState.APPROVING.value
+                            )
+
+                        # Start new approval flow with updated items
                         return await self.approval_manager.start_approval_flow(
                             session_id=operation['session_id'],
                             tool_operation_id=str(operation['_id']),
-                            items=generation_result["items"],
-                            analysis=approval_result.get("data", {}).get("analysis", {})
+                            items=collecting_items,
+                            message=message
                         )
-                        
-                    except Exception as e:
-                        logger.error(f"Error during content regeneration: {e}")
+                    else:
+                        logger.error("No items found in COLLECTING state for regeneration")
                         return {
-                            "error": str(e),
-                            "response": f"I encountered an error while regenerating content: {str(e)}",
-                            "status": "error"
+                            "status": "error",
+                            "response": "No items found in COLLECTING state for regeneration",
+                            "requires_tts": True
                         }
-                
-                # For partial approvals or other states, return the result to maintain the approval loop
+
+                # After approval (not regeneration), check if we've met our count
+                elif approval_result.get("status") == OperationStatus.APPROVED.value:
+                    # Get total approved items
+                    approved_items = await self.tool_state_manager.get_operation_items(
+                        tool_operation_id=str(operation['_id']),
+                        state=ToolOperationState.EXECUTING.value,
+                        status=OperationStatus.APPROVED.value
+                    )
+                    
+                    logger.info(f"Found {len(approved_items)} approved items out of {original_count} required")
+
+                    # If we have all required items approved
+                    if len(approved_items) >= original_count:
+                        logger.info("Required item count reached, proceeding with completion flow")
+                        
+                        # Check if scheduling is required
+                        if tool.registry.requires_scheduling:
+                            return await self._handle_scheduled_operation(operation, approved_items[:original_count])
+                        else:
+                            # For non-scheduled operations, complete immediately
+                            await self.tool_state_manager.end_operation(
+                                session_id=operation['session_id'],
+                                tool_operation_id=str(operation['_id']),
+                                success=True,
+                                api_response={"message": "All items processed successfully"}
+                            )
+                            
+                            return {
+                                "status": "completed",
+                                "state": ToolOperationState.COMPLETED.value,
+                                "response": f"All {original_count} items have been processed.",
+                                "requires_tts": True
+                            }
+
                 return approval_result
 
-            # Handle other states...
             elif current_state == ToolOperationState.EXECUTING.value:
                 # Handle execution state - check schedule status, etc.
                 logger.info(f"Operation {operation['_id']} is in EXECUTING state")
@@ -865,83 +817,45 @@ Format the summary to:
         )
 
     async def _handle_approved_operation(self, operation: Dict, tool: BaseTool, approval_result: Dict) -> Dict:
-        """Handle an operation that has completed approval"""
-        logger.info(f"Approval successful for operation {operation['_id']}")
-        
-        # Update step to "scheduling"
-        await self.tool_state_manager.update_operation(
-            session_id=operation['session_id'],
-            tool_operation_id=str(operation['_id']),
-            step="scheduling"
-        )
-        
-        # Check if scheduling is required
-        if tool.registry.requires_scheduling:
-            logger.info(f"Tool requires scheduling, proceeding to schedule flow for operation {operation['_id']}")
-            
-            # Get schedule_id from various possible locations
-            schedule_id = (
-                operation.get('metadata', {}).get('schedule_id') or 
-                operation.get('output_data', {}).get('schedule_id') or
-                operation.get('input_data', {}).get('schedule_id')
-            )
-            
-            if not schedule_id:
-                logger.error(f"No schedule_id found for operation {operation['_id']}")
-                return {
-                    "status": "error",
-                    "response": "Schedule information is missing. Unable to activate schedule."
-                }
-            
-            logger.info(f"Activating schedule {schedule_id} for operation {operation['_id']}")
-            
-            # Activate the schedule
-            activation_result = await self.schedule_manager.activate_schedule(
+        try:
+            # Get all approved items
+            approved_items = await self.tool_state_manager.get_operation_items(
                 tool_operation_id=str(operation['_id']),
-                schedule_id=schedule_id
+                state=ToolOperationState.EXECUTING.value
             )
             
-            if activation_result:
-                logger.info(f"Schedule {schedule_id} activated successfully")
-                
-                # Get topic and count for user-friendly response
-                topic = operation.get('input_data', {}).get('topic', 'your content')
-                count = len(await self.tool_state_manager.get_operation_items(
-                    tool_operation_id=str(operation['_id']),
-                    state=ToolOperationState.EXECUTING.value
-                ))
-                
-                # Mark operation as complete
-                updated_operation = await self.tool_state_manager.end_operation(
-                    session_id=operation['session_id'],
-                    tool_operation_id=str(operation['_id']),
-                    success=True,
-                    api_response={
-                        "message": "Schedule activated successfully",
-                        "content_type": tool.registry.content_type.value
-                    },
-                    step="completed"
-                )
-                
-                logger.info(f"Operation {operation['_id']} marked as completed")
-                
-                return {
-                    "status": "completed",
-                    "response": f"Great! I've scheduled {count} items about {topic}. They will be posted according to your schedule.",
-                    "requires_tts": True,
-                    "state": ToolOperationState.COMPLETED.value
-                }
-            else:
-                logger.error(f"Failed to activate schedule {schedule_id}")
-                return {
-                    "status": "error",
-                    "response": "I was unable to activate the schedule. Please try again."
-                }
-        
-        # If no scheduling required, complete the operation
-        return {
-            "status": "completed",
-            "response": "Your content has been approved and will be processed.",
-            "requires_tts": True,
-            "state": ToolOperationState.COMPLETED.value
-        }
+            if tool.registry.requires_scheduling:
+                # Handle scheduling
+                schedule_result = await self._handle_scheduled_operation(operation, approved_items)
+                if schedule_result.get("success"):
+                    # End operation with success
+                    await self.tool_state_manager.end_operation(
+                        session_id=operation['session_id'],
+                        tool_operation_id=str(operation['_id']),
+                        success=True,
+                        step="scheduled"
+                    )
+                    return {
+                        "status": "completed",
+                        "state": ToolOperationState.COMPLETED.value,
+                        "response": "Your content has been scheduled successfully!",
+                        "requires_chat_response": True
+                    }
+            
+            # End operation
+            await self.tool_state_manager.end_operation(
+                session_id=operation['session_id'],
+                tool_operation_id=str(operation['_id']),
+                success=True,
+                step="completed"
+            )
+            
+            return {
+                "status": "completed",
+                "state": ToolOperationState.COMPLETED.value,
+                "response": "Operation completed successfully!",
+                "requires_chat_response": True
+            }
+        except Exception as e:
+            logger.error(f"Error in _handle_approved_operation: {e}")
+            raise

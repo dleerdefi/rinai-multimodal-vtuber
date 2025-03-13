@@ -650,8 +650,8 @@ class ToolStateManager:
                     "state": initial_state,
                     "status": initial_status,
                     "content": {
-                        "raw_content": item.get("content"),
-                        "formatted_content": item.get("content"),
+                        "raw_content": item.get("content", {}).get("content", ""),
+                        "formatted_content": item.get("content", {}).get("content", ""),
                         "version": "1.0"
                     },
                     "metadata": {
@@ -761,3 +761,51 @@ class ToolStateManager:
             raise ValueError(f"Failed to create operation for session {session_id}")
         
         return result
+
+    async def update_tool_item(
+        self,
+        tool_operation_id: str,
+        item_id: str,
+        content: Optional[Dict] = None,
+        state: Optional[str] = None,
+        status: Optional[str] = None,
+        metadata: Optional[Dict] = None
+    ) -> bool:
+        """Update a tool item's content, state, and status"""
+        try:
+            update_data = {"last_updated": datetime.now(UTC)}
+            
+            if content:
+                update_data["content"] = {
+                    "raw_content": content.get("content"),
+                    "formatted_content": content.get("content"),
+                    "version": "1.0"
+                }
+            
+            if state:
+                update_data["state"] = state
+                
+            if status:
+                # Use existing status update functionality
+                await self.db.update_tool_item_status(
+                    item_id=item_id,
+                    status=status,
+                    metadata=metadata
+                )
+                
+            # Update content and state if provided
+            if content or state:
+                result = await self.db.tool_items.update_one(
+                    {
+                        "_id": ObjectId(item_id),
+                        "tool_operation_id": tool_operation_id
+                    },
+                    {"$set": update_data}
+                )
+                return result.modified_count > 0
+            
+            return True
+
+        except Exception as e:
+            logger.error(f"Error updating tool item: {e}")
+            return False

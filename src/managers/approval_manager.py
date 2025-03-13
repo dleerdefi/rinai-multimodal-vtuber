@@ -282,30 +282,52 @@ class ApprovalManager:
                 }
             )
             
-            # Get operation to check if it's schedulable
-            is_schedulable = operation.get('metadata', {}).get('is_schedulable', False)
-            schedule_info = operation.get('input_data', {}).get('command_info', {}).get('schedule_info')
-
-            if is_schedulable and schedule_info:
-                # Trigger scheduling flow
-                schedule_success = await self.schedule_manager.activate_schedule(
-                    tool_operation_id=tool_operation_id,
-                    schedule_info=schedule_info,
-                    content_type=operation['metadata']['content_type']
+            # Get operation to check scheduling requirements
+            requires_scheduling = operation.get('metadata', {}).get('requires_scheduling', False)
+            
+            if requires_scheduling:
+                # Get schedule info from operation metadata or input data
+                schedule_info = (
+                    operation.get('metadata', {}).get('schedule_info') or 
+                    operation.get('input_data', {}).get('command_info', {}).get('schedule_info')
                 )
-                if not schedule_success:
-                    return self._create_error_response("Failed to activate schedule")
+                
+                if schedule_info:
+                    logger.info(f"Activating schedule for operation {tool_operation_id}")
+                    schedule_success = await self.schedule_manager.activate_schedule(
+                        tool_operation_id=tool_operation_id,
+                        schedule_info=schedule_info,
+                        content_type=operation['metadata']['content_type']
+                    )
+                    
+                    if schedule_success:
+                        # Update operation state to reflect schedule activation
+                        await self.tool_state_manager.update_operation(
+                            session_id=session_id,
+                            tool_operation_id=tool_operation_id,
+                            state=ToolOperationState.EXECUTING.value,
+                            metadata={
+                                "schedule_activated": True,
+                                "schedule_activated_at": datetime.now(UTC).isoformat()
+                            }
+                        )
+                        
+                        return {
+                            "status": OperationStatus.SCHEDULED.value,
+                            "state": ToolOperationState.EXECUTING.value,
+                            "message": "Items approved and schedule activated",
+                            "requires_chat_response": True
+                        }
+                    else:
+                        logger.error(f"Failed to activate schedule for operation {tool_operation_id}")
+                        return self._create_error_response("Failed to activate schedule")
 
+            # Return normal approval response if no scheduling needed
             return {
                 "status": OperationStatus.APPROVED.value,
                 "state": ToolOperationState.EXECUTING.value,
-                "approval_state": ApprovalState.APPROVAL_FINISHED.value,
-                "message": "Items approved and scheduled for execution",
-                "data": {
-                    "approved_items": approved_items,
-                    "rejected_items": rejected_items,
-                    "scheduled": is_schedulable
-                }
+                "message": "Items approved successfully",
+                "requires_chat_response": True
             }
             
         except Exception as e:
@@ -360,21 +382,20 @@ class ApprovalManager:
             if not operation:
                 raise ValueError(f"No operation found for ID {tool_operation_id}")
             
-            # Create new items for regeneration using tool_state_manager
+            # Create new items for regeneration using the proper method
             new_items = await self.tool_state_manager.create_regeneration_items(
                 session_id=session_id,
                 tool_operation_id=tool_operation_id,
-                items_data=[{} for _ in range(len(regenerate_indices))],
+                items_data=[{} for _ in range(len(regenerate_indices))],  # Empty items to be filled with content later
                 content_type=operation.get('metadata', {}).get('content_type'),
                 schedule_id=operation.get('metadata', {}).get('schedule_id')
             )
-            logger.info(f"Created {len(new_items)} new items for regeneration")
 
-            # Update operation metadata with comprehensive state tracking
+            # Update operation metadata
             await self.tool_state_manager.update_operation(
                 session_id=session_id,
                 tool_operation_id=tool_operation_id,
-                state=ToolOperationState.COLLECTING.value,  # Explicitly set state for regeneration
+                state=ToolOperationState.COLLECTING.value,
                 metadata={
                     "regeneration_needed": True,
                     "regenerated_at": datetime.now(UTC).isoformat(),
@@ -393,33 +414,9 @@ class ApprovalManager:
 
             return {
                 "status": "regeneration_needed",
-                "response": (
-                    f"{len(approved_items)} items approved and will be executed. "
-                    f"{len(rejected_items)} items marked for regeneration."
-                ),
-                "requires_tts": True,
                 "data": {
-                    "approved_items": approved_items,
-                    "rejected_items": rejected_items,
-                    "analysis": analysis,
-                    "regenerate_count": len(regenerate_indices),
-                    "item_states": {
-                        "approved": {
-                            "count": len(approved_items),
-                            "state": ToolOperationState.EXECUTING.value,
-                            "status": OperationStatus.APPROVED.value
-                        },
-                        "rejected": {
-                            "count": len(rejected_items),
-                            "state": ToolOperationState.CANCELLED.value,
-                            "status": OperationStatus.REJECTED.value
-                        },
-                        "new": {
-                            "count": len(new_items),
-                            "state": ToolOperationState.COLLECTING.value,
-                            "status": OperationStatus.PENDING.value
-                        }
-                    }
+                    "regenerate_count": len(new_items),
+                    "analysis": analysis
                 }
             }
             
