@@ -326,7 +326,7 @@ class Orchestrator:
                 
                 # Then generate content using analysis results
                 generation_result = await tool._generate_content(
-                    topic=command_analysis["topic"],
+                    topic=command_analysis.get("topic"),
                     count=command_analysis["item_count"],
                     schedule_id=command_analysis.get("schedule_id"),
                     tool_operation_id=str(operation['_id'])

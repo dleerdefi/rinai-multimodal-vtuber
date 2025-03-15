@@ -58,6 +58,17 @@ class ApprovalManager:
         try:
             logger.info(f"Starting approval flow for {len(items)} items")
             
+            # Ensure we have valid items
+            if not items:
+                raise ValueError("No items provided for approval flow")
+            
+            # Ensure each item is a dictionary with required fields
+            for item in items:
+                if not isinstance(item, dict):
+                    raise ValueError(f"Invalid item format: {item}")
+                if '_id' not in item:
+                    raise ValueError(f"Item missing _id field: {item}")
+            
             # Update items to APPROVING state
             await self.db.tool_items.update_many(
                 {
@@ -79,7 +90,7 @@ class ApprovalManager:
                 state=ToolOperationState.APPROVING.value,
                 metadata={
                     "approval_state": ApprovalState.AWAITING_APPROVAL.value,
-                    "pending_items": [str(item.get('_id')) for item in items],
+                    "pending_items": [str(item['_id']) for item in items],
                     "total_items": len(items)
                 }
             )
@@ -89,7 +100,7 @@ class ApprovalManager:
             return {
                 "approval_status": "awaiting_approval",
                 "approval_state": ApprovalState.AWAITING_APPROVAL.value,
-                "response": f"Here are the items for your review:\n\n{formatted_items}", # duplicated with line 207 approval_analyzer.py
+                "response": f"Here are the items for your review:\n\n{formatted_items}",
                 "data": {
                     "items": items,
                     "formatted_items": formatted_items,

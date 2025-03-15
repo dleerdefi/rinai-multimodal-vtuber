@@ -102,16 +102,18 @@ class IntentsTool(BaseTool):
                     tool_operation_id=None
                 )
 
+            # Get current operation
             operation = await self.tool_state_manager.get_operation(self.deps.session_id)
             
-            if not operation or operation.get('state') == ToolOperationState.COMPLETED.value:
+            # Check if we need to start a new operation
+            if not operation or operation.get('state') in [ToolOperationState.COMPLETED.value, ToolOperationState.ERROR.value]:
                 # Initial analysis and command flow for limit order
                 command_info = await self._analyze_command(input_data)
                 
                 # Generate content for approval using count from command_info
                 content_result = await self._generate_content(
                     topic=command_info["topic"],
-                    count=command_info["item_count"],  # Use count from command analysis
+                    count=command_info["item_count"],
                     schedule_id=command_info["schedule_id"],
                     tool_operation_id=command_info["tool_operation_id"]
                 )
@@ -222,68 +224,92 @@ Return ONLY valid JSON matching the example format.
             logger.info(f"Raw LLM response: {response}")
             
             try:
-                # Parse response and use it directly as parameters
-                params = json.loads(response)
-                logger.info(f"Parsed JSON data: {params}")
+                # Parse response and handle both single order and array of orders
+                parsed_data = json.loads(response)
+                orders = parsed_data if isinstance(parsed_data, list) else [parsed_data]
+                logger.info(f"Parsed JSON data: {orders}")
                 
-                # Validate required fields
+                # Validate required fields for each order
                 required_fields = ['from_token', 'from_amount', 'to_token', 'target_price_usd', 'reference_token']
-                missing_fields = [field for field in required_fields if field not in params]
-                if missing_fields:
-                    raise ValueError(f"Missing required fields: {missing_fields}")
+                for order in orders:
+                    missing_fields = [field for field in required_fields if field not in order]
+                    if missing_fields:
+                        raise ValueError(f"Missing required fields in order: {missing_fields}")
                 
-                # Set up monitoring parameters
-                monitoring_params = {
-                    "check_interval_seconds": 60,
-                    "last_checked_timestamp": int(datetime.now(UTC).timestamp()),
-                    "best_price_seen": 0,
-                    "expiration_timestamp": int((datetime.now(UTC) + timedelta(hours=params.get("expiration_hours", 24))).timestamp()),
-                    "max_checks": 1000,
-                    "reference_token": params["reference_token"]  # Add reference token to monitoring params
-                }
+                # Use first order's item_count since they should all be the same
+                item_count = orders[0]["item_count"]
                 
-                # Create topic string using reference token for price
-                topic = f"Limit order: {params['from_token']} to {params['to_token']} at ${params['target_price_usd']} per {params['reference_token']}"
+                # Set up monitoring parameters for each order
+                monitoring_params_list = []
+                topics = []
                 
-                # Create schedule FIRST
+                for order in orders:
+                    monitoring_params = {
+                        "check_interval_seconds": 60,
+                        "last_checked_timestamp": int(datetime.now(UTC).timestamp()),
+                        "best_price_seen": 0,
+                        "expiration_timestamp": int((datetime.now(UTC) + timedelta(hours=order.get("expiration_hours", 24))).timestamp()),
+                        "max_checks": 1000,
+                        "reference_token": order["reference_token"],
+                        "target_price_usd": order["target_price_usd"],
+                        "from_token": order["from_token"],
+                        "from_amount": order["from_amount"],
+                        "to_token": order["to_token"]
+                    }
+                    monitoring_params_list.append(monitoring_params)
+                    
+                    # Create topic string using reference token for price
+                    topic = f"Limit order: {order['from_token']} to {order['to_token']} at ${order['target_price_usd']} per {order['reference_token']}"
+                    topics.append(topic)
+                
+                # Create schedule FIRST with all necessary info
                 schedule_id = await self.schedule_manager.initialize_schedule(
                     tool_operation_id=tool_operation_id,
                     schedule_info={
                         "schedule_type": "monitoring",
                         "operation_type": "limit_order",
-                        "total_items": params["item_count"],
-                        "monitoring_params": monitoring_params
+                        "total_items": len(orders),
+                        "monitoring_params_list": monitoring_params_list,
+                        "topics": topics,
+                        "content_type": self.registry.content_type.value,
+                        "tool_type": self.registry.tool_type.value,
+                        "requires_approval": True,
+                        "requires_scheduling": True
                     },
                     content_type=self.registry.content_type.value,
                     session_id=self.deps.session_id
                 )
                 
-                # THEN update operation with the schedule_id
+                # THEN update operation with the schedule_id and all necessary info
                 await self.tool_state_manager.update_operation(
                     session_id=self.deps.session_id,
                     tool_operation_id=tool_operation_id,
                     input_data={
                         "command_info": {
                             "operation_type": "limit_order",
-                            "parameters": params,
-                            "monitoring_params": monitoring_params,
-                            "topic": topic,
-                            "item_count": params["item_count"]
+                            "orders": orders,
+                            "monitoring_params_list": monitoring_params_list,
+                            "topics": topics,
+                            "item_count": len(orders)
                         },
                         "schedule_id": schedule_id
                     },
                     metadata={
                         "schedule_state": ScheduleState.PENDING.value,
                         "schedule_id": schedule_id,
-                        "operation_type": "limit_order"
+                        "operation_type": "limit_order",
+                        "content_type": self.registry.content_type.value,
+                        "tool_type": self.registry.tool_type.value,
+                        "requires_approval": True,
+                        "requires_scheduling": True
                     }
                 )
                 
                 # FINALLY return all required information
                 return {
                     "tool_operation_id": tool_operation_id,
-                    "topic": topic,
-                    "item_count": params["item_count"],
+                    "topics": topics,
+                    "item_count": len(orders),
                     "schedule_id": schedule_id,
                     
                     # Required by approval_manager
@@ -298,27 +324,8 @@ Return ONLY valid JSON matching the example format.
                     "schedule_info": {
                         "schedule_type": "monitoring",
                         "operation_type": "limit_order",
-                        "total_items": params["item_count"],
-                        "monitoring_params": monitoring_params
-                    },
-                    
-                    # Limit order specific parameters
-                    "parameters": {
-                        "price_oracle": {
-                            "symbol": params["reference_token"],
-                            "target_price_usd": params["target_price_usd"]
-                        },
-                        "swap": {
-                            "from_token": params["from_token"],
-                            "from_amount": params["from_amount"],
-                            "to_token": params["to_token"],
-                            "chain_out": params.get("to_chain", "ethereum")
-                        },
-                        "withdraw": {
-                            "enabled": bool(params.get("destination_address")),
-                            "destination_address": params.get("destination_address"),
-                            "destination_chain": params.get("destination_chain", "ethereum")
-                        }
+                        "total_items": len(orders),
+                        "monitoring_params_list": monitoring_params_list
                     }
                 }
 
@@ -336,40 +343,70 @@ Return ONLY valid JSON matching the example format.
 
     async def _generate_content(
         self, 
-        topic: str, 
-        count: int, 
-        schedule_id: str = None, 
-        tool_operation_id: str = None
+        topic: Optional[str] = None,  # Make topic optional
+        count: int = 1, 
+        schedule_id: Optional[str] = None, 
+        tool_operation_id: str = None,
+        revision_instructions: str = None
     ) -> Dict:
         """Generate human-readable content for limit order approval"""
         try:
-            logger.info(f"Generating {count} limit order(s) for topic: {topic}")
+            logger.info(f"Generating {count} limit order(s)")
+            if revision_instructions:
+                logger.info(f"With revision instructions: {revision_instructions}")
             
             # Get parent operation to access stored parameters
             operation = await self.tool_state_manager.get_operation(self.deps.session_id)
             if not operation:
                 raise ValueError("No active operation found")
             
-            # Get the parameters from _analyze_command
+            # Get the schedule_id from operation if not provided
+            operation_schedule_id = (
+                operation.get('metadata', {}).get('schedule_id') or 
+                operation.get('input_data', {}).get('schedule_id')
+            )
+            if operation_schedule_id:
+                schedule_id = operation_schedule_id
+                logger.info(f"Using schedule_id from operation: {schedule_id}")
+            
+            if not schedule_id:
+                raise ValueError("No schedule_id found in operation or parameters")
+            
+            # Get the orders and monitoring params from command_info
             command_info = operation.get("input_data", {}).get("command_info", {})
-            params = command_info.get("parameters", {})
-            logger.info(f"Using parameters for content generation: {params}")
+            orders = command_info.get("orders", [])
+            monitoring_params_list = command_info.get("monitoring_params_list", [])
+            
+            if not orders:
+                raise ValueError("No orders found in operation command_info")
+            
+            logger.info(f"Processing {len(orders)} orders with monitoring params")
+            
+            # Check if we're regenerating content
+            is_regenerating = operation.get("metadata", {}).get("approval_state") == ApprovalState.REGENERATING.value
+            logger.info(f"Generating content in {'regeneration' if is_regenerating else 'initial'} mode")
             
             # Track all generated items
             saved_items = []
             current_pending_items = operation.get("output_data", {}).get("pending_items", [])
 
-            # Generate multiple items based on count
-            for i in range(count):
-                # Generate description using LLM with improved prompt
-                prompt = f"""You are a cryptocurrency expert. Generate a detailed description for a limit order with the following parameters:
+            # Generate content for each order
+            for i, order in enumerate(orders):
+                # Base prompt for limit order description
+                base_prompt = f"""You are a cryptocurrency expert. Generate a detailed description for a limit order with the following parameters:
 
 Operation Details:
-- Swap {params['from_amount']} {params['from_token']} for {params['to_token']}
-- Target Price: ${params['target_price_usd']} per {params['from_token']}
-- Output Chain: {params.get('to_chain', 'ethereum')}
-- Destination: {params.get('destination_address', 'default wallet')} on {params.get('destination_chain', 'ethereum')}
-- Expires in: {params.get('expiration_hours', 24)} hours
+- Swap {order['from_amount']} {order['from_token']} for {order['to_token']}
+- Target Price: ${order['target_price_usd']} per {order['reference_token']}
+- Output Chain: {order.get('to_chain', 'ethereum')}
+- Destination: {order.get('destination_address', 'default wallet')} on {order.get('destination_chain', 'ethereum')}
+- Expires in: {order.get('expiration_hours', 24)} hours"""
+
+                # Add revision instructions if provided
+                if revision_instructions:
+                    base_prompt += f"\n\nImportant revision instructions: {revision_instructions}"
+
+                base_prompt += """
 
 Include:
 1. A clear title summarizing the limit order
@@ -377,111 +414,83 @@ Include:
 3. Expected outcome when price target is met
 
 IMPORTANT: Your response MUST be valid JSON in the following format:
-{{
+{
     "title": "Limit Order Summary",
     "description": "Detailed description here...",
     "expected_outcome": "Expected outcome description"
-}}
-
-Do not include any text outside of this JSON structure."""
+}"""
 
                 messages = [
                     {
                         "role": "system",
-                        "content": "You are a cryptocurrency expert. Generate clear, detailed descriptions for limit orders. Return ONLY valid JSON with no markdown formatting or additional text."
+                        "content": "You are a cryptocurrency expert. Generate clear, detailed descriptions for limit orders. Return ONLY valid JSON."
                     },
                     {
                         "role": "user",
-                        "content": prompt
+                        "content": base_prompt
                     }
                 ]
 
-                # Log the prompt being sent
-                logger.info(f"Sending content generation prompt to LLM")
-
-                # Get LLM response with increased max_tokens and lower temperature
+                # Get LLM response
                 response = await self.llm_service.get_response(
                     prompt=messages,
                     model_type=ModelType.GROQ_LLAMA_3_3_70B,
                     override_config={
-                        "temperature": 0.15,  # Lower temperature for more predictable output
-                        "max_tokens": 800    # Increased token limit
+                        "temperature": 0.15,
+                        "max_tokens": 800
                     }
                 )
                 
-                # Log the raw response for debugging
-                logger.info(f"Raw LLM response for content generation: {response}")
-                
-                # Clean up response - remove any markdown formatting
-                cleaned_response = response.strip()
-                if cleaned_response.startswith('```') and cleaned_response.endswith('```'):
-                    # Remove markdown code blocks
-                    cleaned_response = '\n'.join(cleaned_response.split('\n')[1:-1])
-                
-                # Remove any non-JSON text before or after the JSON structure
-                if '{' in cleaned_response and '}' in cleaned_response:
-                    start_idx = cleaned_response.find('{')
-                    end_idx = cleaned_response.rfind('}') + 1
-                    cleaned_response = cleaned_response[start_idx:end_idx]
-                
-                logger.info(f"Cleaned response: {cleaned_response}")
-                
-                # Try to parse the response as JSON with robust error handling
                 try:
-                    generated_content = json.loads(cleaned_response)
-                    logger.info(f"Successfully parsed JSON content: {generated_content}")
-                except json.JSONDecodeError as e:
-                    logger.error(f"Failed to parse LLM response as JSON: {e}")
-                    
-                    # Try to use the parse_strict_json utility if available
+                    generated_content = json.loads(response)
+                except json.JSONDecodeError:
                     try:
-                        generated_content = parse_strict_json(cleaned_response)
-                        logger.info(f"Successfully parsed with parse_strict_json: {generated_content}")
-                    except Exception as parse_error:
-                        logger.error(f"Failed to parse with parse_strict_json: {parse_error}")
-                        
-                        # Last resort: create minimal content structure
-                        logger.warning("Using minimal content structure as last resort")
+                        generated_content = parse_strict_json(response)
+                    except Exception:
                         generated_content = {
-                            "title": f"Limit Order: {params['from_token']} to {params['to_token']} at ${params['target_price_usd']}",
-                            "description": f"This limit order will execute when {params['from_token']} reaches ${params['target_price_usd']}.",
-                            "expected_outcome": f"Exchange {params['from_amount']} {params['from_token']} for {params['to_token']}."
+                            "title": f"Limit Order: {order['from_token']} to {order['to_token']} at ${order['target_price_usd']}",
+                            "description": f"This limit order will execute when {order['reference_token']} reaches ${order['target_price_usd']}.",
+                            "expected_outcome": f"Exchange {order['from_amount']} {order['from_token']} for {order['to_token']}."
                         }
                 
-                # Create tool item for approval
+                # Create tool item with monitoring parameters
                 tool_item = {
                     "session_id": self.deps.session_id,
                     "tool_operation_id": tool_operation_id,
                     "schedule_id": schedule_id,
                     "content_type": self.registry.content_type.value,
                     "state": operation["state"],
-                    "status": OperationStatus.PENDING.value,  # Individual item status
+                    "status": OperationStatus.PENDING.value,
                     "content": {
-                        "title": generated_content.get("title", f"Limit Order: {params['from_token']} to {params['to_token']}"),
-                        "description": generated_content.get("description", ""),
-                        "expected_outcome": generated_content.get("expected_outcome", ""),
+                        "title": generated_content.get("title"),
+                        "description": generated_content.get("description"),
+                        "expected_outcome": generated_content.get("expected_outcome"),
+                        "operation_type": "limit_order",
                         "operation_details": {
-                            "from_token": params["from_token"],
-                            "from_amount": params["from_amount"],
-                            "to_token": params["to_token"],
-                            "target_price_usd": params["target_price_usd"],
-                            "reference_token": params["reference_token"],
-                            "to_chain": params.get("to_chain", "ethereum"),
-                            "destination_address": params.get("destination_address"),
-                            "destination_chain": params.get("destination_chain", "ethereum"),
-                            "expiration_hours": params.get("expiration_hours", 24)
+                            "from_token": order["from_token"],
+                            "from_amount": str(order["from_amount"]),  # Convert to string for consistency
+                            "to_token": order["to_token"],
+                            "target_price_usd": float(order["target_price_usd"]),  # Ensure float
+                            "reference_token": order["reference_token"],
+                            "to_chain": order.get("to_chain", "ethereum")
                         }
                     },
                     "metadata": {
                         "generated_at": datetime.now(UTC).isoformat(),
                         "scheduling_type": "monitored",
-                        "order_index": i + 1,  # Add order index
-                        "total_orders": count,  # Add total count
+                        "monitoring_params": monitoring_params_list[i],  # Use corresponding monitoring params
+                        "order_index": i + 1,
+                        "total_orders": len(orders),
                         "state_history": [{
                             "state": operation["state"],
                             "status": OperationStatus.PENDING.value,
                             "timestamp": datetime.now(UTC).isoformat()
-                        }]
+                        }],
+                        "regeneration_info": {
+                            "is_regenerated": is_regenerating,
+                            "revision_instructions": revision_instructions,
+                            "regenerated_at": datetime.now(UTC).isoformat() if is_regenerating else None
+                        } if is_regenerating else None
                     }
                 }
                 
@@ -494,7 +503,7 @@ Do not include any text outside of this JSON structure."""
                 current_pending_items.append(item_id)
                 saved_items.append(tool_item)
                 
-                logger.info(f"Created limit order item {i+1}/{count} with ID {item_id}")
+                logger.info(f"Created limit order item {i+1}/{len(orders)} with ID {item_id}")
 
             # Update operation with all pending items
             await self.tool_state_manager.update_operation(
@@ -511,12 +520,26 @@ Do not include any text outside of this JSON structure."""
                         }
                         for item in saved_items
                     },
-                    "total_items": count,
-                    "generated_items": len(saved_items)
+                    "total_items": len(orders),
+                    "generated_items": len(saved_items),
+                    "schedule_id": schedule_id,
+                    "regeneration_info": {
+                        "is_regenerated": is_regenerating,
+                        "revision_instructions": revision_instructions,
+                        "regenerated_at": datetime.now(UTC).isoformat()
+                    } if is_regenerating else None
                 }
             )
 
-            logger.info(f"Successfully generated {len(saved_items)} limit order items")
+            if is_regenerating:
+                return {
+                    "items": saved_items,
+                    "schedule_id": schedule_id,
+                    "tool_operation_id": tool_operation_id,
+                    "regeneration_needed": True,
+                    "regenerate_count": len(saved_items)
+                }
+
             return {
                 "items": saved_items,
                 "schedule_id": schedule_id,
