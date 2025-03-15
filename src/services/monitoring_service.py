@@ -116,39 +116,47 @@ class LimitOrderMonitoringService:
         """Main monitoring loop that checks for limit orders"""
         while self.running:
             try:
-                # Get current time
                 current_time = datetime.now(UTC)
                 
-                # Get all active limit orders - SPECIFICALLY those marked as monitored
+                # Update query to match our actual data structure
                 active_orders = await self.db.tool_items.find({
                     "content_type": ContentType.LIMIT_ORDER.value,
-                    "status": OperationStatus.SCHEDULED.value,
-                    "state": ToolOperationState.EXECUTING.value,
-                    "metadata.scheduling_type": "monitored"  # Only get monitored items
+                    "metadata.scheduling_type": "monitored",
+                    "state": ToolOperationState.COMPLETED.value,
+                    "status": OperationStatus.SCHEDULED.value
                 }).to_list(None)
                 
+                logger.info(f"Monitoring service checking {len(active_orders)} active limit orders at {current_time.isoformat()}")
+                
                 if active_orders:
-                    logger.info(f"Found {len(active_orders)} active limit orders to check at {current_time.isoformat()}")
-                    
                     for order in active_orders:
                         try:
-                            # Check if it's time to check this order based on its check interval
-                            params = order.get("parameters", {}).get("custom_params", {})
-                            last_checked = params.get("last_checked_timestamp", 0)
-                            check_interval = params.get("check_interval_seconds", 60)
+                            # Get operation details from the correct location
+                            operation_details = order.get("content", {}).get("operation_details", {})
                             
-                            if time.time() - last_checked >= check_interval:
+                            # Extract monitoring parameters
+                            token_to_monitor = operation_details.get("reference_token")
+                            target_price_usd = float(operation_details.get("target_price_usd", 0))
+                            
+                            logger.info(f"Processing limit order {order['_id']}: "
+                                      f"Monitoring {token_to_monitor} for target price ${target_price_usd}")
+                            
+                            if token_to_monitor and target_price_usd > 0:
                                 await self._check_limit_order(order)
+                            else:
+                                logger.error(f"Invalid monitoring parameters for order {order['_id']}: "
+                                           f"token={token_to_monitor}, target=${target_price_usd}")
                             
                         except Exception as e:
                             logger.error(f"Error checking limit order {order.get('_id')}: {e}", exc_info=True)
+                else:
+                    logger.debug("No active limit orders found for monitoring")
                 
-                # Sleep before next check
                 await asyncio.sleep(self._check_interval)
                 
             except Exception as e:
                 logger.error(f"Error in monitoring loop: {e}", exc_info=True)
-                await asyncio.sleep(60)  # Longer wait on error
+                await asyncio.sleep(60)
 
     async def _check_limit_order(self, order):
         """Check if a limit order's conditions are met using CoinGecko USD prices"""
@@ -156,15 +164,15 @@ class LimitOrderMonitoringService:
             order_id = str(order.get('_id'))
             content = order.get("content", {})
             operation_details = content.get("operation_details", {})
-            params = order.get("parameters", {}).get("custom_params", {})  # Get params first
+            params = order.get("parameters", {}).get("custom_params", {})  # Keep params check
             
-            # Get the reference token for price monitoring
+            # Get the reference token and target price
             token_to_monitor = operation_details.get("reference_token")
             target_price_usd = float(operation_details.get("target_price_usd", 0))
             
             logger.info(f"Checking limit order {order_id}: monitoring {token_to_monitor} price target ${target_price_usd}")
             
-            # Check if we have the required parameters
+            # Keep parameter validation
             if not token_to_monitor or not target_price_usd:
                 logger.error(f"Missing required parameters for limit order {order_id}: token_to_monitor={token_to_monitor}, target_price_usd={target_price_usd}")
                 await self.db.tool_items.update_one(
@@ -177,7 +185,7 @@ class LimitOrderMonitoringService:
                 )
                 return
 
-            # Check if order has expired
+            # Keep expiration check
             expiration_timestamp = params.get("expiration_timestamp")
             if expiration_timestamp and time.time() > expiration_timestamp:
                 await self._expire_limit_order(order)
@@ -195,22 +203,24 @@ class LimitOrderMonitoringService:
                     logger.error(f"Could not get price data for {token_to_monitor}")
                     return
                 
-                current_price = float(price_data['price_usd'])  # Ensure float for comparison
+                current_price = float(price_data['price_usd'])
                 
                 logger.info(f"Current {token_to_monitor} price: ${current_price}, Target: ${target_price_usd}")
                 
-                # Update best price seen if this is better
+                # Update best price seen and timestamp
                 if current_price > params.get("best_price_seen", 0):
                     await self.db.tool_items.update_one(
                         {"_id": ObjectId(order_id)},
                         {"$set": {
                             "parameters.custom_params.best_price_seen": current_price,
                             "parameters.custom_params.last_checked_timestamp": int(time.time()),
-                            "metadata.last_check_result": f"New best price: ${current_price}"
+                            "metadata.last_check_result": f"New best price: ${current_price}",
+                            "metadata.best_price_seen": current_price,
+                            "metadata.last_check_time": datetime.now(UTC).isoformat()
                         }}
                     )
                 else:
-                    # Just update last checked timestamp
+                    # Update timestamp only
                     await self.db.tool_items.update_one(
                         {"_id": ObjectId(order_id)},
                         {"$set": {
@@ -229,15 +239,14 @@ class LimitOrderMonitoringService:
                         logger.error(f"No tool found for content type: {order.get('content_type')}")
                         return
                     
-                    # Execute using the tool's execute_scheduled_operation method
                     try:
-                        # Get from_amount from operation_details
-                        from_amount = operation_details.get("from_amount")
-                        
                         # Ensure numeric values are strings for the NEAR API
+                        from_amount = operation_details.get("from_amount")
                         order['content']['operation_details']['from_amount'] = str(from_amount)
+                        
+                        # Execute the order
                         result = await tool.execute_scheduled_operation(order)
-                        logger.info(f"Execution result: {result}")
+                        logger.info(f"Execution result for {order_id}: {result}")
                         
                         if result.get('success'):
                             await self.db.tool_items.update_one(
@@ -248,6 +257,8 @@ class LimitOrderMonitoringService:
                                     "executed_time": datetime.now(UTC),
                                     "api_response": result,
                                     "metadata.execution_result": result,
+                                    "metadata.execution_price": current_price,
+                                    "metadata.execution_time": datetime.now(UTC).isoformat(),
                                     "metadata.execution_completed_at": datetime.now(UTC).isoformat()
                                 }}
                             )
@@ -263,9 +274,7 @@ class LimitOrderMonitoringService:
                         )
                 
             except Exception as e:
-                logger.error(f"Error checking price for limit order {order_id}: {e}")
-                
-                # Update with error
+                logger.error(f"Error checking price for {token_to_monitor}: {e}")
                 await self.db.tool_items.update_one(
                     {"_id": ObjectId(order_id)},
                     {"$set": {
@@ -278,107 +287,6 @@ class LimitOrderMonitoringService:
             
         except Exception as e:
             logger.error(f"Error in _check_limit_order: {e}", exc_info=True)
-
-    async def _execute_limit_order(self, order):
-        """Signal schedule manager to execute the limit order"""
-        try:
-            order_id = str(order.get('_id'))
-            content = order.get("content", {})
-            
-            # Update order status to indicate price conditions met
-            await self.db.tool_items.update_one(
-                {"_id": ObjectId(order_id)},
-                {"$set": {
-                    "status": OperationStatus.EXECUTING.value,
-                    "metadata.execution_started_at": datetime.now(UTC).isoformat()
-                }}
-            )
-            
-            # Signal schedule manager to execute the operation
-            await self.schedule_manager.execute_scheduled_operation(order)
-            
-        except Exception as e:
-            logger.error(f"Error executing limit order: {e}", exc_info=True)
-
-    async def _execute_direct_swap(self, order):
-        """Execute a limit order using direct swap method"""
-        try:
-            order_id = str(order.get('_id'))
-            content = order.get("content", {})
-            
-            # Extract order parameters
-            from_token = content.get("from_token")
-            from_amount = content.get("from_amount")
-            to_token = content.get("to_token")
-            to_chain = content.get("to_chain", "near")
-            
-            logger.info(f"Executing direct swap for limit order {order_id}: {from_amount} {from_token} -> {to_token}")
-            
-            # Update order status to executing
-            await self.db.tool_items.update_one(
-                {"_id": ObjectId(order_id)},
-                {"$set": {
-                    "status": OperationStatus.EXECUTING.value,
-                    "metadata.execution_started_at": datetime.now(UTC).isoformat()
-                }}
-            )
-            
-            # Execute the swap directly
-            try:
-                swap_result = await intent_swap(
-                    self.near_account,
-                    from_token,
-                    from_amount,
-                    to_token,
-                    chain_out=to_chain
-                )
-                
-                logger.info(f"Limit order {order_id} executed with direct swap: {swap_result}")
-                
-                # Update order status
-                await self.db.tool_items.update_one(
-                    {"_id": ObjectId(order_id)},
-                    {"$set": {
-                        "status": OperationStatus.EXECUTED.value,
-                        "state": ToolOperationState.COMPLETED.value,
-                        "executed_time": datetime.now(UTC),
-                        "api_response": {
-                            "success": True,
-                            "timestamp": datetime.now(UTC).isoformat(),
-                            "result": swap_result
-                        },
-                        "metadata.execution_result": swap_result,
-                        "metadata.execution_completed_at": datetime.now(UTC).isoformat(),
-                        "metadata.execution_method": "direct_swap"
-                    }}
-                )
-                
-                return swap_result
-                
-            except Exception as e:
-                logger.error(f"Error executing direct swap for limit order {order_id}: {e}", exc_info=True)
-                
-                # Update order with error
-                await self.db.tool_items.update_one(
-                    {"_id": ObjectId(order_id)},
-                    {"$set": {
-                        "status": OperationStatus.FAILED.value,
-                        "metadata.execution_error": str(e),
-                        "metadata.execution_error_time": datetime.now(UTC).isoformat()
-                    }}
-                )
-                
-                return {
-                    "success": False,
-                    "error": str(e)
-                }
-                
-        except Exception as e:
-            logger.error(f"Error in _execute_direct_swap: {e}", exc_info=True)
-            return {
-                "success": False,
-                "error": str(e)
-            }
 
     async def _expire_limit_order(self, order):
         """Mark a limit order as expired"""
@@ -458,7 +366,7 @@ class LimitOrderMonitoringService:
             active_orders = await self.db.tool_items.find({
                 "content.operation_type": "limit_order",
                 "status": OperationStatus.SCHEDULED.value,
-                "state": ToolOperationState.EXECUTING.value
+                "state": ToolOperationState.COMPLETED.value
             }).to_list(None)
             
             return active_orders

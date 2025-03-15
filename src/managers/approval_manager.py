@@ -89,7 +89,7 @@ class ApprovalManager:
             return {
                 "approval_status": "awaiting_approval",
                 "approval_state": ApprovalState.AWAITING_APPROVAL.value,
-                "response": f"Here are the items for your review:\n\n{formatted_items}",
+                "response": f"Here are the items for your review:\n\n{formatted_items}", # duplicated with line 207 approval_analyzer.py
                 "data": {
                     "items": items,
                     "formatted_items": formatted_items,
@@ -113,26 +113,32 @@ class ApprovalManager:
     ) -> Dict:
         """Process user's response during approval flow"""
         try:
-            # Get current items for this operation
+            # Get operation to check active items
+            operation = await self.tool_state_manager.get_operation_by_id(tool_operation_id)
+            active_items = operation.get('metadata', {}).get('active_items', [])
+            
+            # Get ONLY the current turn's pending items using active_items list
             items = await self.db.tool_items.find({
                 "tool_operation_id": tool_operation_id,
                 "state": ToolOperationState.APPROVING.value,
-                "status": {"$ne": OperationStatus.REJECTED.value}
+                "status": OperationStatus.PENDING.value,
+                "metadata.rejected_at": {"$exists": False},
+                "_id": {"$in": [ObjectId(id) for id in active_items]} if active_items else {"$exists": True}
             }).to_list(None)
 
             if not items:
-                logger.error(f"No items found for approval in operation {tool_operation_id}")
+                logger.error(f"No pending items found for approval in operation {tool_operation_id}")
                 return self.analyzer.create_error_response("No items found for approval")
 
             # Log items being analyzed
-            logger.info(f"Analyzing {len(items)} items for approval")
+            logger.info(f"Analyzing {len(items)} pending items")
             for item in items:
                 logger.info(f"Item {item['_id']}: state={item['state']}, status={item.get('status')}")
 
-            # Analyze the response with the current items
+            # Analyze the response with ONLY the current items
             analysis = await self.analyzer.analyze_response(
                 user_response=message,
-                current_items=items
+                current_items=items  # Pass only current turn's items
             )
             
             # Map the analysis to an action
@@ -236,100 +242,110 @@ class ApprovalManager:
         items: List[Dict],
         analysis: Dict
     ) -> Dict:
-        """Handle full approval of all items"""
+        """Handle full approval of current turn's items and verify operation completion"""
         try:
             logger.info(f"Handling full approval for operation {tool_operation_id}")
             
-            # 1. Get current operation to check history
+            # 1. Get operation to check requirements
             operation = await self.tool_state_manager.get_operation_by_id(tool_operation_id)
             if not operation:
                 raise ValueError(f"No operation found for ID {tool_operation_id}")
+            
+            required_count = operation.get('input_data', {}).get('command_info', {}).get('item_count', 0)
+            logger.info(f"Operation requires {required_count} total approved items")
 
-            # 2. Update all current items to APPROVED state
-            await self._update_approved_items(
-                tool_operation_id,
-                list(range(len(items))),  # All current items
-                items
+            # 2. Get the valid item IDs from the analysis metadata
+            valid_item_ids = [ObjectId(id) for id in analysis.get('metadata', {}).get('valid_item_ids', [])]
+            logger.info(f"Updating items with IDs: {valid_item_ids}")
+
+            # 3. Update the items using the valid_item_ids from analysis
+            update_result = await self.db.tool_items.update_many(
+                {
+                    "_id": {"$in": valid_item_ids},
+                    "tool_operation_id": tool_operation_id
+                },
+                {"$set": {
+                    "state": ToolOperationState.EXECUTING.value,
+                    "status": OperationStatus.APPROVED.value,
+                    "metadata.approval_state": ApprovalState.APPROVAL_FINISHED.value,
+                    "metadata.approved_at": datetime.now(UTC).isoformat()
+                }}
             )
             
-            # 3. Get all items for this operation, including rejected ones
-            all_items = await self.db.tool_items.find({
-                "tool_operation_id": tool_operation_id
-            }).to_list(None)
-            
-            # Count items by state for metadata
-            approved_items = [i for i in all_items if i['status'] == OperationStatus.APPROVED.value]
-            rejected_items = [i for i in all_items if i['status'] == OperationStatus.REJECTED.value]
-            
-            logger.info(f"Operation summary - Approved: {len(approved_items)}, "
-                       f"Previously Rejected: {len(rejected_items)}")
+            logger.info(f"Updated {update_result.modified_count} items to APPROVED/EXECUTING state")
 
-            # 4. Update operation state with complete item tracking
-            await self.tool_state_manager.update_operation(
-                session_id=session_id,
+            # 4. Get ALL approved items to verify completion
+            all_approved_items = await self.tool_state_manager.get_operation_items(
                 tool_operation_id=tool_operation_id,
                 state=ToolOperationState.EXECUTING.value,
-                metadata={
-                    "approval_state": ApprovalState.APPROVAL_FINISHED.value,
-                    "item_summary": {
-                        "total_items_generated": len(all_items),
-                        "final_approved_count": len(approved_items),
-                        "total_rejected_count": len(rejected_items),
-                        "approved_item_ids": [str(i['_id']) for i in approved_items],
-                        "rejected_item_ids": [str(i['_id']) for i in rejected_items],
-                        "approval_completed_at": datetime.now(UTC).isoformat()
-                    }
-                }
+                status=OperationStatus.APPROVED.value
             )
             
-            # Get operation to check scheduling requirements
-            requires_scheduling = operation.get('metadata', {}).get('requires_scheduling', False)
-            
-            if requires_scheduling:
-                # Get schedule info from operation metadata or input data
-                schedule_info = (
-                    operation.get('metadata', {}).get('schedule_info') or 
-                    operation.get('input_data', {}).get('command_info', {}).get('schedule_info')
-                )
-                
-                if schedule_info:
-                    logger.info(f"Activating schedule for operation {tool_operation_id}")
-                    schedule_success = await self.schedule_manager.activate_schedule(
-                        tool_operation_id=tool_operation_id,
-                        schedule_info=schedule_info,
-                        content_type=operation['metadata']['content_type']
-                    )
-                    
-                    if schedule_success:
-                        # Update operation state to reflect schedule activation
-                        await self.tool_state_manager.update_operation(
-                            session_id=session_id,
-                            tool_operation_id=tool_operation_id,
-                            state=ToolOperationState.EXECUTING.value,
-                            metadata={
-                                "schedule_activated": True,
-                                "schedule_activated_at": datetime.now(UTC).isoformat()
-                            }
-                        )
-                        
-                        return {
-                            "status": OperationStatus.SCHEDULED.value,
-                            "state": ToolOperationState.EXECUTING.value,
-                            "message": "Items approved and schedule activated",
-                            "requires_chat_response": True
-                        }
-                    else:
-                        logger.error(f"Failed to activate schedule for operation {tool_operation_id}")
-                        return self._create_error_response("Failed to activate schedule")
+            total_approved = len(all_approved_items)
+            logger.info(f"Found {total_approved} total approved items out of {required_count} required")
 
-            # Return normal approval response if no scheduling needed
+            # 5. If we have all required items, proceed with completion
+            if total_approved >= required_count:
+                logger.info("Required item count reached, completing operation")
+                
+                # Take only the required number of items if we have extra
+                final_approved_items = all_approved_items[:required_count]
+                
+                # Update operation state to reflect completion
+                await self.tool_state_manager.update_operation(
+                    session_id=session_id,
+                    tool_operation_id=tool_operation_id,
+                    state=ToolOperationState.EXECUTING.value,
+                    metadata={
+                        "approval_state": ApprovalState.APPROVAL_FINISHED.value,
+                        "item_summary": {
+                            "total_approved": required_count,
+                            "required_count": required_count,
+                            "approved_item_ids": [str(item['_id']) for item in final_approved_items],
+                            "approval_completed_at": datetime.now(UTC).isoformat()
+                        }
+                    }
+                )
+
+                # Check if scheduling is required
+                requires_scheduling = operation.get('metadata', {}).get('requires_scheduling', False)
+                if requires_scheduling:
+                    return {
+                        "status": OperationStatus.APPROVED.value,
+                        "state": ToolOperationState.EXECUTING.value,
+                        "message": "All required items approved, ready for scheduling",
+                        "requires_scheduling": True,
+                        "data": {
+                            "approved_count": required_count,
+                            "approved_item_ids": [str(item['_id']) for item in final_approved_items],
+                            "schedule_info": operation.get('metadata', {}).get('schedule_info')
+                        }
+                    }
+
+                # Return success for non-scheduled operations
+                return {
+                    "status": OperationStatus.APPROVED.value,
+                    "state": ToolOperationState.EXECUTING.value,
+                    "message": f"All {required_count} required items approved successfully",
+                    "requires_chat_response": True,
+                    "data": {
+                        "approved_count": required_count,
+                        "approved_item_ids": [str(item['_id']) for item in final_approved_items]
+                    }
+                }
+
+            # 6. If we still need more items, indicate partial completion
+            remaining_needed = required_count - total_approved
             return {
-                "status": OperationStatus.APPROVED.value,
-                "state": ToolOperationState.EXECUTING.value,
-                "message": "Items approved successfully",
-                "requires_chat_response": True
+                "status": "partial_completion",
+                "message": f"Approved current items. Still need {remaining_needed} more.",
+                "requires_regeneration": True,
+                "data": {
+                    "current_approved": total_approved,
+                    "remaining_needed": remaining_needed
+                }
             }
-            
+
         except Exception as e:
             logger.error(f"Error in full approval handler: {e}")
             return self._create_error_response(str(e))
@@ -377,20 +393,37 @@ class ApprovalManager:
                         rejected_items.append(current_items[array_idx])
                 logger.info(f"Processed {len(rejected_items)} rejected items")
             
-            # Get operation details
+            # Get original operation to check count
             operation = await self.tool_state_manager.get_operation_by_id(tool_operation_id)
-            if not operation:
-                raise ValueError(f"No operation found for ID {tool_operation_id}")
+            original_count = operation.get('input_data', {}).get('command_info', {}).get('item_count', 0)
             
-            # Create new items for regeneration using the proper method
+            # Get current approved items count
+            approved_items_count = await self.tool_state_manager.get_operation_items(
+                tool_operation_id=tool_operation_id,
+                state=ToolOperationState.EXECUTING.value,
+                status=OperationStatus.APPROVED.value
+            )
+            
+            # Calculate how many new items we actually need
+            remaining_slots = original_count - len(approved_items_count)
+            regenerate_count = min(len(analysis.get('regenerate_indices', [])), remaining_slots)
+            
+            if regenerate_count <= 0:
+                logger.warning(f"No slots remaining for regeneration (approved: {len(approved_items_count)}, original: {original_count})")
+                return {
+                    "status": "completed",
+                    "message": "All required items are approved"
+                }
+
+            # Create new items for regeneration using the proper count
             new_items = await self.tool_state_manager.create_regeneration_items(
                 session_id=session_id,
                 tool_operation_id=tool_operation_id,
-                items_data=[{} for _ in range(len(regenerate_indices))],  # Empty items to be filled with content later
+                items_data=[{} for _ in range(regenerate_count)],
                 content_type=operation.get('metadata', {}).get('content_type'),
                 schedule_id=operation.get('metadata', {}).get('schedule_id')
             )
-
+            
             # Update operation metadata
             await self.tool_state_manager.update_operation(
                 session_id=session_id,
@@ -411,7 +444,7 @@ class ApprovalManager:
                     }
                 }
             )
-
+            
             return {
                 "status": "regeneration_needed",
                 "data": {
@@ -433,54 +466,52 @@ class ApprovalManager:
     ) -> Dict:
         """Handle regeneration of all items"""
         try:
-            # Get operation first to access tool type and other metadata
-            operation = await self.tool_state_manager.get_operation_by_id(tool_operation_id)
-            if not operation:
-                raise ValueError(f"No operation found for ID {tool_operation_id}")
-
-            # Get all current items
+            # 1. First get and properly mark all current PENDING items as REJECTED
             current_items = await self.db.tool_items.find({
                 "tool_operation_id": tool_operation_id,
-                "state": ToolOperationState.APPROVING.value
+                "state": ToolOperationState.APPROVING.value,
+                "status": OperationStatus.PENDING.value,
+                "metadata.rejected_at": {"$exists": False}
             }).to_list(None)
 
             if not current_items:
-                logger.error("No items found for regeneration")
+                logger.error("No pending items found for regeneration")
                 return self.analyzer.create_error_response("No items found")
 
             logger.info(f"Marking {len(current_items)} items for regeneration")
 
-            # Extract revision instructions from analysis
-            revision_instructions = analysis.get("revision_instructions")
-            logger.info(f"Revision instructions for regeneration: {revision_instructions}")
-
-            # Mark all current items as rejected and cancelled
+            # 2. Mark current items as REJECTED and store rejection info
             await self.db.tool_items.update_many(
                 {
-                    "tool_operation_id": tool_operation_id,
-                    "state": ToolOperationState.APPROVING.value
+                    "_id": {"$in": [item['_id'] for item in current_items]},
+                    "state": ToolOperationState.APPROVING.value,
+                    "status": OperationStatus.PENDING.value
                 },
                 {"$set": {
                     "state": ToolOperationState.CANCELLED.value,
                     "status": OperationStatus.REJECTED.value,
-                    "metadata": {
-                        "rejected_at": datetime.now(UTC).isoformat(),
-                        "rejection_reason": "regenerate_all requested",
-                        "revision_instructions": revision_instructions
-                    }
+                    "metadata.rejected_at": datetime.now(UTC).isoformat(),
+                    "metadata.rejection_reason": "regenerate_all requested",
+                    "metadata.revision_instructions": analysis.get("revision_instructions")
                 }}
             )
+            logger.info(f"Updated {len(current_items)} items to REJECTED/CANCELLED state")
 
-            # Create new items in COLLECTING state
+            # 3. Get operation to check required count
+            operation = await self.tool_state_manager.get_operation_by_id(tool_operation_id)
+            required_count = operation.get('input_data', {}).get('command_info', {}).get('item_count', len(current_items))
+
+            # 4. Create new items in COLLECTING state
             new_items = await self.tool_state_manager.create_regeneration_items(
                 session_id=session_id,
                 tool_operation_id=tool_operation_id,
-                items_data=[{} for _ in range(len(current_items))],
+                items_data=[{} for _ in range(required_count)],
                 content_type=current_items[0]['content_type'],
                 schedule_id=operation.get('metadata', {}).get('schedule_id')
             )
+            logger.info(f"Created {len(new_items)} new items in COLLECTING state")
 
-            # Update operation state after creating items
+            # 5. Update operation state to reflect regeneration
             await self.tool_state_manager.update_operation(
                 session_id=session_id,
                 tool_operation_id=tool_operation_id,
@@ -489,23 +520,23 @@ class ApprovalManager:
                     "approval_state": ApprovalState.REGENERATING.value,
                     "last_action": "regenerate_all",
                     "items_rejected": len(current_items),
+                    "items_to_regenerate": required_count,
                     "regeneration_requested_at": datetime.now(UTC).isoformat(),
-                    "last_revision_instructions": revision_instructions,
-                    "tool_type": operation.get('tool_type'),  # Maintain existing tool type from operation
-                    "content_type": current_items[0]['content_type']  # Maintain content type
+                    "revision_instructions": analysis.get("revision_instructions"),
+                    "content_type": current_items[0]['content_type'],
+                    "active_items": [str(item['_id']) for item in new_items]  # Track active items
                 }
             )
 
             return {
                 "status": "regeneration_needed",
-                "regenerate_count": len(current_items),
-                "response": f"All {len(current_items)} items will be regenerated.",
+                "regenerate_count": required_count,
+                "response": f"All {required_count} items will be regenerated.",
                 "data": {
                     "completion_type": "regenerate_all",
-                    "items_to_regenerate": len(current_items),
                     "analysis": analysis,
-                    "revision_instructions": revision_instructions,
-                    "tool_type": operation.get('tool_type')  # Include original tool type in response
+                    "revision_instructions": analysis.get("revision_instructions"),
+                    "active_item_ids": [str(item['_id']) for item in new_items]
                 }
             }
 

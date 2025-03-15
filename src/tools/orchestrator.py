@@ -6,6 +6,7 @@ import os
 from dotenv import load_dotenv
 from datetime import datetime, UTC, timedelta
 import json
+from bson import ObjectId
 
 # Base imports
 from src.tools.base import (
@@ -278,15 +279,24 @@ class Orchestrator:
                     "status": "error"
                 }
             
-            # Get or create operation
+            # Get current operation
             operation = await self.tool_state_manager.get_operation(session_id)
             logger.info(f"Retrieved operation for session {session_id}: {operation['_id'] if operation else None}")
             
-            # If operation exists, delegate to _handle_ongoing_operation
+            # If operation exists but is in terminal state, clear it to force new operation
+            if operation and operation.get('state') in [
+                ToolOperationState.COMPLETED.value,
+                ToolOperationState.ERROR.value,
+                ToolOperationState.CANCELLED.value
+            ]:
+                logger.info(f"Previous operation {operation['_id']} was in terminal state {operation.get('state')}, starting new operation")
+                operation = None  # Clear the operation to force creation of a new one
+            
+            # Keep the existing logic for handling ongoing or creating new operation
             if operation:
                 return await self._handle_ongoing_operation(operation, message)
 
-            # If no operation, start new one
+            # Rest of the existing code for creating new operation...
             operation = await self.tool_state_manager.start_operation(
                 session_id=session_id,
                 tool_type=tool_type,
@@ -519,7 +529,6 @@ class Orchestrator:
             tool_type = operation.get('tool_type')
             logger.info(f"Handling ongoing operation {operation['_id']} in state {current_state}")
 
-            # Get original count from initial command
             original_count = operation.get('input_data', {}).get('command_info', {}).get('item_count', 0)
             logger.info(f"Original requested count: {original_count}")
 
@@ -534,15 +543,21 @@ class Orchestrator:
                 }
 
             if current_state == ToolOperationState.APPROVING.value:
-                # Get current items for approval
+                # Get ONLY active pending items from current turn
                 current_items = await self.tool_state_manager.get_operation_items(
                     tool_operation_id=str(operation['_id']),
-                    state=ToolOperationState.APPROVING.value
+                    state=ToolOperationState.APPROVING.value,
+                    status=OperationStatus.PENDING.value,
+                    additional_query={
+                        "metadata.rejected_at": {"$exists": False},
+                        "content": {"$exists": True, "$ne": ""},
+                        "_id": {"$in": [ObjectId(id) for id in operation.get('metadata', {}).get('active_items', [])]}
+                    }
                 )
 
                 logger.info(f"Processing approval response for {len(current_items)} items in operation {operation['_id']}")
 
-                # Handle approval through ApprovalManager with ALL approval actions
+                # Handle approval through ApprovalManager
                 approval_result = await self.approval_manager.process_approval_response(
                     message=message,
                     session_id=operation['session_id'],
@@ -553,7 +568,7 @@ class Orchestrator:
                             self.approval_manager._handle_full_approval(
                                 tool_operation_id=tool_operation_id,
                                 session_id=session_id,
-                                items=current_items,
+                                items=current_items,  # Pass only current turn's items
                                 analysis=analysis
                             ),
                         "partial_approval": lambda tool_operation_id, session_id, analysis, **kwargs:
@@ -637,7 +652,17 @@ class Orchestrator:
                         
                         # Check if scheduling is required
                         if tool.registry.requires_scheduling:
-                            return await self._handle_scheduled_operation(operation, approved_items[:original_count])
+                            schedule_result = await self._handle_scheduled_operation(
+                                operation=operation,
+                                approved_items=approved_items[:original_count]
+                            )
+                            if schedule_result.get("success"):
+                                return {
+                                    "status": "completed",
+                                    "state": ToolOperationState.COMPLETED.value,
+                                    "message": "Items approved and scheduled successfully",
+                                    "requires_chat_response": True
+                                }
                         else:
                             # For non-scheduled operations, complete immediately
                             await self.tool_state_manager.end_operation(

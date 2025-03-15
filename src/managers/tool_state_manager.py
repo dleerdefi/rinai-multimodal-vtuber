@@ -449,9 +449,10 @@ class ToolStateManager:
         self,
         tool_operation_id: str,
         state: Optional[str] = None,
-        status: Optional[Union[str, List[str]]] = None
+        status: Optional[str] = None,
+        additional_query: Optional[Dict] = None
     ) -> List[Dict]:
-        """Get all items for a tool operation with optional state/status filter"""
+        """Get items for an operation with specific state/status"""
         try:
             query = {"tool_operation_id": tool_operation_id}
             
@@ -459,18 +460,16 @@ class ToolStateManager:
                 query["state"] = state
                 
             if status:
-                if isinstance(status, list):
-                    query["status"] = {"$in": status}
-                else:
-                    query["status"] = status
-                    
-            # Log the query for debugging
+                query["status"] = status
+                
+            if additional_query:
+                query.update(additional_query)
+                
             logger.info(f"Querying items with: {query}")
             
-            cursor = self.db.tool_items.find(query)
-            items = await cursor.to_list(length=None)
-            
+            items = await self.db.tool_items.find(query).to_list(None)
             logger.info(f"Found {len(items)} items matching query")
+            
             return items
             
         except Exception as e:

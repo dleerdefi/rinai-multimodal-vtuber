@@ -277,6 +277,17 @@ class ScheduleManager:
     ) -> bool:
         """Activate a schedule after items are ready for execution"""
         try:
+            # Get operation first to retrieve session_id
+            operation = await self.tool_state_manager.get_operation_by_id(tool_operation_id)
+            if not operation:
+                logger.error(f"No operation found for ID {tool_operation_id}")
+                return False
+            
+            session_id = operation.get('session_id')
+            if not session_id:
+                logger.error(f"No session_id found for operation {tool_operation_id}")
+                return False
+
             # 1. Verify items are in EXECUTING state
             items = await self.tool_state_manager.get_operation_items(
                 tool_operation_id=tool_operation_id,
@@ -332,11 +343,11 @@ class ScheduleManager:
                 # Check if this is a limit order
                 is_limit_order = item.get('content_type') == ContentType.LIMIT_ORDER.value
                 
-                # Build update data - ADDING scheduling_type field
                 await self.db.tool_items.update_one(
                     {"_id": item["_id"]},
                     {"$set": {
                         "status": OperationStatus.SCHEDULED.value,
+                        "state": ToolOperationState.COMPLETED.value,  # Update state to COMPLETED
                         "scheduled_time": scheduled_time,
                         "execution_order": i + 1,
                         "metadata.schedule_state": ScheduleState.ACTIVE.value,
@@ -387,6 +398,20 @@ class ScheduleManager:
                     },
                     "metadata.last_modified": datetime.now(UTC).isoformat()
                 }}
+            )
+
+            # Update the operation state and status
+            await self.tool_state_manager.update_operation(
+                session_id=session_id,
+                tool_operation_id=tool_operation_id,
+                state=ToolOperationState.COMPLETED.value,
+                content_updates={
+                    "status": OperationStatus.SCHEDULED.value
+                },
+                metadata={
+                    "schedule_state": ScheduleState.ACTIVE.value,
+                    "schedule_activated_at": datetime.now(UTC).isoformat()
+                }
             )
 
             return True

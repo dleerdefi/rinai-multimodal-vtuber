@@ -3,7 +3,7 @@ import json
 import logging
 from typing import Dict, List, Any, Optional
 from src.services.llm_service import LLMService, ModelType
-from src.db.enums import OperationStatus, ContentType
+from src.db.enums import OperationStatus, ContentType, ToolOperationState
 
 logger = logging.getLogger(__name__)
 
@@ -19,7 +19,19 @@ class ApprovalAnalyzer:
         """Analyze user's approval response"""
         try:
             logger.info(f"Analyzing approval response: {user_response}")
-            presentation = self.format_items_for_review(current_items)
+            
+            # Filter for only current turn's pending items in APPROVING state
+            valid_items = [
+                item for item in current_items 
+                if (item.get('status') == OperationStatus.PENDING.value and
+                    item.get('state') == ToolOperationState.APPROVING.value and
+                    item.get('content') and 
+                    not item.get('metadata', {}).get('rejected_at'))
+            ]
+            
+            logger.info(f"Found {len(valid_items)} active pending items for current turn")
+            
+            presentation = self.format_items_for_review(valid_items)
             
             prompt = [
                 {
@@ -32,12 +44,14 @@ Key actions to detect:
 - Rejection/Regeneration: "reject this", "redo item 2", "regenerate", etc.
 - Exit/Cancel: "stop", "cancel", "quit", etc.
 
-Always return structured JSON with the appropriate action and indices.
-Extract both the action and any specific feedback about WHY items were rejected."""
+Always return structured JSON with the appropriate action and indices."""
                 },
                 {
                     "role": "user",
-                    "content": f"""Context: User is reviewing {len(current_items)} items.
+                    "content": f"""Context: User is reviewing {len(valid_items)} items.
+
+Items being reviewed:
+{presentation}
 
 User's response: "{user_response}"
 
@@ -71,23 +85,32 @@ Output: {{
                 }
             )
 
-            # Parse response
+            # Parse and validate the response
             analysis = json.loads(response)
-            logger.info(f"LLM analysis result: {analysis}")
             
-            # Ensure the indices are correctly extracted and logged
+            # Ensure indices are within bounds of current pending items
             if 'approved_indices' in analysis:
-                # Make sure they're integers
-                analysis['approved_indices'] = [int(idx) for idx in analysis['approved_indices']]
+                analysis['approved_indices'] = [
+                    idx for idx in analysis['approved_indices'] 
+                    if 1 <= idx <= len(valid_items)
+                ]
             
             if 'regenerate_indices' in analysis:
-                # Make sure they're integers
-                analysis['regenerate_indices'] = [int(idx) for idx in analysis['regenerate_indices']]
+                analysis['regenerate_indices'] = [
+                    idx for idx in analysis['regenerate_indices'] 
+                    if 1 <= idx <= len(valid_items)
+                ]
             
-            # Log the processed analysis
+            # Add metadata about the analysis context
+            analysis['metadata'] = {
+                'total_pending_items': len(valid_items),
+                'analyzed_at': datetime.now(UTC).isoformat(),
+                'valid_item_ids': [str(item.get('_id')) for item in valid_items]
+            }
+            
             logger.info(f"Processed analysis: {analysis}")
-            
             return analysis
+
         except Exception as e:
             logger.error(f"Error analyzing approval response: {e}")
             return {"action": "error", "feedback": str(e)}
@@ -228,11 +251,7 @@ Output: {{
                 
             # Add standard options menu
             review_text += "Would you like to:\n"
-            review_text += "1. Approve all items\n"
-            review_text += "2. Approve specific items\n"
-            review_text += "3. Regenerate all items\n"
-            review_text += "4. Regenerate specific items\n"
-            review_text += "5. Cancel the operation\n"
+            review_text += "Approve all, regenerate all, regenerate specific items, or cancel and exit?\n"
             
             return review_text
 
@@ -243,14 +262,6 @@ Output: {{
     def _format_limit_order(self, content: Dict) -> str:
         """Format limit order specific content"""
         text = ""
-        text += f"Title: {content.get('title', 'No title')}\n"
-        text += f"Description: {content.get('description', 'No description')}\n"
-        
-        warnings = content.get('warnings', [])
-        if warnings:
-            text += "\nWarnings:\n"
-            for warning in warnings:
-                text += f"- {warning}\n"
         
         text += f"\nExpected Outcome: {content.get('expected_outcome', 'No outcome specified')}\n"
         

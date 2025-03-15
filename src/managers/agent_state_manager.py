@@ -120,6 +120,9 @@ class AgentStateManager:
             initial_state = self.current_state
             logger.info(f"Current state before handling: {self.current_state}")
 
+            # Get current operation
+            operation = await self.tool_state_manager.get_operation(session_id)
+
             # NORMAL_CHAT: Check for tool triggers
             if self.current_state == AgentState.NORMAL_CHAT:
                 tool_type = self.trigger_detector.get_specific_tool_type(message)
@@ -155,48 +158,86 @@ class AgentStateManager:
 
             # TOOL_OPERATION: Handle ongoing operation
             elif self.current_state == AgentState.TOOL_OPERATION:
-                try:
-                    result = await self.orchestrator.handle_tool_operation(
-                        message=message,
-                        session_id=session_id,
-                        tool_type=self._current_tool_type
+                # Check if operation is in terminal state
+                if operation and operation.get("state") in [
+                    ToolOperationState.COMPLETED.value,
+                    ToolOperationState.CANCELLED.value,
+                    ToolOperationState.ERROR.value
+                ]:
+                    # Reset state to NORMAL_CHAT
+                    await self._transition_state(
+                        AgentAction.COMPLETE_TOOL,
+                        "Previous operation completed"
                     )
-                    
-                    if isinstance(result, dict):
-                        operation_status = result.get("status", "").lower()
-                        
-                        # Handle operation completion
-                        if operation_status in ["completed", "cancelled", "error", "exit"]:
-                            # Get operation summary if available
-                            operation_summary = result.get("operation_summary", {})
-                            
-                            # Transition state based on status
-                            action = AgentAction.COMPLETE_TOOL if operation_status == "completed" else AgentAction.CANCEL_TOOL
-                            await self._transition_state(action, f"Operation {operation_status}")
-                            
-                            # Clear tool type as operation is complete
-                            self._current_tool_type = None
-                            
-                            # Return with summary for chat context
-                            return {
-                                "state": self.current_state.value,
-                                "status": operation_status,
-                                "requires_chat_response": True,
-                                "operation_summary": operation_summary,
-                                "response": operation_summary.get("summary") if operation_summary else result.get("response")
-                            }
-                        
-                        # For ongoing operations
-                        return {
-                            **result,
-                            "state": self.current_state.value,
-                            "tool_type": self._current_tool_type
-                        }
+                    self._current_tool_type = None
 
-                except Exception as e:
-                    logger.error(f"Error in tool operation: {e}")
-                    await self._transition_state(AgentAction.ERROR, str(e))
-                    return self._create_error_response(str(e))
+                    # Check for new tool trigger
+                    tool_type = self.trigger_detector.get_specific_tool_type(message)
+                    if tool_type:
+                        # Start new operation
+                        await self._transition_state(
+                            AgentAction.START_TOOL,
+                            f"Starting new {tool_type} operation"
+                        )
+                        self._current_tool_type = tool_type
+                        
+                        # Handle new operation
+                        result = await self.orchestrator.handle_tool_operation(
+                            message=message,
+                            session_id=session_id,
+                            tool_type=tool_type
+                        )
+                        
+                        if isinstance(result, dict):
+                            return {
+                                **result,
+                                "state": self.current_state.value,
+                                "tool_type": tool_type
+                            }
+                else:
+                    # Handle ongoing operation normally
+                    try:
+                        result = await self.orchestrator.handle_tool_operation(
+                            message=message,
+                            session_id=session_id,
+                            tool_type=self._current_tool_type
+                        )
+                        
+                        if isinstance(result, dict):
+                            operation_status = result.get("status", "").lower()
+                            
+                            # Handle operation completion
+                            if operation_status in ["completed", "cancelled", "error", "exit"]:
+                                # Get operation summary if available
+                                operation_summary = result.get("operation_summary", {})
+                                
+                                # Transition state based on status
+                                action = AgentAction.COMPLETE_TOOL if operation_status == "completed" else AgentAction.CANCEL_TOOL
+                                await self._transition_state(action, f"Operation {operation_status}")
+                                
+                                # Clear tool type as operation is complete
+                                self._current_tool_type = None
+                                
+                                # Return with summary for chat context
+                                return {
+                                    "state": self.current_state.value,
+                                    "status": operation_status,
+                                    "requires_chat_response": True,
+                                    "operation_summary": operation_summary,
+                                    "response": operation_summary.get("summary") if operation_summary else result.get("response")
+                                }
+                            
+                            # For ongoing operations
+                            return {
+                                **result,
+                                "state": self.current_state.value,
+                                "tool_type": self._current_tool_type
+                            }
+
+                    except Exception as e:
+                        logger.error(f"Error in tool operation: {e}")
+                        await self._transition_state(AgentAction.ERROR, str(e))
+                        return self._create_error_response(str(e))
 
             # Default response for NORMAL_CHAT
             return {

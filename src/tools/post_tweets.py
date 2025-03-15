@@ -405,16 +405,22 @@ Return ONLY valid JSON in this exact format:
             current_pending_items = operation.get("output_data", {}).get("pending_items", [])
             
             for item in generated_items.get('items', []):
+                # Fix content structure to be consistent
+                content = item.get("content")
+                if isinstance(content, dict):
+                    # If we somehow got a nested structure, flatten it
+                    content = content.get("formatted_content") or content.get("raw_content")
+                
                 tool_item = {
                     "session_id": self.deps.session_id,
                     "tool_operation_id": tool_operation_id,
                     "schedule_id": schedule_id,
                     "content_type": ContentType.TWEET.value,
-                    "state": operation["state"],  # Inherit COLLECTING state
-                    "status": OperationStatus.PENDING.value,  # Individual item status
+                    "state": operation["state"],
+                    "status": OperationStatus.PENDING.value,
                     "content": {
-                        "raw_content": item["content"],
-                        "formatted_content": item["content"],
+                        "raw_content": content,
+                        "formatted_content": content,
                         "version": "1.0"
                     },
                     "metadata": {
@@ -544,38 +550,4 @@ Return ONLY valid JSON in this exact format:
             
         except Exception as e:
             logger.error(f"Error handling approval error: {e}")
-            return self.approval_manager._create_error_response(str(e))
-
-    async def _regenerate_rejected_items(
-        self,
-        tool_operation_id: str,
-        regenerate_count: int,
-        analysis: Dict,
-        **kwargs
-    ) -> Dict:
-        """Handle tweet regeneration after partial approval"""
-        try:
-            # Get operation for topic
-            operation = await self.tool_state_manager.get_operation_by_id(tool_operation_id)
-            if not operation:
-                raise ValueError(f"No operation found for ID {tool_operation_id}")
-
-            # Get topic from command_info
-            topic = operation.get("input_data", {}).get("command_info", {}).get("topic")
-            if not topic:
-                raise ValueError("Could not find topic for regeneration")
-
-            logger.info(f"Regenerating {regenerate_count} tweets about topic: {topic}")
-
-            # Generate new tweet content - _generate_tweets handles state management
-            return await self._generate_content(
-                topic=topic, 
-                count=regenerate_count, 
-                schedule_id=operation.get("input_data", {}).get("schedule_id"), 
-                tool_operation_id=tool_operation_id,
-                revision_instructions=analysis.get("revision_instructions")
-            )
-
-        except Exception as e:
-            logger.error(f"Error regenerating tweets: {e}")
             return self.approval_manager._create_error_response(str(e))
