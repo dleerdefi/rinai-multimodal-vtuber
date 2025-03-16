@@ -229,41 +229,28 @@ class ScheduleManager:
                 if not session_id:
                     raise ValueError(f"No session_id found for operation {tool_operation_id}")
 
-            # Clean up any existing schedule for this operation
-            existing = await self.db.scheduled_operations.find_one({"tool_operation_id": tool_operation_id})
-            if existing:
-                logger.info(f"Found existing schedule for operation {tool_operation_id}, cleaning up...")
-                await self.db.scheduled_operations.delete_one({"tool_operation_id": tool_operation_id})
-
-            # Create new schedule
+            # Always create a new schedule
+            logger.info(f"Creating new schedule for operation {tool_operation_id}")
             schedule_id = await self.db.create_scheduled_operation(
                 tool_operation_id=tool_operation_id,
                 content_type=content_type,
                 schedule_info=schedule_info
             )
 
-            # Track state transition
+            # Initialize new schedule in PENDING state
             await self._transition_schedule_state(
                 schedule_id=schedule_id,
                 action=ScheduleAction.INITIALIZE,
-                reason="Schedule initialized with pending items",
+                reason="New schedule created for operation",
                 metadata={
                     "tool_operation_id": tool_operation_id,
                     "content_type": content_type,
-                    "schedule_info": schedule_info
+                    "schedule_info": schedule_info,
+                    "created_at": datetime.now(UTC).isoformat()
                 }
             )
 
-            # Update tool operation with schedule reference
-            await self.tool_state_manager.update_operation(
-                session_id=session_id,
-                tool_operation_id=tool_operation_id,
-                metadata={
-                    "schedule_id": schedule_id,
-                    "schedule_state": ScheduleState.PENDING.value
-                }
-            )
-
+            logger.info(f"Successfully created new schedule {schedule_id} for operation {tool_operation_id}")
             return schedule_id
 
         except Exception as e:
@@ -295,8 +282,7 @@ class ScheduleManager:
                 status={"$in": [OperationStatus.APPROVED.value, OperationStatus.PENDING.value]}
             )
             
-            logger.info(f"Looking for items with tool_operation_id={tool_operation_id}, state=EXECUTING, status=[APPROVED, PENDING]")
-            logger.info(f"Found {len(items)} items matching criteria")
+            logger.info(f"Found {len(items)} items to schedule. Items: {[str(item['_id']) for item in items]}")
             
             if not items:
                 logger.error(f"No executable items found for operation {tool_operation_id}")
@@ -336,18 +322,17 @@ class ScheduleManager:
                 
             logger.info(f"Scheduling items starting at {start_time.isoformat()} with {interval_minutes} minute intervals")
             
-            # 4. Update each item with scheduled time
+            # 4. Update each item to COMPLETED state and SCHEDULED status
+            successfully_scheduled = []
             for i, item in enumerate(items):
                 scheduled_time = start_time + timedelta(minutes=i * interval_minutes)
-                
-                # Check if this is a limit order
                 is_limit_order = item.get('content_type') == ContentType.LIMIT_ORDER.value
                 
-                await self.db.tool_items.update_one(
+                update_result = await self.db.tool_items.update_one(
                     {"_id": item["_id"]},
                     {"$set": {
-                        "status": OperationStatus.SCHEDULED.value,
-                        "state": ToolOperationState.COMPLETED.value,  # Update state to COMPLETED
+                        "state": ToolOperationState.COMPLETED.value,    # COMPLETED state
+                        "status": OperationStatus.SCHEDULED.value,      # SCHEDULED status
                         "scheduled_time": scheduled_time,
                         "execution_order": i + 1,
                         "metadata.schedule_state": ScheduleState.ACTIVE.value,
@@ -360,7 +345,14 @@ class ScheduleManager:
                     }}
                 )
                 
-                logger.info(f"Scheduled item {item['_id']} for execution at {scheduled_time.isoformat()}, type: {'monitored' if is_limit_order else 'time_based'}")
+                if update_result.modified_count > 0:
+                    successfully_scheduled.append(str(item['_id']))
+                    logger.info(f"Successfully scheduled item {item['_id']} for execution at {scheduled_time.isoformat()}")
+
+            # Verify all items were scheduled
+            if len(successfully_scheduled) != len(items):
+                logger.error(f"Only {len(successfully_scheduled)}/{len(items)} items were scheduled successfully")
+                return False
 
             # 5. Fix state history format - ensure it's an array
             # First check if state_history exists and is an array
@@ -400,19 +392,36 @@ class ScheduleManager:
                 }}
             )
 
-            # Update the operation state and status
+            # After successfully scheduling items, update operation state/status
+            logger.info(f"Updating operation {tool_operation_id} state to COMPLETED and status to SCHEDULED")
             await self.tool_state_manager.update_operation(
                 session_id=session_id,
                 tool_operation_id=tool_operation_id,
-                state=ToolOperationState.COMPLETED.value,
-                content_updates={
-                    "status": OperationStatus.SCHEDULED.value
-                },
+                state=ToolOperationState.COMPLETED.value,    # Set final state
+                status=OperationStatus.SCHEDULED.value,      # Set final status
                 metadata={
                     "schedule_state": ScheduleState.ACTIVE.value,
-                    "schedule_activated_at": datetime.now(UTC).isoformat()
+                    "schedule_activated_at": datetime.now(UTC).isoformat(),
+                    "scheduled_items": successfully_scheduled,
+                    "total_scheduled": len(successfully_scheduled),
+                    "completion_reason": "Schedule activated successfully"
                 }
             )
+            logger.info(f"Successfully updated operation {tool_operation_id} state and status")
+
+            # Update schedule state to ACTIVE
+            logger.info(f"Updating schedule {schedule_id} state to ACTIVE")
+            await self._transition_schedule_state(
+                schedule_id=schedule_id,
+                action=ScheduleAction.ACTIVATE,
+                reason="Schedule activated with all items scheduled",
+                metadata={
+                    "activation_time": datetime.now(UTC).isoformat(),
+                    "scheduled_items": successfully_scheduled,
+                    "total_scheduled": len(successfully_scheduled)
+                }
+            )
+            logger.info(f"Successfully updated schedule {schedule_id} state")
 
             return True
 

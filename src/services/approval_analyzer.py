@@ -261,19 +261,16 @@ Output: {{
 
     def _format_limit_order(self, content: Dict) -> str:
         """Format limit order specific content"""
+        # Log full details for console
+        logger.info(f"Formatting limit order content: {json.dumps(content, indent=2)}")
+        
+        # For TTS, only include essential info
         text = ""
-        
-        text += f"\nExpected Outcome: {content.get('expected_outcome', 'No outcome specified')}\n"
-        
         op_details = content.get('operation_details', {})
         if op_details:
-            text += "\nOperation Details:\n"
-            text += f"- From: {op_details.get('from_amount')} {op_details.get('from_token')}\n"
-            text += f"- To: {op_details.get('to_token')}\n"
-            text += f"- Target Price: ${op_details.get('target_price_usd')} per {op_details.get('reference_token')}\n"
-            text += f"- Chain: {op_details.get('to_chain', 'ethereum')}\n"
-            if op_details.get('destination_address'):
-                text += f"- Withdrawal to: {op_details['destination_address']} on {op_details.get('destination_chain', 'ethereum')}\n"
+            text += f"Limit order to swap {op_details.get('from_amount')} {op_details.get('from_token')} "
+            text += f"for {op_details.get('to_token')} when {op_details.get('reference_token')} "
+            text += f"reaches ${op_details.get('target_price_usd')}.\n"
         
         return text
 

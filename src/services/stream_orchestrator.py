@@ -19,6 +19,7 @@ from aiohttp import web
 from src.services.monitoring_service import LimitOrderMonitoringService
 from src.clients.coingecko_client import CoinGeckoClient
 from src.clients.near_account_helper import get_near_account
+from src.db.enums import ToolType
 
 logger = logging.getLogger(__name__)
 
@@ -253,8 +254,8 @@ class StreamOrchestrator:
                 self.agent.orchestrator._register_intents_tool()
                 logger.info("Injected NEAR account into orchestrator for IntentsTool")
                 
-                # Get the IntentsTool from orchestrator's tools registry
-                intents_tool = self.agent.orchestrator.tools.get('intents')
+                # Get the IntentsTool from orchestrator's tools registry using correct key
+                intents_tool = self.agent.orchestrator.tools.get(ToolType.INTENTS.value)
                 if intents_tool:
                     logger.info("Found IntentsTool in orchestrator's tools registry")
                 else:

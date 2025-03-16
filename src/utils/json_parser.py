@@ -25,16 +25,30 @@ def extract_json(response: str) -> str:
                 elif block.startswith("javascript"):
                     block = block[10:].strip()
                     
-                # Try to find JSON markers
-                if "{" in block and "}" in block:
-                    start_idx = block.find('{')
-                    end_idx = block.rfind('}')
+                # Try to find JSON markers - handle both objects and arrays
+                if ("[" in block and "]" in block) or ("{" in block and "}" in block):
+                    # For arrays
+                    if block.find('[') < block.find('{') or (block.find('[') != -1 and block.find('{') == -1):
+                        start_idx = block.find('[')
+                        end_idx = block.rfind(']')
+                    # For objects
+                    else:
+                        start_idx = block.find('{')
+                        end_idx = block.rfind('}')
+                        
                     if start_idx != -1 and end_idx > start_idx:
                         return block[start_idx:end_idx + 1].strip()
         
         # If no code blocks, try to find JSON markers directly
-        start_idx = response.find('{')
-        end_idx = response.rfind('}')
+        # Check for arrays first
+        start_idx = response.find('[')
+        end_idx = response.rfind(']')
+        
+        # If no array markers, try object markers
+        if start_idx == -1 or end_idx == -1:
+            start_idx = response.find('{')
+            end_idx = response.rfind('}')
+            
         if start_idx != -1 and end_idx > start_idx:
             return response[start_idx:end_idx + 1].strip()
             

@@ -34,19 +34,21 @@ class ToolStateManager:
                 ToolOperationState.COLLECTING.value
             ],
             ToolOperationState.COLLECTING.value: [
-                ToolOperationState.APPROVING.value,
-                ToolOperationState.EXECUTING.value,
-                ToolOperationState.ERROR.value  
+                ToolOperationState.APPROVING.value,  # If requires_approval
+                ToolOperationState.EXECUTING.value,  # If direct execution
+                ToolOperationState.CANCELLED.value,
+                ToolOperationState.ERROR.value
             ],
             ToolOperationState.APPROVING.value: [
-                ToolOperationState.EXECUTING.value,
-                ToolOperationState.CANCELLED.value,
-                ToolOperationState.ERROR.value,
-                ToolOperationState.COLLECTING.value # Allow collecting from approving for regeneration
+                ToolOperationState.EXECUTING.value,  # When approved
+                ToolOperationState.COLLECTING.value, # When regenerating items
+                ToolOperationState.CANCELLED.value,  # When rejected/cancelled
+                ToolOperationState.ERROR.value
             ],
             ToolOperationState.EXECUTING.value: [
-                ToolOperationState.COMPLETED.value,
-                ToolOperationState.ERROR.value
+                ToolOperationState.COMPLETED.value,  # On successful execution
+                ToolOperationState.CANCELLED.value,
+                ToolOperationState.ERROR.value      # On execution failure
             ],
             ToolOperationState.COMPLETED.value: [],  # Terminal state
             ToolOperationState.ERROR.value: [],      # Terminal state
@@ -57,10 +59,17 @@ class ToolStateManager:
         self,
         session_id: str,
         tool_type: str,
-        initial_data: Optional[Dict[str, Any]] = None
+        initial_data: Optional[Dict[str, Any]] = None,
+        initial_state: str = ToolOperationState.COLLECTING.value
     ) -> Dict:
         """Start any tool operation with a unique ID"""
         try:
+            # First check for any active operations
+            active_op = await self.get_operation(session_id)
+            if active_op:
+                logger.warning(f"Found active operation {active_op['_id']} when starting new one")
+                # Optionally end it or raise error
+
             tool_operation_id = str(ObjectId())
             initial_data = initial_data or {}
             
@@ -76,7 +85,7 @@ class ToolStateManager:
                 "_id": ObjectId(tool_operation_id),
                 "session_id": session_id,
                 "tool_type": tool_type,
-                "state": ToolOperationState.COLLECTING.value,
+                "state": initial_state,
                 "step": "analyzing",
                 "input_data": {
                     "command": initial_data.get("command"),
@@ -95,7 +104,7 @@ class ToolStateManager:
                 },
                 "metadata": {
                     "state_history": [{
-                        "state": ToolOperationState.COLLECTING.value,
+                        "state": initial_state,
                         "step": "analyzing",
                         "timestamp": datetime.now(UTC).isoformat()
                     }],
@@ -113,7 +122,7 @@ class ToolStateManager:
             result = await self.db.tool_operations.insert_one(operation_data)
             operation_data['_id'] = result.inserted_id
             
-            logger.info(f"Started {tool_type} operation {tool_operation_id} for session {session_id}")
+            logger.info(f"Started {tool_type} operation {tool_operation_id} for session {session_id} in state {initial_state}")
             return operation_data
 
         except Exception as e:
@@ -125,107 +134,116 @@ class ToolStateManager:
         session_id: str,
         tool_operation_id: str,
         state: Optional[str] = None,
-        step: Optional[str] = None,
+        status: Optional[str] = None,
         content_updates: Optional[Dict] = None,
         metadata: Optional[Dict] = None,
         input_data: Optional[Dict] = None,
         output_data: Optional[Dict] = None
     ) -> bool:
-        """Update tool operation with new data"""
+        """Update operation with state validation"""
         try:
-            # Validate operation exists and belongs to session
-            current_op = await self.db.tool_operations.find_one({
-                "_id": ObjectId(tool_operation_id),
-                "session_id": session_id
-            })
+            # Get operation first
+            operation = await self.get_operation_by_id(tool_operation_id)
+            if not operation:
+                logger.error(f"No operation found for ID {tool_operation_id}")
+                return False
             
-            if not current_op:
-                logger.error(f"No operation found for ID {tool_operation_id} and session {session_id}")
+            # Verify session matches
+            if operation["session_id"] != session_id:
+                logger.error(f"Session ID mismatch: {session_id} vs {operation['session_id']}")
                 return False
 
             update_data = {"last_updated": datetime.now(UTC)}
-            
-            # Validate state transition if state is being updated
+
+            # Validate state transition
+            if state and not self._is_valid_transition(operation["state"], state):
+                logger.error(f"Invalid state transition: {operation['state']} -> {state}")
+                return False
+
+            # Build update data preserving existing fields
             if state:
-                current_state = current_op.get("state")
-                if not self._is_valid_transition(current_state, state):
-                    logger.warning(
-                        f"Invalid state transition from {current_state} to {state}. "
-                        f"Valid transitions are: {self.valid_transitions.get(current_state, [])}"
-                    )
-                    return False
                 update_data["state"] = state
-                
-                # Handle schedule state updates if this is a scheduled operation
-                if current_op.get("metadata", {}).get("requires_scheduling"):
-                    schedule_id = current_op.get("output_data", {}).get("schedule_id")
-                    if schedule_id:
-                        if state == ToolOperationState.COMPLETED.value:
-                            await self.db.update_schedule_state(
-                                schedule_id=schedule_id,
-                                state=ScheduleState.ACTIVE.value
-                            )
-                        elif state in [ToolOperationState.CANCELLED.value, ToolOperationState.ERROR.value]:
-                            await self.db.update_schedule_state(
-                                schedule_id=schedule_id,
-                                state=ScheduleState.CANCELLED.value if state == ToolOperationState.CANCELLED.value else ScheduleState.ERROR.value
-                            )
-                
-            if step:
-                update_data["step"] = step
-                
+            if status:
+                update_data["status"] = status
             if content_updates:
-                # Merge with existing output_data
-                existing_output = current_op.get("output_data", {})
-                update_data["output_data"] = {
-                    **existing_output,
+                update_data["content_updates"] = {
+                    **(operation.get("content_updates", {})),
                     **content_updates
                 }
-                
-            if metadata:
-                # Merge with existing metadata
-                existing_metadata = current_op.get("metadata", {})
-                update_data["metadata"] = {
-                    **existing_metadata,
-                    **metadata,
-                    "last_modified": datetime.now(UTC).isoformat()
-                }
-
             if input_data:
-                # Merge with existing input_data
-                existing_input = current_op.get("input_data", {})
                 update_data["input_data"] = {
-                    **existing_input,
+                    **(operation.get("input_data", {})),
                     **input_data
                 }
-
             if output_data:
-                # Merge with existing output_data if not already updated
-                if "output_data" not in update_data:
-                    existing_output = current_op.get("output_data", {})
-                    update_data["output_data"] = {
-                        **existing_output,
-                        **output_data
-                    }
-                
-            # Update operation
+                update_data["output_data"] = {
+                    **(operation.get("output_data", {})),
+                    **output_data
+                }
+            if metadata:
+                update_data["metadata"] = {
+                    **(operation.get("metadata", {})),
+                    **metadata
+                }
+
             result = await self.db.tool_operations.update_one(
-                {
-                    "_id": ObjectId(tool_operation_id),
-                    "session_id": session_id
-                },
+                {"_id": ObjectId(tool_operation_id)},
                 {"$set": update_data}
             )
-            
             return result.modified_count > 0
 
         except Exception as e:
             logger.error(f"Error updating operation: {e}")
             return False
 
-    async def get_operation(self, session_id: str) -> Optional[ToolOperation]:
-        """Get current operation state"""
-        return await self.db.get_tool_operation_state(session_id)
+    async def get_operation(
+        self,
+        session_id: str,
+        additional_query: Optional[Dict] = None,
+        include_terminal_states: bool = False
+    ) -> Optional[Dict]:
+        """Get current operation for a session
+        
+        Args:
+            session_id: The session ID
+            additional_query: Additional query parameters
+            include_terminal_states: Whether to include completed/error/cancelled operations
+        """
+        try:
+            # Base query
+            query = {"session_id": session_id}
+            
+            # Exclude terminal states unless specifically requested
+            if not include_terminal_states:
+                query["state"] = {
+                    "$nin": [
+                        ToolOperationState.COMPLETED.value,
+                        ToolOperationState.ERROR.value,
+                        ToolOperationState.CANCELLED.value
+                    ]
+                }
+                
+            # Add any additional query parameters
+            if additional_query:
+                query.update(additional_query)
+                
+            # Sort by creation time descending to get most recent
+            operation = await self.db.tool_operations.find_one(
+                query,
+                sort=[("created_at", -1)]
+            )
+            
+            logger.info(
+                f"Retrieved operation for session {session_id}: "
+                f"{operation['_id'] if operation else None} "
+                f"(state: {operation.get('state') if operation else None})"
+            )
+            
+            return operation
+            
+        except Exception as e:
+            logger.error(f"Error getting operation: {e}")
+            return None
 
     async def end_operation(
         self,
@@ -250,23 +268,47 @@ class ToolStateManager:
 
             current_state = operation.get("state")
             current_status = operation.get("status", "unknown")
+            requires_scheduling = bool(operation.get("metadata", {}).get("requires_scheduling"))
             
             # Determine final states
             final_state = self._determine_final_state(success, current_state)
             final_status = self._determine_final_status(
                 success=success,
-                requires_scheduling=bool(operation.get("metadata", {}).get("requires_scheduling")),
+                requires_scheduling=requires_scheduling,
                 current_status=current_status
             )
 
-            # First, clean up any existing scheduled operations
-            try:
-                await self.db.scheduled_operations.delete_many({
-                    "tool_operation_id": str(operation["_id"])
-                })
-                logger.info(f"Cleaned up scheduled operations for {operation['_id']}")
-            except Exception as e:
-                logger.error(f"Error cleaning up scheduled operations: {e}")
+            # Handle scheduled operations differently
+            if requires_scheduling:
+                schedule_id = operation.get("metadata", {}).get("schedule_id")
+                if schedule_id:
+                    if not success:
+                        # On error, cancel the schedule
+                        try:
+                            await self.db.scheduled_operations.update_one(
+                                {"_id": ObjectId(schedule_id)},
+                                {"$set": {
+                                    "state": ScheduleState.ERROR.value,
+                                    "status": "error",
+                                    "error": api_response.get("error") if api_response else "Operation failed",
+                                    "error_timestamp": datetime.now(UTC).isoformat()
+                                }}
+                            )
+                            logger.info(f"Updated schedule {schedule_id} to ERROR state")
+                        except Exception as e:
+                            logger.error(f"Error updating schedule state: {e}")
+                    else:
+                        # For successful scheduled operations, don't delete the schedule
+                        logger.info(f"Keeping schedule {schedule_id} active for execution")
+            else:
+                # For non-scheduled operations, clean up any existing scheduled operations
+                try:
+                    await self.db.scheduled_operations.delete_many({
+                        "tool_operation_id": str(operation["_id"])
+                    })
+                    logger.info(f"Cleaned up scheduled operations for {operation['_id']}")
+                except Exception as e:
+                    logger.error(f"Error cleaning up scheduled operations: {e}")
             
             # Update operation with final state
             update_data = {
@@ -278,13 +320,24 @@ class ToolStateManager:
             }
             
             if api_response:
-                update_data["output_data"] = api_response
+                # Merge with existing output_data instead of replacing
+                existing_output = operation.get("output_data", {})
+                update_data["output_data"] = {
+                    **existing_output,
+                    **(api_response if isinstance(api_response, dict) else {"response": api_response})
+                }
 
             # Update operation in database
             result = await self.db.tool_operations.find_one_and_update(
                 {"_id": operation["_id"]},
                 {"$set": update_data},
                 return_document=True
+            )
+
+            # Update all operation items to match final state
+            await self.sync_items_to_operation_status(
+                tool_operation_id=str(operation["_id"]),
+                operation_status=final_status
             )
 
             # Clear session state if this was the active operation
@@ -304,12 +357,19 @@ class ToolStateManager:
 
     def _determine_final_state(self, success: bool, current_state: str) -> str:
         """Determine final ToolOperationState based on success and current state"""
+        # If operation failed, always transition to ERROR state
         if not success:
             return ToolOperationState.ERROR.value
             
+        # If operation was cancelled, preserve CANCELLED state
         if current_state == ToolOperationState.CANCELLED.value:
             return ToolOperationState.CANCELLED.value
             
+        # If operation was already in ERROR state, preserve it
+        if current_state == ToolOperationState.ERROR.value:
+            return ToolOperationState.ERROR.value
+            
+        # Otherwise, mark as COMPLETED
         return ToolOperationState.COMPLETED.value
 
     def _determine_final_status(
@@ -319,15 +379,23 @@ class ToolStateManager:
         current_status: str
     ) -> str:
         """Determine final OperationStatus based on operation type and success"""
+        # If operation failed, always set to FAILED status
         if not success:
             return OperationStatus.FAILED.value
             
+        # If operation was rejected, preserve REJECTED status
         if current_status == OperationStatus.REJECTED.value:
             return OperationStatus.REJECTED.value
             
+        # If operation was already failed, preserve FAILED status
+        if current_status == OperationStatus.FAILED.value:
+            return OperationStatus.FAILED.value
+            
+        # For scheduled operations that completed successfully
         if requires_scheduling:
             return OperationStatus.SCHEDULED.value
             
+        # For immediate operations that completed successfully
         return OperationStatus.EXECUTED.value
 
     def _is_valid_transition(self, current_state: str, new_state: str) -> bool:
@@ -530,19 +598,16 @@ class ToolStateManager:
 
             # Determine new state based on operation type and item states
             if is_scheduled_operation:
-                if len(items_by_status['executed']) == expected_item_count:
-                    new_state = ToolOperationState.COMPLETED.value
-                elif len(items_by_status['scheduled']) == expected_item_count:
-                    new_state = ToolOperationState.EXECUTING.value  # Schedule is active
+                if len(items_by_status['scheduled']) == expected_item_count:
+                    new_state = ToolOperationState.COMPLETED.value # Schedule is active 
                 elif len(items_by_status['approved']) == expected_item_count:
-                    # All items approved but not yet scheduled
-                    new_state = ToolOperationState.APPROVING.value
+                    new_state = ToolOperationState.EXECUTING.value
             else:
                 # Non-scheduled operation state progression
-                if len(items_by_state['completed']) == expected_item_count:
-                    new_state = ToolOperationState.COMPLETED.value
-                elif len(items_by_state['executing']) == expected_item_count:
+                if len(items_by_status['approved']) == expected_item_count:
                     new_state = ToolOperationState.EXECUTING.value
+                elif len(items_by_state['executed']) == expected_item_count:
+                    new_state = ToolOperationState.COMPLETED.value
 
             # Only update if state has changed
             if new_state != current_state:
@@ -630,7 +695,8 @@ class ToolStateManager:
         content_type: str,
         schedule_id: Optional[str] = None,
         initial_state: str = ToolOperationState.COLLECTING.value,
-        initial_status: str = OperationStatus.PENDING.value
+        initial_status: str = OperationStatus.PENDING.value,
+        metadata: Optional[Dict] = None
     ) -> List[Dict]:
         """Create new tool items with proper state tracking"""
         try:
@@ -655,6 +721,7 @@ class ToolStateManager:
                     },
                     "metadata": {
                         **item.get("metadata", {}),
+                        **(metadata or {}),
                         "created_at": datetime.now(UTC).isoformat(),
                         "state_history": [{
                             "state": initial_state,
@@ -691,7 +758,8 @@ class ToolStateManager:
         tool_operation_id: str,
         items_data: List[Dict],
         content_type: str,
-        schedule_id: Optional[str] = None
+        schedule_id: Optional[str] = None,
+        metadata: Optional[Dict] = None
     ) -> List[Dict]:
         """Create new items specifically for regeneration"""
         try:
@@ -714,7 +782,12 @@ class ToolStateManager:
                 content_type=content_type,
                 schedule_id=schedule_id,
                 initial_state=ToolOperationState.COLLECTING.value,
-                initial_status=OperationStatus.PENDING.value
+                initial_status=OperationStatus.PENDING.value,
+                metadata={
+                    **(metadata or {}),
+                    "regenerated_at": datetime.now(UTC).isoformat(),
+                    "regeneration_phase": "collecting"
+                }
             )
 
             # Update operation metadata
@@ -723,7 +796,8 @@ class ToolStateManager:
                 tool_operation_id=tool_operation_id,
                 metadata={
                     "regeneration_count": len(items),
-                    "last_regeneration": datetime.now(UTC).isoformat()
+                    "last_regeneration": datetime.now(UTC).isoformat(),
+                    "regeneration_metadata": metadata
                 }
             )
 
@@ -808,3 +882,31 @@ class ToolStateManager:
         except Exception as e:
             logger.error(f"Error updating tool item: {e}")
             return False
+
+    async def get_session_operations(
+        self,
+        session_id: str,
+        include_terminal_states: bool = True,
+        limit: int = 10
+    ) -> List[Dict]:
+        """Get all operations for a session, sorted by creation time"""
+        try:
+            query = {"session_id": session_id}
+            if not include_terminal_states:
+                query["state"] = {
+                    "$nin": [
+                        ToolOperationState.COMPLETED.value,
+                        ToolOperationState.ERROR.value,
+                        ToolOperationState.CANCELLED.value
+                    ]
+                }
+            
+            cursor = self.db.tool_operations.find(
+                query,
+                sort=[("created_at", -1)]
+            ).limit(limit)
+            
+            return await cursor.to_list(length=None)
+        except Exception as e:
+            logger.error(f"Error getting session operations: {e}")
+            return []

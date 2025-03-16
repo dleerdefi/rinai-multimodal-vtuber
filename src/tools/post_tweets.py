@@ -51,7 +51,7 @@ class TwitterTool(BaseTool):
         tool_type=ToolType.TWITTER,
         requires_approval=True,
         requires_scheduling=True,
-        required_clients=["twitter_client"],
+        required_clients=["twitter_client", "perplexity_client"],
         required_managers=["tool_state_manager", "approval_manager", "schedule_manager"]
     )
 
@@ -70,6 +70,7 @@ class TwitterTool(BaseTool):
         self.llm_service = None
         self.approval_manager = None
         self.schedule_manager = None
+        self.perplexity_client = None
         self.db = None
 
     def inject_dependencies(self, **services):
@@ -78,6 +79,7 @@ class TwitterTool(BaseTool):
         self.llm_service = services.get("llm_service")
         self.approval_manager = services.get("approval_manager")
         self.schedule_manager = services.get("schedule_manager")
+        self.perplexity_client = services.get("perplexity_client")
         self.db = self.tool_state_manager.db if self.tool_state_manager else None
 
     def can_handle(self, input_data: Any) -> bool:
@@ -285,9 +287,63 @@ Example response format:
         """Generate tweet content and save as tool items"""
         try:
             logger.info(f"Starting tweet generation: {count} tweets about {topic}")
-            if revision_instructions:
-                logger.info(f"With revision instructions: {revision_instructions}")
             
+            # Get enriched context from Perplexity
+            perplexity_prompt = f"""
+Research the latest information about {topic} to create high-engagement tweets.
+Analyze and synthesize:
+
+1. BREAKING NEWS (last 12 hours): What's the most recent development that would surprise or inform our audience?
+
+2. DATA INSIGHTS: What specific numbers, percentages, or statistics demonstrate significant trends or changes? Include exact figures with sources.
+
+3. EXPERT ANALYSIS: What are recognized authorities saying that challenges conventional wisdom or offers unique perspectives? Include direct quotes with attribution.
+
+4. AUDIENCE DISCUSSIONS: What specific questions or debates are generating the most engagement in online communities? What are people confused about or wanting to know?
+
+5. PREDICTION ANGLES: What forecasts or future implications are being discussed that our audience should know about?
+
+6. CONTRARIAN VIEWPOINTS: What counter-intuitive perspectives exist that might provoke thought or discussion?
+
+7. TIME-SENSITIVE OPPORTUNITIES: What upcoming events, deadlines, or releases should our audience be aware of?
+
+Format your response with clearly labeled sections and bullet points. For each point, include:
+- The specific insight
+- Why it matters (relevance/impact)
+- Source attribution where applicable
+- Engagement potential (why people would care)
+
+Prioritize information that is:
+- Timely (preferably within last 24 hours)
+- Specific rather than general
+- Surprising or challenging to common assumptions
+- Actionable or decision-relevant
+- Emotionally resonant
+"""
+
+            context_info = ""
+            if self.perplexity_client:
+                try:
+                    logger.info(f"Querying Perplexity for context about: {topic}")
+                    search_result = await self.perplexity_client.search(
+                        query=perplexity_prompt,
+                        max_tokens=500
+                    )
+                    if search_result.get("status") == "success":
+                        context_info = search_result["data"]
+                        logger.info(f"Perplexity context received:\n{context_info}")
+                        
+                        # Log key points extracted from context
+                        logger.info("Key points from Perplexity response:")
+                        for line in context_info.split('\n'):
+                            if line.strip().startswith(('-', '•', '*')) or ': ' in line:
+                                logger.info(f"  {line.strip()}")
+                    else:
+                        logger.warning(f"Perplexity search failed: {search_result.get('error')}")
+                except Exception as e:
+                    logger.error(f"Error getting Perplexity context: {e}")
+                    context_info = ""
+
             # Get parent operation to inherit state/status
             operation = await self.tool_state_manager.get_operation(self.deps.session_id)
             if not operation:
@@ -301,11 +357,40 @@ Example response format:
             is_regenerating = operation.get("metadata", {}).get("approval_state") == ApprovalState.REGENERATING.value
             logger.info(f"Generating tweets in {'regeneration' if is_regenerating else 'initial'} mode")
             
-            # Modify prompt based on whether we have revision instructions
-            base_prompt = f"""You are a professional social media manager. Generate {count} engaging tweets about {topic}."""
-            
+            # Enhanced base prompt with context
+            base_prompt = f"""You are a professional social media manager crafting {count} engaging tweets about {topic}.
+
+Latest Research Context:
+{context_info}
+
+CORE TWEET PRINCIPLES:
+1. SPECIFICITY: Include precise data points, specific examples, or concrete details from the research
+2. TIMELINESS: Reference exactly when information was published (e.g., "New study released today shows..." or "Breaking: As of 2PM EST...")
+3. CREDIBILITY: Incorporate expert opinions with proper attribution (e.g., "According to [expert name/org]...")
+4. RELEVANCE: Connect information directly to audience interests/needs/pain points
+5. EMOTIONAL TRIGGERS: Evoke curiosity, surprise, concern, or excitement through unexpected facts or implications
+6. ACTIONABILITY: Where possible, include a clear next step or way to use the information
+
+TWEET FORMATS (USE VARIETY):
+- Surprising statistic + implication
+- Breaking news + why it matters
+- Expert quote + your analysis
+- Contrarian take on conventional wisdom
+- Time-sensitive opportunity or deadline
+- Question that challenges assumptions
+- "Did you know" revelations with specific data
+- Before/after or comparison frameworks
+
+TECHNICAL REQUIREMENTS:
+- Maximum 280 characters per tweet
+- Include 1-2 relevant emojis per tweet (placed strategically, not decoratively)
+- Incorporate contextually appropriate hashtags (max 2 per tweet)
+- Vary sentence structure and length
+- Use active voice and conversational tone
+- Each tweet must be substantially different in content and structure"""
+
             if revision_instructions:
-                base_prompt += f"\n\nImportant revision instructions: {revision_instructions}"
+                base_prompt += f"\n\nRevision Instructions: {revision_instructions}"
             
             prompt = f"""{base_prompt}
 
@@ -319,6 +404,8 @@ Guidelines:
 - No hashtags, just the content
 - Smart subtle intelligent tweets, be original and creative
 - Ensure proper JSON formatting with commas between items
+
+Each tweet should pass this test: "Would someone who sees this in their feed feel compelled to share it with others because it provides genuine value?"
 
 Return ONLY valid JSON in this exact format:
 {{
