@@ -360,7 +360,8 @@ Return ONLY valid JSON matching the example format.
         count: int = 1, 
         revision_instructions: str = None,
         schedule_id: Optional[str] = None, 
-        tool_operation_id: str = None
+        tool_operation_id: str = None,
+        analyzed_params: Optional[Dict] = None  # Add this parameter
     ) -> Dict:
         """Generate human-readable content for limit order approval"""
         try:
@@ -412,6 +413,27 @@ Return ONLY valid JSON matching the example format.
                     monitoring_params_list = monitoring_params_list[:count]
                     logger.info(f"No specific indices, using first {count} orders")
                 
+                # If we have analyzed parameters from orchestrator, use them
+                if analyzed_params:
+                    # Update the order with analyzed parameters
+                    orders = [analyzed_params]  # Replace with analyzed parameters
+                    # Update monitoring parameters
+                    new_monitoring_params = {
+                        "check_interval_seconds": 60,
+                        "last_checked_timestamp": int(datetime.now(UTC).timestamp()),
+                        "best_price_seen": 0,
+                        "expiration_timestamp": int((datetime.now(UTC) + timedelta(hours=analyzed_params.get("expiration_hours", 24))).timestamp()),
+                        "max_checks": 1000,
+                        "reference_token": analyzed_params["reference_token"],
+                        "target_price_usd": float(analyzed_params["target_price_usd"]),
+                        "from_token": analyzed_params["from_token"],
+                        "from_amount": float(analyzed_params["from_amount"]),
+                        "to_token": analyzed_params["to_token"]
+                    }
+                    monitoring_params_list = [new_monitoring_params]
+                    logger.info(f"Using analyzed parameters from orchestrator: {analyzed_params}")
+                    logger.info(f"Updated monitoring params: {new_monitoring_params}")
+                
                 logger.info(f"Processing {len(orders)} orders for regeneration")
                 logger.info(f"Orders for regeneration: {orders}")
                 logger.info(f"Monitoring params for regeneration: {monitoring_params_list}")
@@ -422,32 +444,6 @@ Return ONLY valid JSON matching the example format.
 
             # Generate content for each order
             for i, order in enumerate(orders):
-                if is_regenerating and revision_instructions:
-                    # Pass is_regeneration flag to skip schedule creation
-                    revision_analysis = await self._analyze_command(
-                        revision_instructions,
-                        is_regeneration=True
-                    )
-                    
-                    if revision_analysis and revision_analysis.get('orders'):
-                        revised_order = revision_analysis['orders'][0]
-                        
-                        # Update order with revised parameters
-                        order = revised_order
-                        
-                        # Update monitoring parameters with revised details
-                        if i < len(monitoring_params_list):
-                            monitoring_params_list[i].update({
-                                "reference_token": revised_order["reference_token"],
-                                "target_price_usd": revised_order["target_price_usd"],
-                                "from_token": revised_order["from_token"],
-                                "from_amount": revised_order["from_amount"],
-                                "to_token": revised_order["to_token"]
-                            })
-                        
-                        logger.info(f"Updated order with revision analysis: {order}")
-                        logger.info(f"Updated monitoring params: {monitoring_params_list[i]}")
-
                 # Base prompt for limit order description
                 base_prompt = f"""You are a cryptocurrency expert. Generate a detailed description for a limit order with the following parameters:
 

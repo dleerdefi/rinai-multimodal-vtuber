@@ -418,7 +418,16 @@ class ApprovalManager:
     ) -> Dict:
         """Handle regeneration of all items"""
         try:
-            # 1. First get and properly mark all current PENDING items as REJECTED
+            # 1. Get current operation and its command info
+            operation = await self.tool_state_manager.get_operation_by_id(tool_operation_id)
+            if not operation:
+                raise ValueError(f"No operation found for ID {tool_operation_id}")
+
+            # Get original command info for monitoring params
+            command_info = operation.get('input_data', {}).get('command_info', {})
+            original_monitoring_params = command_info.get('monitoring_params_list', [])
+
+            # 2. Mark current PENDING items as REJECTED
             current_items = await self.db.tool_items.find({
                 "tool_operation_id": tool_operation_id,
                 "state": ToolOperationState.APPROVING.value,
@@ -432,7 +441,7 @@ class ApprovalManager:
 
             logger.info(f"Marking {len(current_items)} items for regeneration")
 
-            # 2. Mark current items as REJECTED and store rejection info
+            # 3. Mark items as REJECTED with rejection info
             await self.db.tool_items.update_many(
                 {
                     "_id": {"$in": [item['_id'] for item in current_items]},
@@ -449,21 +458,28 @@ class ApprovalManager:
             )
             logger.info(f"Updated {len(current_items)} items to REJECTED/CANCELLED state")
 
-            # 3. Get operation to check required count
-            operation = await self.tool_state_manager.get_operation_by_id(tool_operation_id)
+            # 4. Create new items in COLLECTING state
             required_count = operation.get('input_data', {}).get('command_info', {}).get('item_count', len(current_items))
 
-            # 4. Create new items in COLLECTING state
+            # Create items with proper metadata including monitoring params
             new_items = await self.tool_state_manager.create_regeneration_items(
                 session_id=session_id,
                 tool_operation_id=tool_operation_id,
                 items_data=[{} for _ in range(required_count)],
                 content_type=current_items[0]['content_type'],
-                schedule_id=operation.get('metadata', {}).get('schedule_id')
+                schedule_id=operation.get('metadata', {}).get('schedule_id'),
+                metadata={
+                    "regeneration_reason": "regenerate_all",
+                    "regenerated_at": datetime.now(UTC).isoformat(),
+                    "revision_instructions": analysis.get("revision_instructions"),
+                    "original_monitoring_params": original_monitoring_params,  # Pass original params
+                    "parent_operation_id": tool_operation_id,
+                    "parent_schedule_id": operation.get('metadata', {}).get('schedule_id')
+                }
             )
             logger.info(f"Created {len(new_items)} new items in COLLECTING state")
 
-            # 5. Update operation state to reflect regeneration
+            # 5. Update operation state for regeneration
             await self.tool_state_manager.update_operation(
                 session_id=session_id,
                 tool_operation_id=tool_operation_id,
@@ -476,7 +492,9 @@ class ApprovalManager:
                     "regeneration_requested_at": datetime.now(UTC).isoformat(),
                     "revision_instructions": analysis.get("revision_instructions"),
                     "content_type": current_items[0]['content_type'],
-                    "active_items": [str(item['_id']) for item in new_items]  # Track active items
+                    "active_items": [str(item['_id']) for item in new_items],  # Track active items
+                    "original_monitoring_params": original_monitoring_params,  # Keep original params
+                    "schedule_id": operation.get('metadata', {}).get('schedule_id')  # Keep schedule_id
                 }
             )
 

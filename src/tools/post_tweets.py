@@ -396,13 +396,11 @@ TECHNICAL REQUIREMENTS:
 
 Guidelines:
 - Each tweet should be unique and engaging
-- Include relevant hashtags
 - Keep within Twitter's character limit (280 characters)
 - Vary the style and tone
 - Make them informative yet conversational
 - Include emojis where appropriate
 - No hashtags, just the content
-- Smart subtle intelligent tweets, be original and creative
 - Ensure proper JSON formatting with commas between items
 
 Each tweet should pass this test: "Would someone who sees this in their feed feel compelled to share it with others because it provides genuine value?"

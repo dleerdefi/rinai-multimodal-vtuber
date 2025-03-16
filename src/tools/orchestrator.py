@@ -600,25 +600,37 @@ class Orchestrator:
                 # Handle regeneration
                 if approval_result.get("status") == "regeneration_needed":
                     regenerate_count = approval_result.get("data", {}).get("regenerate_count", 0)
-                    logger.info(f"Regenerating {regenerate_count} items")
+                    revision_instructions = approval_result.get("data", {}).get("analysis", {}).get("revision_instructions")
+                    logger.info(f"Handling regeneration with count: {regenerate_count}, instructions: {revision_instructions}")
+
+                    if tool.registry.tool_type == ToolType.INTENTS:
+                        # First analyze the revision instructions
+                        revision_analysis = await tool._analyze_command(
+                            revision_instructions,
+                            is_regeneration=True
+                        )
+                        # Then generate using analysis results
+                        generation_result = await tool._generate_content(
+                            topic=revision_analysis.get("topic"),
+                            count=regenerate_count,
+                            revision_instructions=revision_instructions,
+                            schedule_id=operation.get('metadata', {}).get('schedule_id'),
+                            tool_operation_id=str(operation['_id']),
+                            analyzed_params=revision_analysis.get('orders', [{}])[0]  # Pass analyzed parameters
+                        )
+                    else:
+                        # For other tools, just generate
+                        generation_result = await tool._generate_content(
+                            topic=operation.get('input_data', {}).get('topic'),
+                            count=regenerate_count,
+                            revision_instructions=revision_instructions,
+                            schedule_id=operation.get('metadata', {}).get('schedule_id'),
+                            tool_operation_id=str(operation['_id'])
+                        )
                     
-                    # Create new items in COLLECTING state
-                    new_items = await self.tool_state_manager.create_regeneration_items(
-                        session_id=operation['session_id'],
-                        tool_operation_id=str(operation['_id']),
-                        items_data=[{} for _ in range(regenerate_count)],
-                        content_type=operation.get('metadata', {}).get('content_type'),
-                        schedule_id=operation.get('metadata', {}).get('schedule_id')
-                    )
-                    
-                    # Generate content for new items
-                    generation_result = await tool._generate_content(
-                        topic=operation.get('input_data', {}).get('topic'),
-                        count=regenerate_count,
-                        revision_instructions=approval_result.get("data", {}).get("analysis", {}).get("revision_instructions"),
-                        schedule_id=operation.get('metadata', {}).get('schedule_id'),
-                        tool_operation_id=str(operation['_id'])
-                    )
+                    # Get the newly generated items
+                    new_items = generation_result.get("items", [])
+                    logger.info(f"Generated {len(new_items)} new items for regeneration")
                     
                     # Update items with generated content
                     for item, content in zip(new_items, generation_result["items"]):
