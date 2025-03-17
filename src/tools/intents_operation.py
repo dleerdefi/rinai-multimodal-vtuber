@@ -137,57 +137,47 @@ class IntentsTool(BaseTool):
                 
             tool_operation_id = str(operation['_id'])
             
-            # Update prompt to be more explicit about direction and price reference
-            prompt = f"""You are a blockchain intents analyzer. Determine the limit order parameters for buying or selling a token based on the user's command.
+            # Update prompt to be more strict
+            prompt = f"""You are a blockchain intents analyzer. Parse the following command into limit order parameters.
 
 Command: "{command}"
 
-Required parameters for limit order:
-   - item_count: number of limit orders to create (default 1)
-   - topic: what to swap (e.g., "NEAR to USDC")
-   - from_token: token being sold (e.g., "NEAR")
-   - from_amount: amount of from_token to sell
-   - to_token: token being bought (e.g., "USDC")
-   - target_price_usd: target price in USD per reference_token
-   - reference_token: token that the target price refers to
-   - to_chain: destination chain for the to_token
-   - expiration_hours: hours until order expires (optional, defaults to 24)
-   - slippage: slippage tolerance percentage (optional, defaults to 0.5)
+Return a JSON object with EXACTLY these fields:
+{{
+    "item_count": number of orders (default 1),
+    "topic": "descriptive text of the order",
+    "from_token": "token being sold",
+    "from_amount": numeric amount to sell,
+    "to_token": "token being bought",
+    "target_price_usd": numeric target price in USD,
+    "reference_token": "token the price refers to",
+    "to_chain": "destination chain",
+    "destination_address": "withdrawal address (if specified)",
+    "destination_chain": "withdrawal chain (if different from to_chain)"
+}}
 
-IMPORTANT RULES:
-- When command says "at $X per TOKEN", TOKEN is the reference_token for pricing
-- Direction matters: "swap A for B" means A is from_token and B is to_token
-- If buying a token at $X per unit, that token is the reference_token
-- Chain specification (e.g., "on Solana") refers to the to_chain
+Rules:
+1. ALL numeric values must be numbers (not strings)
+2. ALL chain names must be lowercase
+3. If withdrawal is specified, BOTH destination_address and destination_chain are required
+4. Chain names must be one of: "ethereum", "solana", "arbitrum", "near", "base"
 
-Example 1: "limit order swap 5 NEAR for USDC at $3.00 per NEAR"
-Should parse as:
+Example command: "limit order swap 0.15 NEAR for SOL and withdraw to Solana address abc123 when NEAR reaches $2.50"
+Example response:
 {{
     "item_count": 1,
-    "topic": "swap 5 NEAR for USDC at $3.00 per NEAR",
+    "topic": "swap 0.15 NEAR for SOL with withdrawal to Solana",
     "from_token": "NEAR",
-    "from_amount": 5.0,
-    "to_token": "USDC",
-    "target_price_usd": 3.0,
+    "from_amount": 0.15,
+    "to_token": "SOL",
+    "target_price_usd": 2.50,
     "reference_token": "NEAR",
-    "to_chain": "ethereum"
+    "to_chain": "solana",
+    "destination_address": "abc123",
+    "destination_chain": "solana"
 }}
 
-Example 2: "limit order swap 1 USDC for NEAR at $2.20 per NEAR"
-Should parse as:
-{{
-    "item_count": 1,
-    "topic": "swap 1 USDC for NEAR at $2.20 per NEAR",
-    "from_token": "USDC",
-    "from_amount": 1.0,
-    "to_token": "NEAR",
-    "target_price_usd": 2.20,
-    "reference_token": "NEAR",
-    "to_chain": "near"
-}}
-
-Return ONLY valid JSON matching the example format.
-"""
+Parse the command and return ONLY the JSON object with no additional text."""
 
             messages = [
                 {
@@ -216,17 +206,39 @@ Return ONLY valid JSON matching the example format.
             logger.info(f"Raw LLM response: {response}")
             
             try:
-                # Parse response and handle both single order and array of orders
-                parsed_data = json.loads(response)
-                orders = parsed_data if isinstance(parsed_data, list) else [parsed_data]
-                logger.info(f"Parsed JSON data: {orders}")
+                # First try parse_strict_json which handles markdown
+                parsed_data = parse_strict_json(response)
+                if not parsed_data:
+                    # If that fails, try cleaning the response
+                    cleaned_response = response.strip()
+                    if '```' in cleaned_response:
+                        # Get content between backticks
+                        parts = cleaned_response.split('```')
+                        for part in parts:
+                            if '{' in part and '}' in part:
+                                cleaned_response = part.strip()
+                                if cleaned_response.startswith('json'):
+                                    cleaned_response = cleaned_response[4:].strip()
+                                try:
+                                    parsed_data = json.loads(cleaned_response)
+                                    break
+                                except json.JSONDecodeError:
+                                    continue
+                    if not parsed_data:
+                        raise ValueError("Failed to parse LLM response into valid JSON")
+
+                # Handle both single order and array formats
+                if isinstance(parsed_data, dict):
+                    if "limit_orders" in parsed_data:
+                        orders = parsed_data["limit_orders"]
+                    else:
+                        orders = [parsed_data]
+                else:
+                    orders = parsed_data if isinstance(parsed_data, list) else [parsed_data]
                 
-                # Validate required fields for each order
-                required_fields = ['from_token', 'from_amount', 'to_token', 'target_price_usd', 'reference_token']
-                for order in orders:
-                    missing_fields = [field for field in required_fields if field not in order]
-                    if missing_fields:
-                        raise ValueError(f"Missing required fields in order: {missing_fields}")
+                # Validate each order using config-based validation
+                orders = [self._validate_order(order) for order in orders]
+                logger.info(f"Successfully parsed and validated orders: {orders}")
                 
                 # Use first order's item_count since they should all be the same
                 item_count = orders[0]["item_count"]
@@ -243,10 +255,15 @@ Return ONLY valid JSON matching the example format.
                         "expiration_timestamp": int((datetime.now(UTC) + timedelta(hours=order.get("expiration_hours", 24))).timestamp()),
                         "max_checks": 1000,
                         "reference_token": order["reference_token"],
-                        "target_price_usd": order["target_price_usd"],
+                        "target_price_usd": float(order["target_price_usd"]),
                         "from_token": order["from_token"],
-                        "from_amount": order["from_amount"],
-                        "to_token": order["to_token"]
+                        "from_amount": float(order["from_amount"]),
+                        "to_token": order["to_token"],
+                        "to_chain": order["to_chain"],
+                        "destination_chain": order.get("destination_chain", order["to_chain"]),
+                        "destination_address": order.get("destination_address"),
+                        "from_asset_id": order.get("from_asset_id"),
+                        "to_asset_id": order.get("to_asset_id")
                     }
                     monitoring_params_list.append(monitoring_params)
                     
@@ -443,16 +460,21 @@ Return ONLY valid JSON matching the example format.
                 
                 # Create monitoring params from stored analysis
                 monitoring_params = {
-                            "check_interval_seconds": 60,
-                            "last_checked_timestamp": int(datetime.now(UTC).timestamp()),
-                            "best_price_seen": 0,
+                    "check_interval_seconds": 60,
+                    "last_checked_timestamp": int(datetime.now(UTC).timestamp()),
+                    "best_price_seen": 0,
                     "expiration_timestamp": int((datetime.now(UTC) + timedelta(hours=24)).timestamp()),
-                            "max_checks": 1000,
+                    "max_checks": 1000,
                     "reference_token": order["reference_token"],
                     "target_price_usd": float(order["target_price_usd"]),
                     "from_token": order["from_token"],
                     "from_amount": float(order["from_amount"]),
-                    "to_token": order["to_token"]
+                    "to_token": order["to_token"],
+                    "to_chain": order["to_chain"],
+                    "destination_chain": order.get("destination_chain", order["to_chain"]),
+                    "destination_address": order.get("destination_address"),
+                    "from_asset_id": order.get("from_asset_id"),
+                    "to_asset_id": order.get("to_asset_id")
                 }
 
                 saved_items = []
@@ -532,7 +554,11 @@ IMPORTANT: Your response MUST be valid JSON in the following format:
                                 "to_token": order["to_token"],
                                 "target_price_usd": float(order["target_price_usd"]),
                                 "reference_token": order["reference_token"],
-                                "to_chain": order.get("to_chain", "ethereum")
+                                "to_chain": order["to_chain"],
+                                "from_asset_id": order.get("from_asset_id"),
+                                "to_asset_id": order.get("to_asset_id"),
+                                "destination_address": order.get("destination_address"),
+                                "destination_chain": order.get("destination_chain")
                             }
                         },
                         operation_details=order,
@@ -672,7 +698,11 @@ IMPORTANT: Your response MUST be valid JSON in the following format:
                             "to_token": order["to_token"],
                             "target_price_usd": float(order["target_price_usd"]),
                             "reference_token": order["reference_token"],
-                            "to_chain": order.get("to_chain", "ethereum")
+                            "to_chain": order["to_chain"],
+                            "from_asset_id": order.get("from_asset_id"),
+                            "to_asset_id": order.get("to_asset_id"),
+                            "destination_address": order.get("destination_address"),
+                            "destination_chain": order.get("destination_chain")
                         }
                     },
                     "parameters": {
@@ -760,12 +790,20 @@ IMPORTANT: Your response MUST be valid JSON in the following format:
             # Extract operation parameters from the correct location
             content = operation.get("content", {})
             operation_details = content.get("operation_details", {})
+            custom_params = operation.get("parameters", {}).get("custom_params", {})
+            
+            # Use chain info from custom_params first, fall back to operation_details
+            chain_out = str(
+                custom_params.get("destination_chain") or 
+                custom_params.get("to_chain") or 
+                operation_details.get("destination_chain") or 
+                operation_details.get("to_chain", "ethereum")
+            )
             
             # Create new variables to ensure correct types
             from_token = str(operation_details.get("from_token", ""))
             from_amount = float(operation_details.get("from_amount", 0))
             to_token = str(operation_details.get("to_token", ""))
-            chain_out = str(operation_details.get("to_chain", "ethereum"))
             
             logger.info(f"Executing swap with parameters: from_token='{from_token}', "
                        f"from_amount={from_amount}, to_token='{to_token}', chain_out='{chain_out}'")
@@ -776,48 +814,44 @@ IMPORTANT: Your response MUST be valid JSON in the following format:
 
             execution_steps = []
             try:
-                # IMPORTANT: Remove 'await' - this is not an async function
-                logger.info(f"Checking balance for token: '{from_token}'")
+                # Step 1: Check Balance
                 initial_balance = get_intent_balance(self.near_account, from_token)
                 initial_balance_float = float(initial_balance) if initial_balance is not None else 0
-                
-                logger.info(f"Initial {from_token} balance in intents: {initial_balance_float}")
                 execution_steps.append({
                     "step": "check_balance",
-                    "result": {"initial_balance": initial_balance_float}
+                    "result": {"initial_balance": initial_balance_float},
+                    "success": True
                 })
 
-                # Handle deposit if needed
+                # Step 2: Handle deposit if needed
                 if initial_balance_float < from_amount:
                     needed_amount = from_amount - initial_balance_float
-                    logger.info(f"Depositing {needed_amount} {from_token}")
                     
                     if from_token == "NEAR":
-                        # IMPORTANT: Remove 'await' here too
                         wrap_result = wrap_near(self.near_account, needed_amount)
-                        logger.info(f"Wrapped NEAR result: {wrap_result}")
                         execution_steps.append({
                             "step": "wrap_near",
-                            "result": wrap_result
+                            "result": wrap_result,
+                            "success": "final_execution_status" in wrap_result 
+                                and wrap_result["final_execution_status"] == "EXECUTED_OPTIMISTIC"
                         })
-                        await asyncio.sleep(15)  # Keep this await - asyncio.sleep is async
-                    
-                    # IMPORTANT: Remove 'await' here too
+                        await asyncio.sleep(15)
+
                     deposit_result = intent_deposit(self.near_account, from_token, needed_amount)
-                    logger.info(f"Deposit result: {deposit_result}")
                     execution_steps.append({
                         "step": "deposit",
-                        "result": deposit_result
+                        "result": deposit_result,
+                        "success": deposit_result is not None  # deposit returns None on success
                     })
-                    await asyncio.sleep(15)  # Keep this await
-                    
-                    # IMPORTANT: Remove 'await' here too
+                    await asyncio.sleep(15)
+
+                    # Verify deposit
                     new_balance = get_intent_balance(self.near_account, from_token)
                     new_balance_float = float(new_balance) if new_balance is not None else 0
                     if new_balance_float < from_amount:
                         raise ValueError(f"Deposit verification failed. Balance: {new_balance_float} {from_token}")
 
-                # Execute swap - remove 'await' here too
+                # Step 3: Execute swap
                 logger.info(f"Executing swap: {from_amount} {from_token} -> {to_token}")
                 swap_result = intent_swap(
                     self.near_account,
@@ -827,53 +861,82 @@ IMPORTANT: Your response MUST be valid JSON in the following format:
                     chain_out=chain_out
                 )
                 
-                if not swap_result or 'error' in swap_result:
+                if not swap_result or 'error' in swap_result or 'amount_out' not in swap_result:
                     raise Exception(f"Swap failed: {swap_result.get('error', 'Unknown error')}")
+                
+                # Calculate received amount
+                received_amount = from_decimals(swap_result.get('amount_out', 0), to_token)
+                logger.info(f"Swap successful. Received {received_amount} {to_token}")
                 
                 execution_steps.append({
                     "step": "swap",
-                    "result": swap_result
+                    "result": swap_result,
+                    "success": True,
+                    "received_amount": received_amount
                 })
                 
-                # Wait for swap to complete
                 await asyncio.sleep(15)
-                
-                # Calculate received amount using from_decimals
-                received_amount = from_decimals(swap_result.get('amount_out', 0), to_token)
-                logger.info(f"Swap successful. Received {received_amount} {to_token}")
 
-                # 4. Handle withdrawal if enabled
+                # Step 4: Handle withdrawal if enabled
                 if operation_details.get("destination_address"):
-                    logger.info(f"Withdrawing {received_amount} {to_token} to {operation_details['destination_address']} on {operation_details['destination_chain']}")
-                    
-                    withdrawal_result = smart_withdraw(
-                        account=self.near_account,
-                        token=to_token,
-                        amount=received_amount,
-                        destination_address=operation_details['destination_address'],
-                        destination_chain=operation_details['destination_chain']
-                    )
-                    
-                    if not withdrawal_result or 'error' in withdrawal_result:
-                        raise Exception(f"Withdrawal failed: {withdrawal_result.get('error', 'Unknown error')}")
-                    
-                    execution_steps.append({
-                        "step": "withdraw",
-                        "result": withdrawal_result
-                    })
-                    
-                    logger.info(f"Withdrawal successful: {withdrawal_result}")
-                    
-                    # Wait for withdrawal to complete
-                    await asyncio.sleep(15)
+                    try:
+                        # Check intents balance before withdrawal
+                        pre_withdrawal_balance = get_intent_balance(
+                            self.near_account, 
+                            to_token, 
+                            chain=chain_out  # Important: Check balance on destination chain
+                        )
+                        
+                        withdrawal_result = smart_withdraw(
+                            account=self.near_account,
+                            token=to_token,
+                            amount=received_amount,
+                            destination_address=operation_details['destination_address'],
+                            destination_chain=operation_details['destination_chain']
+                        )
+                        
+                        # Wait for withdrawal to process
+                        await asyncio.sleep(15)
+                        
+                        # Check intents balance after withdrawal
+                        post_withdrawal_balance = get_intent_balance(
+                            self.near_account, 
+                            to_token, 
+                            chain=chain_out
+                        )
+                        
+                        withdrawal_success = (
+                            withdrawal_result is not None and 
+                            'error' not in withdrawal_result and
+                            (post_withdrawal_balance < pre_withdrawal_balance)  # Balance should decrease
+                        )
+                        
+                        execution_steps.append({
+                            "step": "withdraw",
+                            "result": withdrawal_result,
+                            "success": withdrawal_success,
+                            "pre_withdrawal_balance": pre_withdrawal_balance,
+                            "post_withdrawal_balance": post_withdrawal_balance,
+                            "destination_chain": chain_out,
+                            "destination_address": operation_details['destination_address']
+                        })
+                        
+                        if not withdrawal_success:
+                            logger.warning(
+                                f"Withdrawal may have failed. Pre-balance: {pre_withdrawal_balance}, "
+                                f"Post-balance: {post_withdrawal_balance}, Result: {withdrawal_result}"
+                            )
+                            
+                    except Exception as e:
+                        logger.error(f"Error in withdrawal step: {e}")
+                        execution_steps.append({
+                            "step": "withdraw",
+                            "result": {"error": str(e)},
+                            "success": False
+                        })
+                        # Don't raise here - we want to return the swap result even if withdrawal fails
 
-                # 5. Final balance check
-                final_balance = get_intent_balance(self.near_account, to_token)
-                execution_steps.append({
-                    "step": "final_balance",
-                    "result": {"final_balance": final_balance}
-                })
-
+                # Return success if swap worked, even if withdrawal had issues
                 return {
                     'success': True,
                     'execution_steps': execution_steps,
@@ -883,7 +946,8 @@ IMPORTANT: Your response MUST be valid JSON in the following format:
                         'to_token': to_token,
                         'received_amount': received_amount,
                         'destination_chain': operation_details.get('destination_chain', chain_out),
-                        'withdrawal_executed': bool(operation_details.get('destination_address'))
+                        'withdrawal_executed': bool(operation_details.get('destination_address')),
+                        'withdrawal_success': execution_steps[-1].get('success') if operation_details.get('destination_address') else None
                     },
                     'execution_time': datetime.now(UTC).isoformat()
                 }
@@ -893,7 +957,7 @@ IMPORTANT: Your response MUST be valid JSON in the following format:
                 return {
                     'success': False,
                     'error': str(e),
-                    'execution_steps': execution_steps,  # Include steps completed before error
+                    'execution_steps': execution_steps,
                     'execution_time': datetime.now(UTC).isoformat()
                 }
 
@@ -917,3 +981,55 @@ IMPORTANT: Your response MUST be valid JSON in the following format:
         
         # Otherwise, don't try to detect keywords here - that's the trigger detector's job
         return False
+
+    def _validate_order(self, order: Dict) -> Dict:
+        """Validate and normalize order parameters"""
+        try:
+            # Ensure numeric values are numbers
+            order['from_amount'] = float(order['from_amount'])
+            order['target_price_usd'] = float(order['target_price_usd'])
+            
+            # Use config's token validation for chain support
+            if 'to_chain' in order:
+                chain = order['to_chain'].lower()
+                # Get token info to validate chain support
+                token_info = get_token_by_symbol(order['to_token'], chain)
+                if token_info and chain in token_info.get('chains', {}):
+                    order['to_chain'] = chain
+                else:
+                    logger.warning(f"Token {order['to_token']} not supported on {chain}, defaulting to ethereum")
+                    order['to_chain'] = 'ethereum'
+            
+            # Handle destination chain similarly
+            if order.get('destination_address'):
+                if not order.get('destination_chain'):
+                    order['destination_chain'] = order['to_chain']
+                else:
+                    dest_chain = order['destination_chain'].lower()
+                    # Validate destination chain support
+                    token_info = get_token_by_symbol(order['to_token'], dest_chain)
+                    if token_info and dest_chain in token_info.get('chains', {}):
+                        order['destination_chain'] = dest_chain
+                    else:
+                        logger.warning(f"Token {order['to_token']} not supported on {dest_chain}, using to_chain")
+                        order['destination_chain'] = order['to_chain']
+            
+            # Ensure we have proper asset IDs for the tokens
+            order['from_asset_id'] = to_asset_id(order['from_token'])
+            order['to_asset_id'] = to_asset_id(order['to_token'], order['to_chain'])
+            
+            # Ensure chain information is properly set
+            if order.get('destination_address'):
+                if not order.get('destination_chain'):
+                    order['destination_chain'] = order['to_chain']
+                dest_chain = order['destination_chain'].lower()
+                # Validate destination chain support
+                token_info = get_token_by_symbol(order['to_token'], dest_chain)
+                if not token_info or dest_chain not in token_info.get('chains', {}):
+                    raise ValueError(f"Token {order['to_token']} not supported on {dest_chain}")
+                order['destination_chain'] = dest_chain
+            
+            return order
+        except (ValueError, KeyError) as e:
+            logger.error(f"Order validation failed: {e}")
+            raise ValueError(f"Invalid order parameters: {e}")

@@ -287,6 +287,13 @@ class LimitOrderParams(ToolItemParams):
             "check_interval_seconds": 0  # int
         },
 
+        # Add chain information
+        "chain_info": {
+            "to_chain": "",  # str
+            "destination_chain": "",  # str (if different from to_chain)
+            "destination_address": ""  # str (if withdrawal enabled)
+        },
+
         # Step 1: Deposit Check & Parameters
         "deposit": {
             "needs_deposit": False,  # bool

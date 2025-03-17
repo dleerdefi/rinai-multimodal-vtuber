@@ -179,7 +179,8 @@ class ScheduleManager:
         item_id: str,
         status: OperationStatus,
         api_response: Optional[Dict] = None,
-        error: Optional[str] = None
+        error: Optional[str] = None,
+        metadata: Optional[Dict] = None
     ) -> bool:
         """Update item status after execution attempt"""
         try:
@@ -201,6 +202,13 @@ class ScheduleManager:
                 update_data["last_error"] = error
                 update_data["retry_count"] = 1
                 
+            if metadata:
+                update_data["metadata"] = {
+                    **update_data.get("metadata", {}),
+                    **metadata,
+                    "last_modified": datetime.now(UTC).isoformat()
+                }
+            
             result = await self.db.tool_items.update_one(
                 {"_id": ObjectId(item_id)},
                 {"$set": update_data}
@@ -651,16 +659,27 @@ class ScheduleManager:
             
             # Update operation status based on result
             if result.get('success'):
+                # All steps completed successfully
                 await self.update_item_execution_status(
                     item_id=str(operation['_id']),
                     status=OperationStatus.EXECUTED,
-                    api_response=result
+                    api_response=result,
+                    metadata={
+                        "execution_completed_at": result['execution_time'],
+                        "execution_steps": result['execution_steps'],
+                        "final_result": result['final_result']
+                    }
                 )
             else:
+                # Handle failure with details
                 await self.update_item_execution_status(
                     item_id=str(operation['_id']),
                     status=OperationStatus.FAILED,
-                    error=result.get('error', 'Unknown error')
+                    error=result.get('error', 'Unknown error'),
+                    metadata={
+                        "failed_at": result['execution_time'],
+                        "execution_steps": result['execution_steps']
+                    }
                 )
             
             return result
