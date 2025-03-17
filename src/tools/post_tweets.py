@@ -288,7 +288,22 @@ Example response format:
         try:
             logger.info(f"Starting tweet generation: {count} tweets about {topic}")
             
-            # Get enriched context from Perplexity
+            # 1. Get operation state
+            operation = await self.tool_state_manager.get_operation(self.deps.session_id)
+            if not operation:
+                raise ValueError("No active operation found")
+
+            # 2. Check for regeneration FIRST
+            is_regenerating = operation.get("metadata", {}).get("approval_state") == ApprovalState.REGENERATING.value
+            logger.info(f"Generating tweets in {'regeneration' if is_regenerating else 'initial'} mode")
+
+            # 3. State validation based on generation type
+            if not is_regenerating and operation["state"] != ToolOperationState.COLLECTING.value:
+                raise ValueError(f"Operation in invalid state for initial generation: {operation['state']}")
+            elif is_regenerating and operation["state"] != ToolOperationState.APPROVING.value:
+                raise ValueError(f"Operation in invalid state for regeneration: {operation['state']}")
+
+            # 4. Get Perplexity context FIRST - needed for both flows
             perplexity_prompt = f"""
 Research the latest information about {topic} to create high-engagement tweets.
 Analyze and synthesize:
@@ -332,8 +347,6 @@ Prioritize information that is:
                     if search_result.get("status") == "success":
                         context_info = search_result["data"]
                         logger.info(f"Perplexity context received:\n{context_info}")
-                        
-                        # Log key points extracted from context
                         logger.info("Key points from Perplexity response:")
                         for line in context_info.split('\n'):
                             if line.strip().startswith(('-', '•', '*')) or ': ' in line:
@@ -344,20 +357,7 @@ Prioritize information that is:
                     logger.error(f"Error getting Perplexity context: {e}")
                     context_info = ""
 
-            # Get parent operation to inherit state/status
-            operation = await self.tool_state_manager.get_operation(self.deps.session_id)
-            if not operation:
-                raise ValueError("No active operation found")
-                
-            # Verify operation is in correct state
-            if operation["state"] != ToolOperationState.COLLECTING.value:
-                raise ValueError(f"Operation in invalid state: {operation['state']}")
-            
-            # Add check for regeneration
-            is_regenerating = operation.get("metadata", {}).get("approval_state") == ApprovalState.REGENERATING.value
-            logger.info(f"Generating tweets in {'regeneration' if is_regenerating else 'initial'} mode")
-            
-            # Enhanced base prompt with context
+            # 5. Build base prompt with context
             base_prompt = f"""You are a professional social media manager crafting {count} engaging tweets about {topic}.
 
 Latest Research Context:
@@ -372,7 +372,6 @@ CORE TWEET PRINCIPLES:
 6. ACTIONABILITY: Where possible, include a clear next step or way to use the information
 
 TWEET FORMATS (USE VARIETY):
-- Surprising statistic + implication
 - Breaking news + why it matters
 - Expert quote + your analysis
 - Contrarian take on conventional wisdom
@@ -391,11 +390,161 @@ TECHNICAL REQUIREMENTS:
 
             if revision_instructions:
                 base_prompt += f"\n\nRevision Instructions: {revision_instructions}"
+
+            # 6. Handle regeneration if needed
+            if is_regenerating:
+                collecting_items = await self.tool_state_manager.get_operation_items(
+                    tool_operation_id=tool_operation_id,
+                    state=ToolOperationState.COLLECTING.value,
+                    status=OperationStatus.PENDING.value
+                )
+                
+                if not collecting_items:
+                    raise ValueError("No regeneration items found in COLLECTING state")
+                    
+                logger.info(f"Found {len(collecting_items)} items to regenerate")
+
+                # Get Perplexity context first - same as initial flow
+                context_info = ""
+                if self.perplexity_client:
+                    try:
+                        logger.info(f"Querying Perplexity for context about: {topic}")
+                        search_result = await self.perplexity_client.search(
+                            query=perplexity_prompt,
+                            max_tokens=500
+                        )
+                        if search_result.get("status") == "success":
+                            context_info = search_result["data"]
+                            logger.info(f"Perplexity context received:\n{context_info}")
+                        else:
+                            logger.warning(f"Perplexity search failed: {search_result.get('error')}")
+                    except Exception as e:
+                        logger.error(f"Error getting Perplexity context: {e}")
+
+                # Generate new content for each collecting item
+                saved_items = []
+                for item in collecting_items:
+                    # Generate new content using LLM with context
+                    messages = [
+                        {
+                            "role": "system",
+                            "content": "You are a professional social media manager. Generate a single engaging tweet in strict JSON format."
+                        },
+                        {
+                            "role": "user",
+                            "content": f"""Generate a single tweet about {topic}.
+
+{base_prompt}
+
+{revision_instructions if revision_instructions else ''}
+
+Return ONLY valid JSON in this format:
+{{
+    "content": "Tweet text here",
+    "metadata": {{
+        "estimated_engagement": "high/medium/low"
+    }}
+}}"""
+                        }
+                    ]
+                    
+                    response = await self.llm_service.get_response(
+                        prompt=messages,
+                        model_type=ModelType.GROQ_LLAMA_3_3_70B,
+                        override_config={
+                            "temperature": 0.7,
+                            "max_tokens": 1000,
+                            "response_format": {"type": "json_object"}
+                        }
+                    )
+                    
+                    # Parse response and update item
+                    try:
+                        generated_content = json.loads(response)
+                        # Handle both formats - single item or array
+                        if "items" in generated_content:
+                            content = generated_content["items"][0]["content"]
+                        else:
+                            content = generated_content["content"]
+                        
+                        # Update the existing item with new content
+                        await self.db.store_tool_item_content(
+                            item_id=str(item['_id']),
+                            content={
+                                "raw_content": content,
+                                "formatted_content": content,
+                                "version": "1.0"
+                            },
+                            operation_details={},  # Empty dict instead of None
+                            source='generate_content_regeneration',
+                            tool_operation_id=tool_operation_id
+                        )
+                        
+                        # Get updated item
+                        updated_item = await self.db.tool_items.find_one({"_id": item["_id"]})
+                        saved_items.append(updated_item)
+                        logger.info(f"Updated content for regenerated item {item['_id']}")
+                    except json.JSONDecodeError as e:
+                        logger.error(f"Failed to parse LLM response: {e}")
+                        raise
+
+                return {
+                    "items": saved_items,
+                    "schedule_id": schedule_id,
+                    "tool_operation_id": tool_operation_id,
+                    "regeneration_needed": True,
+                    "regenerate_count": len(saved_items)
+                }
+
+            else:
+                # Only verify operation state for initial generation
+                if operation["state"] != ToolOperationState.COLLECTING.value:
+                    raise ValueError(f"Operation in invalid state for initial generation: {operation['state']}")
+
+            # Get parent operation to inherit state/status
+            operation = await self.tool_state_manager.get_operation(self.deps.session_id)
+            if not operation:
+                raise ValueError("No active operation found")
+                
+            # Update base prompt to explicitly specify count
+            base_prompt = f"""You are a professional social media manager crafting EXACTLY {count} {'tweet' if count == 1 else 'tweets'} about {topic}.
+
+IMPORTANT: Generate EXACTLY {count} tweets, no more and no less.
+
+{context_info}
+
+CORE TWEET PRINCIPLES:
+1. SPECIFICITY: Include precise data points, specific examples, or concrete details from the research
+2. TIMELINESS: Reference exactly when information was published (e.g., "New study released today shows..." or "Breaking: As of 2PM EST...")
+3. CREDIBILITY: Incorporate expert opinions with proper attribution (e.g., "According to [expert name/org]...")
+4. RELEVANCE: Connect information directly to audience interests/needs/pain points
+5. EMOTIONAL TRIGGERS: Evoke curiosity, surprise, concern, or excitement through unexpected facts or implications
+6. ACTIONABILITY: Where possible, include a clear next step or way to use the information
+
+TWEET FORMATS (USE VARIETY):
+- Breaking news + why it matters
+- Expert quote + your analysis
+- Contrarian take on conventional wisdom
+- Time-sensitive opportunity or deadline
+- Question that challenges assumptions
+- "Did you know" revelations with specific data
+- Before/after or comparison frameworks
+
+TECHNICAL REQUIREMENTS:
+- Maximum 280 characters per tweet
+- Include 1-2 relevant emojis per tweet (placed strategically, not decoratively)
+- Incorporate contextually appropriate hashtags (max 2 per tweet)
+- Vary sentence structure and length
+- Use active voice and conversational tone
+- Each tweet must be substantially different in content and structure"""
+            
+            if revision_instructions:
+                base_prompt += f"\n\nRevision Instructions: {revision_instructions}"
             
             prompt = f"""{base_prompt}
 
 Guidelines:
-- Each tweet should be unique and engaging
+- Generate EXACTLY {count} unique tweets
 - Keep within Twitter's character limit (280 characters)
 - Vary the style and tone
 - Make them informative yet conversational
@@ -403,9 +552,7 @@ Guidelines:
 - No hashtags, just the content
 - Ensure proper JSON formatting with commas between items
 
-Each tweet should pass this test: "Would someone who sees this in their feed feel compelled to share it with others because it provides genuine value?"
-
-Return ONLY valid JSON in this exact format:
+Return ONLY valid JSON with exactly {count} items in this format:
 {{
     "items": [
         {{
@@ -413,13 +560,8 @@ Return ONLY valid JSON in this exact format:
             "metadata": {{
                 "estimated_engagement": "high/medium/low"
             }}
-        }},
-        {{
-            "content": "Second tweet text",
-            "metadata": {{
-                "estimated_engagement": "medium"
-            }}
-        }}
+        }}{',' if count > 1 else ''}
+        {'...' if count > 1 else ''}
     ]
 }}"""
 
@@ -439,7 +581,7 @@ Return ONLY valid JSON in this exact format:
                 prompt=messages,
                 model_type=ModelType.GROQ_LLAMA_3_3_70B,
                 override_config={
-                    "temperature": 0.7,
+                    "temperature": 0.9,
                     "max_tokens": 1000,
                     "response_format": {"type": "json_object"}  # Request JSON format
                 }

@@ -518,9 +518,18 @@ class ToolStateManager:
         tool_operation_id: str,
         state: Optional[str] = None,
         status: Optional[str] = None,
-        additional_query: Optional[Dict] = None
+        additional_query: Optional[Dict] = None,
+        include_regenerated: bool = True
     ) -> List[Dict]:
-        """Get items for an operation with specific state/status"""
+        """Get items for an operation with specific state/status
+        
+        Args:
+            tool_operation_id: The operation ID
+            state: Optional state filter
+            status: Optional status filter
+            additional_query: Additional query parameters
+            include_regenerated: Whether to include regenerated items (default True)
+        """
         try:
             query = {"tool_operation_id": tool_operation_id}
             
@@ -529,13 +538,22 @@ class ToolStateManager:
                 
             if status:
                 query["status"] = status
+
+            # Handle regenerated items
+            if not include_regenerated:
+                query["metadata.regenerated_at"] = {"$exists": False}
                 
             if additional_query:
                 query.update(additional_query)
                 
             logger.info(f"Querying items with: {query}")
             
-            items = await self.db.tool_items.find(query).to_list(None)
+            # Get items and sort by creation/regeneration time
+            items = await self.db.tool_items.find(query).sort([
+                ("metadata.regenerated_at", 1),  # Regenerated items after original
+                ("metadata.created_at", 1)       # Sort by creation time within each group
+            ]).to_list(None)
+            
             logger.info(f"Found {len(items)} items matching query")
             
             return items
@@ -761,47 +779,66 @@ class ToolStateManager:
         schedule_id: Optional[str] = None,
         metadata: Optional[Dict] = None
     ) -> List[Dict]:
-        """Create new items specifically for regeneration"""
+        """Create new items specifically for regeneration with proper state tracking"""
         try:
-            # Validate operation exists and is in valid state
+            # Get operation to retrieve existing items
             operation = await self.get_operation_by_id(tool_operation_id)
             if not operation:
                 raise ValueError(f"No operation found for ID {tool_operation_id}")
-            
-            if operation['state'] not in [
-                ToolOperationState.APPROVING.value,
-                ToolOperationState.COLLECTING.value
-            ]:
-                raise ValueError(f"Operation in invalid state for regeneration: {operation['state']}")
 
-            # Create items starting in COLLECTING state
-            items = await self.create_tool_items(
-                session_id=session_id,
-                tool_operation_id=tool_operation_id,
-                items_data=items_data,
-                content_type=content_type,
-                schedule_id=schedule_id,
-                initial_state=ToolOperationState.COLLECTING.value,
-                initial_status=OperationStatus.PENDING.value,
-                metadata={
-                    **(metadata or {}),
-                    "regenerated_at": datetime.now(UTC).isoformat(),
-                    "regeneration_phase": "collecting"
+            # Create new items with proper linkage
+            saved_items = []
+            for item in items_data:
+                tool_item = {
+                    "session_id": session_id,
+                    "tool_operation_id": tool_operation_id,
+                    "schedule_id": schedule_id,
+                    "content_type": content_type,
+                    "state": ToolOperationState.COLLECTING.value,
+                    "status": OperationStatus.PENDING.value,
+                    "content": {
+                        "raw_content": item.get("content", {}).get("content", ""),
+                        "formatted_content": item.get("content", {}).get("content", ""),
+                        "version": "1.0"
+                    },
+                    "metadata": {
+                        **item.get("metadata", {}),
+                        **(metadata or {}),
+                        "created_at": datetime.now(UTC).isoformat(),
+                        "regenerated_at": datetime.now(UTC).isoformat(),
+                        "parent_operation_id": tool_operation_id,
+                        "parent_schedule_id": schedule_id,
+                        "state_history": [{
+                            "state": ToolOperationState.COLLECTING.value,
+                            "status": OperationStatus.PENDING.value,
+                            "timestamp": datetime.now(UTC).isoformat(),
+                            "reason": "Item created for regeneration"
+                        }]
+                    }
                 }
-            )
 
-            # Update operation metadata
+                result = await self.db.tool_items.insert_one(tool_item)
+                saved_item = {**tool_item, "_id": str(result.inserted_id)}
+                saved_items.append(saved_item)
+
+            # Update operation's content_updates to include ALL items
+            all_items = await self.get_operation_items(tool_operation_id)
             await self.update_operation(
                 session_id=session_id,
                 tool_operation_id=tool_operation_id,
+                content_updates={
+                    "items": all_items,
+                    "pending_items": [str(item["_id"]) for item in saved_items]
+                },
                 metadata={
-                    "regeneration_count": len(items),
-                    "last_regeneration": datetime.now(UTC).isoformat(),
-                    "regeneration_metadata": metadata
+                    "regeneration_items": [str(item["_id"]) for item in saved_items],
+                    "regeneration_state": ToolOperationState.COLLECTING.value,
+                    "regeneration_status": OperationStatus.PENDING.value,
+                    "total_items": len(all_items)
                 }
             )
 
-            return items
+            return saved_items
 
         except Exception as e:
             logger.error(f"Error creating regeneration items: {e}")
@@ -910,3 +947,172 @@ class ToolStateManager:
         except Exception as e:
             logger.error(f"Error getting session operations: {e}")
             return []
+
+    async def validate_operation_relationships(
+        self,
+        tool_operation_id: str,
+        schedule_id: Optional[str] = None
+    ) -> Dict[str, bool]:
+        """Validate all relationships for a tool operation and its items"""
+        try:
+            validation_results = {
+                "operation_valid": False,
+                "items_valid": False,
+                "schedule_valid": True,  # Default True if no schedule
+                "relationships_valid": False
+            }
+
+            # 1. Validate operation exists and is in valid state
+            operation = await self.get_operation_by_id(tool_operation_id)
+            if not operation:
+                logger.error(f"Operation {tool_operation_id} not found")
+                return validation_results
+
+            validation_results["operation_valid"] = True
+            logger.info(f"Operation {tool_operation_id} exists in state: {operation.get('state')}")
+
+            # 2. Get all items including regenerated ones
+            all_items = await self.get_operation_items(
+                tool_operation_id=tool_operation_id,
+                include_regenerated=True
+            )
+            
+            if not all_items:
+                logger.error(f"No items found for operation {tool_operation_id}")
+                return validation_results
+
+            # 3. Validate schedule relationships if schedule_id provided
+            if schedule_id:
+                schedule = await self.db.get_scheduled_operation(schedule_id)
+                if not schedule:
+                    logger.error(f"Schedule {schedule_id} not found")
+                    return validation_results
+
+                # Verify schedule belongs to operation
+                if schedule.get('tool_operation_id') != tool_operation_id:
+                    logger.error(f"Schedule {schedule_id} does not belong to operation {tool_operation_id}")
+                    return validation_results
+
+                validation_results["schedule_valid"] = True
+                logger.info(f"Schedule {schedule_id} properly linked to operation {tool_operation_id}")
+
+            # 4. Validate all items have correct relationships
+            items_validation = await self._validate_item_relationships(
+                items=all_items,
+                tool_operation_id=tool_operation_id,
+                schedule_id=schedule_id
+            )
+            
+            validation_results["items_valid"] = items_validation["all_valid"]
+            validation_results["relationships_valid"] = (
+                validation_results["operation_valid"] and 
+                validation_results["items_valid"] and 
+                validation_results["schedule_valid"]
+            )
+
+            return validation_results
+
+        except Exception as e:
+            logger.error(f"Error validating operation relationships: {e}", exc_info=True)
+            return {
+                "operation_valid": False,
+                "items_valid": False,
+                "schedule_valid": False,
+                "relationships_valid": False,
+                "error": str(e)
+            }
+
+    async def _validate_item_relationships(
+        self,
+        items: List[Dict],
+        tool_operation_id: str,
+        schedule_id: Optional[str] = None
+    ) -> Dict[str, Any]:
+        """Validate relationships for all items in an operation"""
+        try:
+            validation_results = {
+                "all_valid": True,
+                "invalid_items": [],
+                "missing_links": [],
+                "inconsistent_states": []
+            }
+
+            for item in items:
+                item_id = str(item['_id'])
+                issues = []
+
+                # Check operation link
+                if item.get('tool_operation_id') != tool_operation_id:
+                    issues.append("missing_operation_link")
+
+                # Check schedule link if applicable
+                if schedule_id:
+                    if item.get('schedule_id') != schedule_id:
+                        issues.append("missing_schedule_link")
+
+                # Check metadata consistency
+                metadata = item.get('metadata', {})
+                if metadata.get('parent_operation_id') != tool_operation_id:
+                    issues.append("inconsistent_parent_operation")
+
+                if schedule_id and metadata.get('parent_schedule_id') != schedule_id:
+                    issues.append("inconsistent_parent_schedule")
+
+                # Track issues
+                if issues:
+                    validation_results["all_valid"] = False
+                    validation_results["invalid_items"].append({
+                        "item_id": item_id,
+                        "issues": issues
+                    })
+
+            if not validation_results["all_valid"]:
+                logger.error(f"Found invalid items: {validation_results['invalid_items']}")
+                # Attempt to fix invalid relationships
+                await self._repair_item_relationships(
+                    invalid_items=validation_results["invalid_items"],
+                    tool_operation_id=tool_operation_id,
+                    schedule_id=schedule_id
+                )
+
+            return validation_results
+
+        except Exception as e:
+            logger.error(f"Error validating item relationships: {e}", exc_info=True)
+            return {
+                "all_valid": False,
+                "error": str(e)
+            }
+
+    async def _repair_item_relationships(
+        self,
+        invalid_items: List[Dict],
+        tool_operation_id: str,
+        schedule_id: Optional[str] = None
+    ) -> None:
+        """Attempt to repair invalid relationships"""
+        try:
+            for invalid_item in invalid_items:
+                item_id = invalid_item["item_id"]
+                issues = invalid_item["issues"]
+                
+                update_data = {
+                    "tool_operation_id": tool_operation_id,
+                    "metadata": {
+                        "parent_operation_id": tool_operation_id,
+                        "relationship_repaired_at": datetime.now(UTC).isoformat()
+                    }
+                }
+
+                if schedule_id and ("missing_schedule_link" in issues or "inconsistent_parent_schedule" in issues):
+                    update_data["schedule_id"] = schedule_id
+                    update_data["metadata"]["parent_schedule_id"] = schedule_id
+
+                await self.db.update_tool_item(
+                    item_id=item_id,
+                    update_data=update_data
+                )
+                logger.info(f"Repaired relationships for item {item_id}")
+
+        except Exception as e:
+            logger.error(f"Error repairing item relationships: {e}", exc_info=True)

@@ -188,12 +188,11 @@ class ApprovalManager:
             return self.analyzer.create_error_response(str(e))
 
     async def _update_approved_items(self, tool_operation_id: str, approved_indices: List[int], items: List[Dict]):
-        """Update approved items to APPROVAL_FINISHED state"""
+        """Update approved items to APPROVAL_FINISHED state using enhanced DB operations"""
         try:
             # Convert 1-based indices to 0-based if needed
             adjusted_indices = [(idx - 1) if idx > 0 else idx for idx in approved_indices]
             
-            # Log the conversion for debugging
             logger.info(f"Converting indices {approved_indices} to array indices {adjusted_indices}")
             
             # Validate indices are in range
@@ -203,48 +202,78 @@ class ApprovalManager:
             
             approved_ids = [items[idx]['_id'] for idx in valid_indices]
             
+            # Get operation to access schedule_id
+            operation = await self.tool_state_manager.get_operation_by_id(tool_operation_id)
+            schedule_id = operation.get('metadata', {}).get('schedule_id')
+            
             logger.info(f"Updating {len(approved_ids)} items to APPROVED/EXECUTING state")
             
             if not approved_ids:
                 logger.warning("No valid item IDs to approve")
                 return
+
+            # Update each item with proper parent relationships
+            for item_id in approved_ids:
+                await self.db.update_tool_item(
+                    item_id=str(item_id),
+                    update_data={
+                        "state": ToolOperationState.EXECUTING.value,
+                        "status": OperationStatus.APPROVED.value,
+                        "tool_operation_id": tool_operation_id,  # Ensure consistent parent operation
+                        "schedule_id": schedule_id,  # Ensure consistent schedule link
+                        "metadata": {
+                            "approval_state": ApprovalState.APPROVAL_FINISHED.value,
+                            "approved_at": datetime.now(UTC).isoformat(),
+                            "parent_operation_id": tool_operation_id,
+                            "parent_schedule_id": schedule_id,
+                            "relationship_updated_at": datetime.now(UTC).isoformat()
+                        }
+                    }
+                )
             
-            await self.db.tool_items.update_many(
-                {
-                    "tool_operation_id": tool_operation_id,
-                    "_id": {"$in": approved_ids}
-                },
-                {"$set": {
-                    "state": ToolOperationState.EXECUTING.value,
-                    "status": OperationStatus.APPROVED.value,
-                    "metadata.approval_state": ApprovalState.APPROVAL_FINISHED.value,
-                    "metadata.approved_at": datetime.now(UTC).isoformat()
-                }}
-            )
             logger.info(f"Successfully updated items {approved_ids} to APPROVED/EXECUTING")
+            
         except Exception as e:
-            logger.error(f"Error updating approved items: {e}")
+            logger.error(f"Error updating approved items: {e}", exc_info=True)
+            raise
 
     async def _update_rejected_items(self, tool_operation_id: str, regenerate_indices: List[int], items: List[Dict]):
-        """Update rejected items to CANCELLED state"""
-        # Convert 1-based indices to 0-based if needed
-        adjusted_indices = [(idx - 1) if idx > 0 else idx for idx in regenerate_indices]
-        rejected_ids = [items[idx]['_id'] for idx in adjusted_indices if 0 <= idx < len(items)]
-        
-        logger.info(f"Updating {len(rejected_ids)} items to REJECTED/CANCELLED state")
-        
-        await self.db.tool_items.update_many(
-            {
-                "tool_operation_id": tool_operation_id,
-                "_id": {"$in": rejected_ids}
-            },
-            {"$set": {
-                "state": ToolOperationState.CANCELLED.value,
-                "status": OperationStatus.REJECTED.value,
-                "metadata.rejected_at": datetime.now(UTC).isoformat()
-            }}
-        )
-        logger.info(f"Successfully updated items {rejected_ids} to REJECTED/CANCELLED")
+        """Update rejected items to CANCELLED state using enhanced DB operations"""
+        try:
+            # Convert 1-based indices to 0-based if needed
+            adjusted_indices = [(idx - 1) if idx > 0 else idx for idx in regenerate_indices]
+            rejected_ids = [items[idx]['_id'] for idx in adjusted_indices if 0 <= idx < len(items)]
+            
+            # Get operation to access schedule_id
+            operation = await self.tool_state_manager.get_operation_by_id(tool_operation_id)
+            schedule_id = operation.get('metadata', {}).get('schedule_id')
+            
+            logger.info(f"Updating {len(rejected_ids)} items to REJECTED/CANCELLED state")
+            
+            # Update each item with proper parent relationships
+            for item_id in rejected_ids:
+                await self.db.update_tool_item(
+                    item_id=str(item_id),
+                    update_data={
+                        "state": ToolOperationState.CANCELLED.value,
+                        "status": OperationStatus.REJECTED.value,
+                        "tool_operation_id": tool_operation_id,  # Ensure consistent parent operation
+                        "schedule_id": schedule_id,  # Ensure consistent schedule link
+                        "metadata": {
+                            "rejected_at": datetime.now(UTC).isoformat(),
+                            "rejection_reason": "Marked for regeneration",
+                            "parent_operation_id": tool_operation_id,
+                            "parent_schedule_id": schedule_id,
+                            "relationship_updated_at": datetime.now(UTC).isoformat()
+                        }
+                    }
+                )
+            
+            logger.info(f"Successfully updated items {rejected_ids} to REJECTED/CANCELLED")
+            
+        except Exception as e:
+            logger.error(f"Error updating rejected items: {e}", exc_info=True)
+            raise
 
     async def _handle_full_approval(
         self,
@@ -326,8 +355,6 @@ class ApprovalManager:
         analysis: Dict
     ) -> Dict:
         try:
-            logger.info(f"Processing partial approval for operation {tool_operation_id}")
-            
             # Get operation to access schedule_id and other metadata
             operation = await self.tool_state_manager.get_operation_by_id(tool_operation_id)
             if not operation:
@@ -337,13 +364,15 @@ class ApprovalManager:
             approved_indices = analysis.get('approved_indices', [])
             regenerate_indices = analysis.get('regenerate_indices', [])
             
-            # Get current items
-            current_items = await self.db.tool_items.find({
-                "tool_operation_id": tool_operation_id,
-                "state": ToolOperationState.APPROVING.value
-            }).to_list(None)
+            # Get current items using tool_state_manager method
+            current_items = await self.tool_state_manager.get_operation_items(
+                tool_operation_id=tool_operation_id,
+                state=ToolOperationState.APPROVING.value,
+                status=OperationStatus.PENDING.value,
+                include_regenerated=False  # Only get original items for approval
+            )
 
-            # Handle approved items - these will be linked to existing schedule
+            # Handle approved items
             if approved_indices:
                 await self._update_approved_items(tool_operation_id, approved_indices, current_items)
                 logger.info(f"Updated {len(approved_indices)} items to APPROVED/EXECUTING")
@@ -353,23 +382,13 @@ class ApprovalManager:
                 await self._update_rejected_items(tool_operation_id, regenerate_indices, current_items)
                 logger.info(f"Updated {len(regenerate_indices)} items to REJECTED/CANCELLED")
 
-            # Calculate regeneration count
-            regenerate_count = len(regenerate_indices)
-            if regenerate_count <= 0:
-                logger.warning("No items to regenerate")
-                return {
-                    "status": "completed",
-                    "message": "All items processed"
-                }
-
-            # Create new items in COLLECTING state
-            # Important: Use same tool_operation_id and schedule_id
+            # Create new items for regeneration
             new_items = await self.tool_state_manager.create_regeneration_items(
                 session_id=session_id,
-                tool_operation_id=tool_operation_id,  # Same parent operation
-                items_data=[{} for _ in range(regenerate_count)],
+                tool_operation_id=tool_operation_id,
+                items_data=[{} for _ in range(len(regenerate_indices))],
                 content_type=operation.get('metadata', {}).get('content_type'),
-                schedule_id=operation.get('metadata', {}).get('schedule_id'),  # Keep existing schedule
+                schedule_id=operation.get('metadata', {}).get('schedule_id'),
                 metadata={
                     "regeneration_reason": "partial_approval",
                     "regenerated_at": datetime.now(UTC).isoformat(),
@@ -379,20 +398,53 @@ class ApprovalManager:
                 }
             )
 
-            # Update operation to COLLECTING state for regeneration
+            # Add this right after creating new items
+            schedule_id = operation.get('metadata', {}).get('schedule_id')
+            if schedule_id:
+                logger.info(f"Linking regenerated items to existing schedule {schedule_id}")
+                await self.schedule_manager.link_regenerated_items(
+                    tool_operation_id=tool_operation_id,
+                    schedule_id=schedule_id,
+                    new_items=new_items
+                )
+
+            # Get all items including regenerated ones
+            all_items = await self.tool_state_manager.get_operation_items(
+                tool_operation_id=tool_operation_id,
+                include_regenerated=True  # Include both original and regenerated items
+            )
+
+            # Add this after creating new items and before updating operation state
+            validation_results = await self.tool_state_manager.validate_operation_relationships(
+                tool_operation_id=tool_operation_id,
+                schedule_id=schedule_id
+            )
+
+            if not validation_results["relationships_valid"]:
+                logger.error(f"Invalid relationships after regeneration: {validation_results}")
+                return self.analyzer.create_error_response(
+                    "Failed to maintain proper relationships after regeneration"
+                )
+
+            logger.info("Successfully validated all relationships after regeneration")
+
+            # Update operation state
             await self.tool_state_manager.update_operation(
                 session_id=session_id,
                 tool_operation_id=tool_operation_id,
-                state=ToolOperationState.COLLECTING.value,
-                status=OperationStatus.PENDING.value,
+                content_updates={
+                    "items": all_items,
+                    "pending_items": [str(item['_id']) for item in new_items]
+                },
                 metadata={
                     "regeneration_needed": True,
                     "approval_state": ApprovalState.REGENERATING.value,
                     "revision_instructions": analysis.get("revision_instructions"),
                     "regenerated_item_ids": [str(item['_id']) for item in new_items],
                     "active_items": [str(item['_id']) for item in new_items],
-                    # Keep existing schedule_id
-                    "schedule_id": operation.get('metadata', {}).get('schedule_id')
+                    "regenerate_indices": regenerate_indices,
+                    "schedule_id": operation.get('metadata', {}).get('schedule_id'),
+                    "approval_analysis": analysis
                 }
             )
 
@@ -416,24 +468,22 @@ class ApprovalManager:
         analysis: Dict,
         **kwargs
     ) -> Dict:
-        """Handle regeneration of all items"""
         try:
-            # 1. Get current operation and its command info
+            # Get operation and its command info
             operation = await self.tool_state_manager.get_operation_by_id(tool_operation_id)
             if not operation:
                 raise ValueError(f"No operation found for ID {tool_operation_id}")
 
-            # Get original command info for monitoring params
             command_info = operation.get('input_data', {}).get('command_info', {})
             original_monitoring_params = command_info.get('monitoring_params_list', [])
 
-            # 2. Mark current PENDING items as REJECTED
-            current_items = await self.db.tool_items.find({
-                "tool_operation_id": tool_operation_id,
-                "state": ToolOperationState.APPROVING.value,
-                "status": OperationStatus.PENDING.value,
-                "metadata.rejected_at": {"$exists": False}
-            }).to_list(None)
+            # Get current items using tool_state_manager method
+            current_items = await self.tool_state_manager.get_operation_items(
+                tool_operation_id=tool_operation_id,
+                state=ToolOperationState.APPROVING.value,
+                status=OperationStatus.PENDING.value,
+                include_regenerated=False  # Only get original items
+            )
 
             if not current_items:
                 logger.error("No pending items found for regeneration")
@@ -441,27 +491,12 @@ class ApprovalManager:
 
             logger.info(f"Marking {len(current_items)} items for regeneration")
 
-            # 3. Mark items as REJECTED with rejection info
-            await self.db.tool_items.update_many(
-                {
-                    "_id": {"$in": [item['_id'] for item in current_items]},
-                    "state": ToolOperationState.APPROVING.value,
-                    "status": OperationStatus.PENDING.value
-                },
-                {"$set": {
-                    "state": ToolOperationState.CANCELLED.value,
-                    "status": OperationStatus.REJECTED.value,
-                    "metadata.rejected_at": datetime.now(UTC).isoformat(),
-                    "metadata.rejection_reason": "regenerate_all requested",
-                    "metadata.revision_instructions": analysis.get("revision_instructions")
-                }}
-            )
+            # Mark items as REJECTED
+            await self._update_rejected_items(tool_operation_id, list(range(len(current_items))), current_items)
             logger.info(f"Updated {len(current_items)} items to REJECTED/CANCELLED state")
 
-            # 4. Create new items in COLLECTING state
+            # Create new items
             required_count = operation.get('input_data', {}).get('command_info', {}).get('item_count', len(current_items))
-
-            # Create items with proper metadata including monitoring params
             new_items = await self.tool_state_manager.create_regeneration_items(
                 session_id=session_id,
                 tool_operation_id=tool_operation_id,
@@ -472,14 +507,43 @@ class ApprovalManager:
                     "regeneration_reason": "regenerate_all",
                     "regenerated_at": datetime.now(UTC).isoformat(),
                     "revision_instructions": analysis.get("revision_instructions"),
-                    "original_monitoring_params": original_monitoring_params,  # Pass original params
+                    "original_monitoring_params": original_monitoring_params,
                     "parent_operation_id": tool_operation_id,
                     "parent_schedule_id": operation.get('metadata', {}).get('schedule_id')
                 }
             )
-            logger.info(f"Created {len(new_items)} new items in COLLECTING state")
 
-            # 5. Update operation state for regeneration
+            # Add this right after creating new items
+            schedule_id = operation.get('metadata', {}).get('schedule_id')
+            if schedule_id:
+                logger.info(f"Linking regenerated items to existing schedule {schedule_id}")
+                await self.schedule_manager.link_regenerated_items(
+                    tool_operation_id=tool_operation_id,
+                    schedule_id=schedule_id,
+                    new_items=new_items
+                )
+
+            # Get all items including regenerated ones
+            all_items = await self.tool_state_manager.get_operation_items(
+                tool_operation_id=tool_operation_id,
+                include_regenerated=True
+            )
+
+            # Add this after creating new items and before updating operation state
+            validation_results = await self.tool_state_manager.validate_operation_relationships(
+                tool_operation_id=tool_operation_id,
+                schedule_id=schedule_id
+            )
+
+            if not validation_results["relationships_valid"]:
+                logger.error(f"Invalid relationships after regeneration: {validation_results}")
+                return self.analyzer.create_error_response(
+                    "Failed to maintain proper relationships after regeneration"
+                )
+
+            logger.info("Successfully validated all relationships after regeneration")
+
+            # Update operation state
             await self.tool_state_manager.update_operation(
                 session_id=session_id,
                 tool_operation_id=tool_operation_id,
@@ -492,9 +556,9 @@ class ApprovalManager:
                     "regeneration_requested_at": datetime.now(UTC).isoformat(),
                     "revision_instructions": analysis.get("revision_instructions"),
                     "content_type": current_items[0]['content_type'],
-                    "active_items": [str(item['_id']) for item in new_items],  # Track active items
-                    "original_monitoring_params": original_monitoring_params,  # Keep original params
-                    "schedule_id": operation.get('metadata', {}).get('schedule_id')  # Keep schedule_id
+                    "active_items": [str(item['_id']) for item in new_items],
+                    "original_monitoring_params": original_monitoring_params,
+                    "schedule_id": operation.get('metadata', {}).get('schedule_id')
                 }
             )
 

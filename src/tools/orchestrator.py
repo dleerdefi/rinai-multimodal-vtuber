@@ -71,8 +71,8 @@ class Orchestrator:
         """Initialize orchestrator with tools and dependencies"""
         self.deps = deps or AgentDependencies(session_id="default")
         self.tools = {}
-        self.schedule_service = None  # Initialize as None
-        self.monitoring_service = None  # Add monitoring service reference
+        self.schedule_service = None
+        self.monitoring_service = None
         
         # Initialize core services first
         self.llm_service = LLMService({
@@ -89,6 +89,9 @@ class Orchestrator:
             if not db:
                 raise ValueError("Failed to initialize MongoDB")
             
+        # Store db instance
+        self.db = db
+        
         # Initialize managers in correct order
         self.tool_state_manager = ToolStateManager(db=db)
         
@@ -323,7 +326,20 @@ class Orchestrator:
             try:
                 # First get command analysis
                 command_analysis = await tool._analyze_command(message)
-                
+                logger.info(f"Command analysis completed for operation {operation['_id']}")
+                logger.info(f"Analysis result: {json.dumps(command_analysis, indent=2)}")
+
+                # Track analysis in database
+                if command_analysis.get('orders'):
+                    for idx, order in enumerate(command_analysis['orders']):
+                        await self.db.store_tool_item_content(
+                            item_id=str(operation['_id']),
+                            content={},  # Will be populated by generate_content
+                            operation_details=order,
+                            source='analyze_command',
+                            tool_operation_id=str(operation['_id'])
+                        )
+
                 # Then generate content using analysis results
                 generation_result = await tool._generate_content(
                     topic=command_analysis.get("topic"),
@@ -332,6 +348,19 @@ class Orchestrator:
                     tool_operation_id=str(operation['_id'])
                 )
                 
+                logger.info(f"Content generation completed for operation {operation['_id']}")
+                logger.info(f"Generated items: {len(generation_result.get('items', []))}")
+
+                # Track generated content in database
+                for item in generation_result.get('items', []):
+                    await self.db.store_tool_item_content(
+                        item_id=str(item['_id']),
+                        content=item.get('content', {}),
+                        operation_details=item.get('content', {}).get('operation_details', {}),
+                        source='generate_content',
+                        tool_operation_id=str(operation['_id'])
+                    )
+
                 # Update operation with tool registry info and generated content
                 await self.tool_state_manager.update_operation(
                     session_id=session_id,
@@ -554,6 +583,7 @@ class Orchestrator:
                     additional_query={
                         "metadata.rejected_at": {"$exists": False},
                         "metadata.cancelled_at": {"$exists": False},
+                        "metadata.approved_at": {"$exists": False},
                         "content": {"$exists": True, "$ne": ""},
                         "_id": {"$in": [ObjectId(id) for id in active_items]} if active_items else {"$exists": True}
                     }

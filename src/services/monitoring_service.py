@@ -5,6 +5,7 @@ import time
 from motor.motor_asyncio import AsyncIOMotorClient
 from bson.objectid import ObjectId
 from typing import Dict, List, Optional, Any
+import json
 
 from src.db.db_schema import RinDB
 from src.db.enums import OperationStatus, ToolOperationState, ContentType
@@ -132,7 +133,7 @@ class LimitOrderMonitoringService:
                     for order in active_orders:
                         try:
                             # Get operation details from the correct location
-                            operation_details = order.get("content", {}).get("operation_details", {})
+                            operation_details = self._get_operation_details(order)
                             
                             # Extract monitoring parameters
                             token_to_monitor = operation_details.get("reference_token")
@@ -158,35 +159,96 @@ class LimitOrderMonitoringService:
                 logger.error(f"Error in monitoring loop: {e}", exc_info=True)
                 await asyncio.sleep(60)
 
+    def _get_operation_details(self, order: Dict) -> Dict:
+        """Extract operation details from any item structure"""
+        try:
+            # For debugging
+            order_id = str(order.get('_id', 'unknown'))
+            logger.info(f"Getting operation details for {order_id}")
+            
+            # Check custom_params first (most reliable source)
+            custom_params = order.get("parameters", {}).get("custom_params", {})
+            if custom_params and custom_params.get("reference_token") and custom_params.get("target_price_usd"):
+                logger.info(f"Found reliable params in custom_params for {order_id}")
+                return {
+                    "from_token": custom_params.get("from_token"),
+                    "from_amount": str(custom_params.get("from_amount")),
+                    "to_token": custom_params.get("to_token"),
+                    "target_price_usd": float(custom_params.get("target_price_usd")),
+                    "reference_token": custom_params.get("reference_token"),
+                    "to_chain": custom_params.get("to_chain", "ethereum")  # Default to ethereum
+                }
+            
+            # Then check content paths
+            for path in [
+                ["content", "operation_details"],
+                ["content", "raw_content", "operation_details"],
+                ["operation_details"]
+            ]:
+                obj = order
+                for key in path:
+                    if not isinstance(obj, dict):
+                        obj = {}
+                        break
+                    obj = obj.get(key, {})
+                
+                if obj and obj.get("reference_token") and obj.get("target_price_usd"):
+                    logger.info(f"Found valid operation details in {'.'.join(path)} for {order_id}")
+                    return {
+                        "from_token": obj.get("from_token"),
+                        "from_amount": str(obj.get("from_amount", "")),
+                        "to_token": obj.get("to_token"),
+                        "target_price_usd": float(obj.get("target_price_usd", 0)),
+                        "reference_token": obj.get("reference_token"),
+                        "to_chain": obj.get("to_chain", "ethereum")  # Default to ethereum
+                    }
+            
+            # Last attempt: log the structure and return an empty dict
+            logger.error(f"Could not find valid monitoring parameters for {order_id}:")
+            logger.error(f"Item structure preview: {json.dumps({k: v for k, v in order.items() if k not in ['content']}, indent=2)}")
+            logger.error(f"Content structure: {json.dumps(order.get('content', {}), indent=2)}")
+            logger.error(f"Parameters structure: {json.dumps(order.get('parameters', {}), indent=2)}")
+            
+            return {}
+            
+        except Exception as e:
+            logger.error(f"Error extracting operation details: {str(e)}", exc_info=True)
+            return {}
+
     async def _check_limit_order(self, order):
         """Check if a limit order's conditions are met using CoinGecko USD prices"""
         try:
             order_id = str(order.get('_id'))
-            content = order.get("content", {})
-            operation_details = content.get("operation_details", {})
-            params = order.get("parameters", {}).get("custom_params", {})  # Keep params check
+            operation_details = self._get_operation_details(order)
+            
+            # Log full details for debugging
+            logger.info(f"Processing order {order_id} with operation details: {operation_details}")
             
             # Get the reference token and target price
             token_to_monitor = operation_details.get("reference_token")
             target_price_usd = float(operation_details.get("target_price_usd", 0))
             
-            logger.info(f"Checking limit order {order_id}: monitoring {token_to_monitor} price target ${target_price_usd}")
-            
-            # Keep parameter validation
-            if not token_to_monitor or not target_price_usd:
-                logger.error(f"Missing required parameters for limit order {order_id}: token_to_monitor={token_to_monitor}, target_price_usd={target_price_usd}")
+            # Validate required parameters
+            if not token_to_monitor or target_price_usd <= 0:
+                logger.error(f"Missing required parameters for limit order {order_id}: "
+                            f"token_to_monitor={token_to_monitor}, target_price_usd={target_price_usd}")
+                logger.error(f"Full operation details: {operation_details}")
                 await self.db.tool_items.update_one(
                     {"_id": ObjectId(order_id)},
                     {"$set": {
                         "parameters.custom_params.last_checked_timestamp": int(time.time()),
                         "metadata.last_error": f"Missing required parameters: token_to_monitor={token_to_monitor}, target_price_usd={target_price_usd}",
-                        "metadata.last_error_time": datetime.now(UTC).isoformat()
+                        "metadata.last_error_time": datetime.now(UTC).isoformat(),
+                        "metadata.error_details": {
+                            "operation_details": operation_details,
+                            "item_structure": order
+                        }
                     }}
                 )
                 return
 
             # Keep expiration check
-            expiration_timestamp = params.get("expiration_timestamp")
+            expiration_timestamp = order.get("parameters", {}).get("custom_params", {}).get("expiration_timestamp")
             if expiration_timestamp and time.time() > expiration_timestamp:
                 await self._expire_limit_order(order)
                 return
@@ -208,7 +270,7 @@ class LimitOrderMonitoringService:
                 logger.info(f"Current {token_to_monitor} price: ${current_price}, Target: ${target_price_usd}")
                 
                 # Update best price seen and timestamp
-                if current_price > params.get("best_price_seen", 0):
+                if current_price > order.get("parameters", {}).get("custom_params", {}).get("best_price_seen", 0):
                     await self.db.tool_items.update_one(
                         {"_id": ObjectId(order_id)},
                         {"$set": {
@@ -242,10 +304,22 @@ class LimitOrderMonitoringService:
                     try:
                         # Ensure numeric values are strings for the NEAR API
                         from_amount = operation_details.get("from_amount")
-                        order['content']['operation_details']['from_amount'] = str(from_amount)
+                        if isinstance(from_amount, (int, float)):
+                            from_amount = str(from_amount)
+                        
+                        # Create execution copy with proper structure
+                        execution_order = {
+                            **order,
+                            "content": {
+                                "operation_details": {
+                                    **operation_details,
+                                    "from_amount": from_amount
+                                }
+                            }
+                        }
                         
                         # Execute the order
-                        result = await tool.execute_scheduled_operation(order)
+                        result = await tool.execute_scheduled_operation(execution_order)
                         logger.info(f"Execution result for {order_id}: {result}")
                         
                         if result.get('success'):
@@ -301,7 +375,7 @@ class LimitOrderMonitoringService:
                     "status": OperationStatus.FAILED.value,
                     "state": ToolOperationState.ERROR.value,
                     "metadata.expired_at": datetime.now(UTC).isoformat(),
-                    "metadata.best_price_seen": order.get("parameters", {}).get("custom_params", {}).get("best_price_seen", 0)
+                    "metadata.best_price_seen": operation_details.get("best_price_seen", 0)
                 }}
             )
             

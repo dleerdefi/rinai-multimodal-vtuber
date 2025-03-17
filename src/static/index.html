@@ -3,128 +3,272 @@
 <head>
     <title>RinAI</title>
     <style>
-        body {
-            background-color: #000;
-            color: #33ff33;
-            font-family: 'Courier New', monospace;
-            margin: 0;
-            padding: 20px 20px 0 20px;  /* Remove bottom padding */
-            overflow: hidden;
-            display: flex;           /* Add flex display */
-            flex-direction: column;  /* Stack children vertically */
-            height: 100vh;          /* Full viewport height */
+        :root {
+            --primary-color: #33ff33;
+            --bg-color: #0a0a0a;
+            --text-color: #ffffff;
+            --message-bg: rgba(51, 255, 51, 0.1);
+            --host-message-bg: rgba(255, 255, 51, 0.1);
+            --rin-message-bg: rgba(51, 51, 255, 0.1);
+            --input-bg: #111111;
+            --border-color: #33ff33;
         }
 
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            background-color: var(--bg-color);
+            color: var(--text-color);
+            font-family: 'Segoe UI', 'Roboto', sans-serif;
+            height: 100vh;
+            display: flex;
+            flex-direction: column;
+        }
+
+        /* Header Section */
+        .header {
+            background: linear-gradient(to right, #000000, #111111);
+            padding: 1rem;
+            border-bottom: 1px solid var(--border-color);
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+        }
+
+        .header h1 {
+            color: var(--primary-color);
+            font-size: 1.5rem;
+            font-weight: 500;
+        }
+
+        .status-indicators {
+            display: flex;
+            gap: 1rem;
+        }
+
+        .indicator {
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+            font-size: 0.9rem;
+        }
+
+        .indicator-dot {
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            background-color: #666;
+        }
+
+        .indicator-dot.active {
+            background-color: var(--primary-color);
+            box-shadow: 0 0 10px var(--primary-color);
+            animation: pulse 2s infinite;
+        }
+
+        /* Main Chat Container */
         #chat-container {
-            flex: 1;                /* Take remaining space */
-            overflow-y: auto;       /* Enable scrolling */
-            padding-right: 20px;
-            /* Increase bottom margin to account for input container height + padding */
-            margin-bottom: 120px;  /* Increased from 100px */
-            /* Add padding to top */
-            padding-top: 20px;
+            flex: 1;
+            overflow-y: auto;
+            padding: 1rem;
+            display: flex;
+            flex-direction: column;
+            gap: 1rem;
+            scroll-behavior: smooth;
         }
 
         .message {
-            margin: 10px 0;
-            opacity: 0;
-            animation: fadeIn 0.5s forwards;
+            max-width: 80%;
+            padding: 0.8rem 1rem;
+            border-radius: 1rem;
+            animation: fadeIn 0.3s ease-out;
+            position: relative;
+            line-height: 1.4;
         }
 
-        .timestamp {
+        .message.host {
+            background: var(--host-message-bg);
+            align-self: flex-end;
+            border-bottom-right-radius: 0.2rem;
+        }
+
+        .message.rin {
+            background: var(--rin-message-bg);
+            align-self: flex-start;
+            border-bottom-left-radius: 0.2rem;
+        }
+
+        .message .timestamp {
+            font-size: 0.7rem;
             color: #666;
-            margin-right: 10px;
+            margin-bottom: 0.3rem;
         }
 
-        .author {
-            color: #ffff33;
-            margin-right: 10px;
+        .message .author {
+            font-weight: 500;
+            color: var(--primary-color);
+            margin-bottom: 0.3rem;
         }
 
-        .content {
-            color: #33ff33;
+        .message .content {
+            color: var(--text-color);
+            word-wrap: break-word;
         }
 
-        .system-message {
-            color: #ff3333;
-        }
-
-        @keyframes fadeIn {
-            from { opacity: 0; transform: translateY(20px); }
-            to { opacity: 1; transform: translateY(0); }
-        }
-
-        /* Input container styles */
+        /* Input Section */
         #input-container {
-            position: fixed;
-            bottom: 0;
-            left: 0;
-            right: 0;
-            background-color: #000;
-            padding: 20px;
+            background: linear-gradient(to top, #000000, #111111);
+            padding: 1rem;
+            border-top: 1px solid var(--border-color);
             display: flex;
-            gap: 10px;
-            border-top: 1px solid #33ff33;
-            /* Add z-index to ensure it stays on top */
-            z-index: 1000;
-            /* Add box shadow for better separation */
-            box-shadow: 0 -5px 10px rgba(0, 0, 0, 0.5);
+            gap: 1rem;
+            align-items: flex-end;
         }
-        
+
         #chat-input {
             flex: 1;
-            min-height: 60px;
-            padding: 10px;
-            font-family: 'Courier New', monospace;
-            font-size: 16px;
-            background-color: #111;
-            color: #33ff33;
-            border: 1px solid #33ff33;
+            min-height: 2.5rem;
+            max-height: 150px;
+            padding: 0.7rem;
+            background-color: var(--input-bg);
+            color: var(--text-color);
+            border: 1px solid var(--border-color);
+            border-radius: 1.5rem;
+            font-size: 1rem;
+            resize: none;
             outline: none;
-            resize: vertical;
-            min-width: 200px;
-            max-height: 200px;
+            transition: all 0.3s ease;
         }
-        
+
+        #chat-input:focus {
+            box-shadow: 0 0 10px rgba(51, 255, 51, 0.3);
+        }
+
         #send-button {
-            padding: 10px 20px;
-            background-color: #33ff33;
-            color: #000;
+            background-color: var(--primary-color);
+            color: var(--bg-color);
             border: none;
+            border-radius: 50%;
+            width: 2.5rem;
+            height: 2.5rem;
             cursor: pointer;
-            font-weight: bold;
-            height: fit-content;  /* Match input height */
-            align-self: flex-end; /* Align with bottom of input */
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            transition: all 0.3s ease;
         }
 
-        /* Chat message styles */
-        .chat-message {
-            padding: 8px;
-            margin: 4px 0;
-            border-radius: 4px;
-            background-color: rgba(51, 255, 51, 0.1);
+        #send-button:hover {
+            transform: scale(1.1);
+            box-shadow: 0 0 15px rgba(51, 255, 51, 0.5);
         }
 
-        .chat-message.host {
-            background-color: rgba(255, 255, 51, 0.1);
+        #send-button svg {
+            width: 1.2rem;
+            height: 1.2rem;
+            fill: var(--bg-color);
         }
 
-        .chat-message.rin {
-            background-color: rgba(51, 51, 255, 0.1);
+        /* Animations */
+        @keyframes fadeIn {
+            from {
+                opacity: 0;
+                transform: translateY(10px);
+            }
+            to {
+                opacity: 1;
+                transform: translateY(0);
+            }
+        }
+
+        @keyframes pulse {
+            0% {
+                transform: scale(1);
+                opacity: 1;
+            }
+            50% {
+                transform: scale(1.2);
+                opacity: 0.7;
+            }
+            100% {
+                transform: scale(1);
+                opacity: 1;
+            }
+        }
+
+        /* System Messages */
+        .system-message {
+            text-align: center;
+            color: #666;
+            font-size: 0.9rem;
+            margin: 0.5rem 0;
+            font-style: italic;
+        }
+
+        /* Scrollbar Styling */
+        ::-webkit-scrollbar {
+            width: 6px;
+        }
+
+        ::-webkit-scrollbar-track {
+            background: var(--bg-color);
+        }
+
+        ::-webkit-scrollbar-thumb {
+            background: var(--border-color);
+            border-radius: 3px;
+        }
+
+        ::-webkit-scrollbar-thumb:hover {
+            background: #4aff4a;
         }
     </style>
 </head>
 <body>
+    <div class="header">
+        <h1>Hello David</h1>
+        <div class="status-indicators">
+            <div class="indicator">
+                <div class="indicator-dot" id="tts-indicator"></div>
+                <span>TTS</span>
+            </div>
+            <div class="indicator">
+                <div class="indicator-dot" id="stt-indicator"></div>
+                <span>STT</span>
+            </div>
+            <div class="indicator">
+                <div class="indicator-dot" id="connection-indicator"></div>
+                <span>Connected</span>
+            </div>
+        </div>
+    </div>
+
     <div id="chat-container"></div>
     
-    <!-- Add input container -->
     <div id="input-container">
-        <textarea id="chat-input" placeholder="Type your message here..."></textarea>
-        <button id="send-button">Send</button>
+        <textarea 
+            id="chat-input" 
+            placeholder="Type your message here..."
+            rows="1"
+        ></textarea>
+        <button id="send-button">
+            <svg viewBox="0 0 24 24">
+                <path d="M2.01 21L23 12 2.01 3 2 10l15 2-15 2z"/>
+            </svg>
+        </button>
     </div>
 
     <script>
         const chatContainer = document.getElementById('chat-container');
+        const chatInput = document.getElementById('chat-input');
+        const sendButton = document.getElementById('send-button');
+        const ttsIndicator = document.getElementById('tts-indicator');
+        const sttIndicator = document.getElementById('stt-indicator');
+        const connectionIndicator = document.getElementById('connection-indicator');
         let ws;
 
         function connect() {
@@ -134,50 +278,69 @@
 
             ws.onopen = function() {
                 console.log("WebSocket connection established");
+                connectionIndicator.classList.add('active');
                 addSystemMessage('Connected to server');
             };
 
             ws.onmessage = function(event) {
                 console.log("Received message:", event.data);
                 const message = JSON.parse(event.data);
+                
+                // Handle TTS/STT indicators
+                if (message.type === 'tts_start') {
+                    ttsIndicator.classList.add('active');
+                } else if (message.type === 'tts_end') {
+                    ttsIndicator.classList.remove('active');
+                } else if (message.type === 'stt_start') {
+                    sttIndicator.classList.add('active');
+                } else if (message.type === 'stt_end') {
+                    sttIndicator.classList.remove('active');
+                }
+                
                 addMessage(message);
             };
 
             ws.onclose = function() {
                 console.log("WebSocket connection closed");
+                connectionIndicator.classList.remove('active');
                 addSystemMessage('Connection lost. Reconnecting...');
                 setTimeout(connect, 1000);
             };
 
             ws.onerror = function(error) {
                 console.error("WebSocket error:", error);
-                addSystemMessage('WebSocket error: ' + error);
+                connectionIndicator.classList.remove('active');
+                addSystemMessage('WebSocket error occurred');
             };
         }
 
         function addMessage(message) {
             const messageDiv = document.createElement('div');
-            messageDiv.className = `message chat-message ${message.author.toLowerCase()}`;
+            messageDiv.className = `message ${message.author.toLowerCase()}`;
 
             const timestamp = message.timestamp 
                 ? new Date(message.timestamp).toLocaleTimeString()
                 : new Date().toLocaleTimeString();
 
             messageDiv.innerHTML = `
-                <span class="timestamp">[${timestamp}]</span>
-                <span class="author">${message.author}:</span>
-                <span class="content">${message.content}</span>
+                <div class="timestamp">${timestamp}</div>
+                <div class="author">${message.author}</div>
+                <div class="content">${message.content}</div>
             `;
 
             chatContainer.appendChild(messageDiv);
-            chatContainer.scrollTop = chatContainer.scrollHeight;
+            scrollToBottom();
         }
 
         function addSystemMessage(text) {
             const messageDiv = document.createElement('div');
-            messageDiv.className = 'message system-message';
+            messageDiv.className = 'system-message';
             messageDiv.textContent = text;
             chatContainer.appendChild(messageDiv);
+            scrollToBottom();
+        }
+
+        function scrollToBottom() {
             chatContainer.scrollTop = chatContainer.scrollHeight;
         }
 
@@ -194,23 +357,21 @@
                 ws.send(JSON.stringify(message));
                 
                 chatInput.value = '';
-            } else {
-                console.error("Cannot send message:", {
-                    content: !!content,
-                    ws: !!ws,
-                    readyState: ws ? ws.readyState : 'no websocket',
-                    wsState: ws ? ['CONNECTING', 'OPEN', 'CLOSING', 'CLOSED'][ws.readyState] : 'no websocket'
-                });
+                // Reset textarea height
+                chatInput.style.height = 'auto';
             }
         }
 
-        // Update event listeners for textarea
-        const chatInput = document.getElementById('chat-input');
-        const sendButton = document.getElementById('send-button');
+        // Auto-resize textarea
+        chatInput.addEventListener('input', function() {
+            this.style.height = 'auto';
+            this.style.height = (this.scrollHeight) + 'px';
+        });
 
+        // Send message handlers
         sendButton.addEventListener('click', sendChat);
         chatInput.addEventListener('keydown', (e) => {
-            if (e.key === 'Enter' && !e.shiftKey) {  // Send on Enter, new line on Shift+Enter
+            if (e.key === 'Enter' && !e.shiftKey) {
                 e.preventDefault();
                 sendChat();
             }

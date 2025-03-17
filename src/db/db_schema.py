@@ -14,8 +14,56 @@ from src.db.enums import (
 )
 from enum import Enum
 from pydantic import BaseModel
+from functools import wraps
+import json
 
 logger = logging.getLogger(__name__)
+
+def db_operation_logger(operation_name: str):
+    """Decorator for logging database operations"""
+    def decorator(func: callable) -> callable:
+        @wraps(func)
+        async def wrapper(*args, **kwargs):
+            try:
+                # Log operation start
+                logger.info(f"Starting {operation_name}")
+                
+                # Log parameters (safely)
+                safe_args = [
+                    str(arg) if isinstance(arg, ObjectId) 
+                    else json.dumps(arg) if isinstance(arg, dict)
+                    else str(arg)
+                    for arg in args[1:]  # Skip self
+                ]
+                safe_kwargs = {
+                    k: str(v) if isinstance(v, ObjectId)
+                    else json.dumps(v) if isinstance(v, dict)
+                    else str(v)
+                    for k, v in kwargs.items()
+                }
+                logger.info(f"Parameters - args: {safe_args}, kwargs: {safe_kwargs}")
+                
+                # Execute operation
+                result = await func(*args, **kwargs)
+                
+                # Log success
+                if result:
+                    if isinstance(result, dict):
+                        logger.info(f"Successfully completed {operation_name}")
+                        logger.info(f"Updated fields: {list(result.keys())}")
+                    else:
+                        logger.info(f"Successfully completed {operation_name} with result: {result}")
+                else:
+                    logger.warning(f"Operation {operation_name} completed but returned no result")
+                
+                return result
+                
+            except Exception as e:
+                logger.error(f"Error in {operation_name}: {str(e)}", exc_info=True)
+                raise
+                
+        return wrapper
+    return decorator
 
 class Message(TypedDict):
     role: str  # "host" or username from livestream
@@ -560,43 +608,135 @@ class RinDB:
             logger.error(f"Error fetching pending items: {e}")
             return []
 
+    @db_operation_logger("update_tool_item")
+    async def update_tool_item(self, item_id: str, update_data: Dict, return_document: bool = True) -> Optional[Dict]:
+        """Update a tool item with enhanced logging and validation"""
+        # Validate update_data structure against ToolItem TypedDict
+        if not isinstance(update_data, dict):
+            raise ValueError("update_data must be a dictionary")
+            
+        result = await self.tool_items.find_one_and_update(
+            {"_id": ObjectId(item_id)},
+            {"$set": {
+                **update_data,
+                "last_updated": datetime.now(UTC)
+            }},
+            return_document=return_document
+        )
+        
+        # Track the update in tool_executions
+        if result:
+            await self.tool_executions.insert_one({
+                "tool_operation_id": result.get("tool_operation_id"),
+                "execution_type": "update",
+                "item_id": item_id,
+                "updated_fields": list(update_data.keys()),
+                "timestamp": datetime.now(UTC)
+            })
+            
+        return result
+
+    @db_operation_logger("update_operation")
+    async def update_operation(self, operation_id: str, update_data: Dict, return_document: bool = True) -> Optional[Dict]:
+        """Update a tool operation with enhanced logging and validation"""
+        # Validate update_data structure against ToolOperation TypedDict
+        if not isinstance(update_data, dict):
+            raise ValueError("update_data must be a dictionary")
+            
+        result = await self.tool_operations.find_one_and_update(
+            {"_id": ObjectId(operation_id)},
+            {"$set": {
+                **update_data,
+                "last_updated": datetime.now(UTC)
+            }},
+            return_document=return_document
+        )
+        
+        # Track the update
+        if result:
+            await self.tool_executions.insert_one({
+                "tool_operation_id": operation_id,
+                "execution_type": "operation_update",
+                "updated_fields": list(update_data.keys()),
+                "timestamp": datetime.now(UTC)
+            })
+            
+        return result
+
+    @db_operation_logger("update_schedule")
+    async def update_schedule(self, schedule_id: str, update_data: Dict, return_document: bool = True) -> Optional[Dict]:
+        """Update a scheduled operation with enhanced logging and validation"""
+        # Validate update_data structure against ScheduledOperation TypedDict
+        if not isinstance(update_data, dict):
+            raise ValueError("update_data must be a dictionary")
+            
+        result = await self.scheduled_operations.find_one_and_update(
+            {"_id": ObjectId(schedule_id)},
+            {"$set": {
+                **update_data,
+                "last_updated": datetime.now(UTC)
+            }},
+            return_document=return_document
+        )
+        
+        # Track the update
+        if result:
+            await self.tool_executions.insert_one({
+                "tool_operation_id": result.get("tool_operation_id"),
+                "execution_type": "schedule_update",
+                "schedule_id": schedule_id,
+                "updated_fields": list(update_data.keys()),
+                "timestamp": datetime.now(UTC)
+            })
+            
+        return result
+
+    @db_operation_logger("update_tool_item_status")
     async def update_tool_item_status(self, 
                                     item_id: str, 
                                     status: OperationStatus,
                                     api_response: Optional[Dict] = None,
                                     error: Optional[str] = None,
                                     metadata: Optional[Dict] = None) -> bool:
-        """Update tool item status and related fields"""
-        try:
-            update_data = {
-                "status": status.value if isinstance(status, OperationStatus) else status,
-                "last_updated": datetime.now(UTC)
+        """Update tool item status with enhanced logging and tracking"""
+        update_data = {
+            "status": status.value if isinstance(status, OperationStatus) else status,
+            "last_updated": datetime.now(UTC)
+        }
+        
+        if status == OperationStatus.EXECUTED and api_response:
+            update_data["executed_time"] = datetime.now(UTC)
+            update_data["api_response"] = api_response
+        
+        if error:
+            update_data["last_error"] = error
+            update_data["retry_count"] = 1
+        
+        if metadata:
+            update_data["metadata"] = {
+                "$set": {
+                    **metadata,
+                    "last_modified": datetime.now(UTC).isoformat()
+                }
             }
+        
+        result = await self.tool_items.update_one(
+            {"_id": ObjectId(item_id)},
+            {"$set": update_data}
+        )
+        
+        # Track the status update
+        if result.modified_count > 0:
+            await self.tool_executions.insert_one({
+                "execution_type": "status_update",
+                "item_id": item_id,
+                "old_status": None,  # Could fetch this first if needed
+                "new_status": status.value if isinstance(status, OperationStatus) else status,
+                "has_error": bool(error),
+                "timestamp": datetime.now(UTC)
+            })
             
-            if status == OperationStatus.EXECUTED and api_response:
-                update_data["executed_time"] = datetime.now(UTC)
-                update_data["api_response"] = api_response
-            
-            if error:
-                update_data["last_error"] = error
-            
-            if metadata:
-                update_data["metadata"] = {
-                    **update_data.get("metadata", {}),
-                    **metadata
-                }
-            
-            result = await self.tool_items.update_one(
-                {"_id": ObjectId(item_id)},
-                {
-                    "$set": update_data,
-                    "$inc": {"retry_count": 1} if error else {}
-                }
-            )
-            return result.modified_count > 0
-        except Exception as e:
-            logger.error(f"Error updating tool item status: {e}")
-            return False
+        return result.modified_count > 0
 
     async def set_tool_operation_state(self, session_id: str, operation_data: Dict) -> Optional[Dict]:
         """Set tool operation state"""
@@ -830,3 +970,80 @@ class RinDB:
         except Exception as e:
             logger.error(f"Error updating schedule state: {e}", exc_info=True)
             return False
+
+    @db_operation_logger("store_tool_item_content")
+    async def store_tool_item_content(
+        self,
+        item_id: str,
+        content: Dict,
+        operation_details: Dict,
+        source: str,  # 'analyze_command' or 'generate_content'
+        tool_operation_id: str
+    ) -> Optional[Dict]:
+        """Store and validate tool item content with detailed logging"""
+        try:
+            logger.info(f"Storing content from {source} for item {item_id}")
+            logger.info(f"Operation details: {json.dumps(operation_details, indent=2)}")
+            logger.info(f"Content structure: {json.dumps(content, indent=2)}")
+
+            # Validate required fields based on source
+            if source == 'analyze_command':
+                required_fields = ['from_token', 'from_amount', 'to_token', 'target_price_usd', 'reference_token']
+                missing_fields = [f for f in required_fields if f not in operation_details]
+                if missing_fields:
+                    logger.error(f"Missing required fields from analyze_command: {missing_fields}")
+                    return None
+
+            # Update the item with content validation
+            update_data = {
+                "content": content,
+                "operation_details": operation_details,
+                "metadata": {
+                    "content_source": source,
+                    "content_updated_at": datetime.now(UTC).isoformat(),
+                    "content_validation": {
+                        "has_operation_details": bool(operation_details),
+                        "has_content": bool(content),
+                        "source": source
+                    }
+                }
+            }
+
+            # For regeneration, add additional tracking but don't overwrite existing fields
+            if source == 'analyze_command_regeneration':
+                update_data["metadata"].update({
+                    "regeneration_analysis": {
+                        "analyzed_params": operation_details,
+                        "analyzed_at": datetime.now(UTC).isoformat()
+                    }
+                })
+
+            result = await self.tool_items.find_one_and_update(
+                {"_id": ObjectId(item_id)},
+                {"$set": update_data},
+                return_document=True
+            )
+
+            if result:
+                # Track content update in tool_executions
+                await self.tool_executions.insert_one({
+                    "tool_operation_id": tool_operation_id,
+                    "execution_type": "content_update",
+                    "item_id": item_id,
+                    "source": source,
+                    "content_fields": list(content.keys()),
+                    "operation_detail_fields": list(operation_details.keys()),
+                    "timestamp": datetime.now(UTC)
+                })
+
+                logger.info(f"Successfully stored content for item {item_id}")
+                logger.info(f"Stored content fields: {list(content.keys())}")
+                logger.info(f"Stored operation details: {list(operation_details.keys())}")
+                return result
+            else:
+                logger.error(f"Failed to store content for item {item_id}")
+                return None
+
+        except Exception as e:
+            logger.error(f"Error storing tool item content: {e}", exc_info=True)
+            raise

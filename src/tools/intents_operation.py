@@ -92,24 +92,13 @@ class IntentsTool(BaseTool):
     async def run(self, input_data: str) -> Dict:
         """Run the intents tool - handles limit order flow"""
         try:
-            # First check if this is an approval response
-            if any(keyword in input_data.lower() for keyword in ["approve", "regenerate", "cancel"]):
-                # Let approval manager handle the response
-                return await self.approval_manager.process_approval_response(
-                    message=input_data,
-                    session_id=self.deps.session_id,
-                    content_type=self.registry.content_type.value,
-                    tool_operation_id=None
-                )
-
-            # Get current operation
             operation = await self.tool_state_manager.get_operation(self.deps.session_id)
             
             # Check if we need to start a new operation
             if not operation or operation.get('state') in [ToolOperationState.COMPLETED.value, ToolOperationState.ERROR.value]:
                 # Initial analysis and command flow for limit order
                 command_info = await self._analyze_command(input_data)
-                
+
                 # Generate content for approval using count from command_info
                 content_result = await self._generate_content(
                     topic=command_info["topic"],
@@ -126,7 +115,6 @@ class IntentsTool(BaseTool):
                 )
             else:
                 # Let orchestrator handle ongoing operations
-                # This includes monitoring service triggers and execution
                 raise ValueError("Operation already in progress - should be handled by orchestrator")
 
         except Exception as e:
@@ -136,9 +124,9 @@ class IntentsTool(BaseTool):
     async def _analyze_command(
         self,
         command: str,
-        is_regeneration: bool = False  # Add this parameter
+        is_regeneration: bool = False
     ) -> Dict:
-        """Analyze command and setup initial monitoring for limit order"""
+        """Analyze command and store analysis results"""
         try:
             logger.info(f"Starting command analysis for: {command}")
             
@@ -268,13 +256,48 @@ Return ONLY valid JSON matching the example format.
                 
                 # After parsing orders, check if this is regeneration
                 if is_regeneration:
+                    # Get the collecting item that needs regeneration
+                    collecting_items = await self.tool_state_manager.get_operation_items(
+                        tool_operation_id=tool_operation_id,
+                        state=ToolOperationState.COLLECTING.value,
+                        status=OperationStatus.PENDING.value
+                    )
+                    
+                    if not collecting_items:
+                        raise ValueError("No regeneration items found in COLLECTING state")
+
+                    # Store analysis results in the correct item
+                    for item in collecting_items:
+                        await self.db.store_tool_item_content(
+                            item_id=str(item['_id']),  # Use item ID not operation ID
+                            content={
+                                "operation_type": "limit_order",
+                                "operation_details": orders[0]  # Store initial details
+                            },
+                            operation_details=orders[0],
+                            source='analyze_command_regeneration',
+                            tool_operation_id=tool_operation_id
+                        )
+
+                    # Update operation with analyzed parameters
+                    await self.tool_state_manager.update_operation(
+                        session_id=self.deps.session_id,
+                        tool_operation_id=tool_operation_id,
+                        input_data={
+                            "regeneration_analysis": {
+                                "orders": orders,
+                                "analyzed_at": datetime.now(UTC).isoformat()
+                            }
+                        }
+                    )
+                    
                     logger.info("Skipping schedule creation for regeneration analysis")
                     return {
                         "orders": orders,
-                        "monitoring_params_list": monitoring_params_list,
+                        "monitoring_params_list": monitoring_params_list,  # Return in same format as initial turn
                         "topics": topics
                     }
-
+                
                 # Create schedule FIRST with all necessary info
                 schedule_id = await self.schedule_manager.initialize_schedule(
                     tool_operation_id=tool_operation_id,
@@ -361,9 +384,9 @@ Return ONLY valid JSON matching the example format.
         revision_instructions: str = None,
         schedule_id: Optional[str] = None, 
         tool_operation_id: str = None,
-        analyzed_params: Optional[Dict] = None  # Add this parameter
+        analyzed_params: Optional[Dict] = None
     ) -> Dict:
-        """Generate human-readable content for limit order approval"""
+        """Generate content and store it properly"""
         try:
             logger.info(f"Generating {count} limit order(s)")
             if revision_instructions:
@@ -400,43 +423,168 @@ Return ONLY valid JSON matching the example format.
             
             # IMPORTANT: If regenerating, only process the specified number of items
             if is_regenerating:
-                # Get indices of items to regenerate from metadata
-                regenerate_indices = operation.get("metadata", {}).get("regenerate_indices", [])
-                if regenerate_indices:
-                    # Use only the orders that need regeneration
-                    orders = [orders[i-1] for i in regenerate_indices if 0 <= i-1 < len(orders)]
-                    monitoring_params_list = [monitoring_params_list[i-1] for i in regenerate_indices if 0 <= i-1 < len(monitoring_params_list)]
-                    logger.info(f"Using regenerate indices: {regenerate_indices}, selected {len(orders)} orders")
-                else:
-                    # If no specific indices, take only the number requested
-                    orders = orders[:count]
-                    monitoring_params_list = monitoring_params_list[:count]
-                    logger.info(f"No specific indices, using first {count} orders")
+                # Find existing COLLECTING items created by approval_manager
+                collecting_items = await self.tool_state_manager.get_operation_items(
+                    tool_operation_id=tool_operation_id,
+                    state=ToolOperationState.COLLECTING.value,
+                    status=OperationStatus.PENDING.value
+                )
                 
-                # If we have analyzed parameters from orchestrator, use them
-                if analyzed_params:
-                    # Update the order with analyzed parameters
-                    orders = [analyzed_params]  # Replace with analyzed parameters
-                    # Update monitoring parameters
-                    new_monitoring_params = {
-                        "check_interval_seconds": 60,
-                        "last_checked_timestamp": int(datetime.now(UTC).timestamp()),
-                        "best_price_seen": 0,
-                        "expiration_timestamp": int((datetime.now(UTC) + timedelta(hours=analyzed_params.get("expiration_hours", 24))).timestamp()),
-                        "max_checks": 1000,
-                        "reference_token": analyzed_params["reference_token"],
-                        "target_price_usd": float(analyzed_params["target_price_usd"]),
-                        "from_token": analyzed_params["from_token"],
-                        "from_amount": float(analyzed_params["from_amount"]),
-                        "to_token": analyzed_params["to_token"]
+                if not collecting_items:
+                    raise ValueError("No regeneration items found in COLLECTING state")
+                
+                logger.info(f"Found {len(collecting_items)} existing items to update")
+
+                # Get the stored analysis results
+                stored_analysis = operation.get('input_data', {}).get('regeneration_analysis', {})
+                
+                # Use stored analysis with fallback to provided params
+                order = analyzed_params or stored_analysis.get('orders', [{}])[0]
+                
+                # Create monitoring params from stored analysis
+                monitoring_params = {
+                            "check_interval_seconds": 60,
+                            "last_checked_timestamp": int(datetime.now(UTC).timestamp()),
+                            "best_price_seen": 0,
+                    "expiration_timestamp": int((datetime.now(UTC) + timedelta(hours=24)).timestamp()),
+                            "max_checks": 1000,
+                    "reference_token": order["reference_token"],
+                    "target_price_usd": float(order["target_price_usd"]),
+                    "from_token": order["from_token"],
+                    "from_amount": float(order["from_amount"]),
+                    "to_token": order["to_token"]
+                }
+
+                saved_items = []
+                for item in collecting_items:
+                    # Use existing prompt logic to generate content
+                    base_prompt = f"""You are a cryptocurrency expert. Generate a detailed description for a limit order with the following parameters:
+
+Operation Details:
+- Swap {order['from_amount']} {order['from_token']} for {order['to_token']}
+- Target Price: ${order['target_price_usd']} per {order['reference_token']}
+- Output Chain: {order.get('to_chain', 'ethereum')}
+- Destination: {order.get('destination_address', 'default wallet')} on {order.get('destination_chain', 'ethereum')}
+- Expires in: {order.get('expiration_hours', 24)} hours"""
+
+                    # Add revision instructions if provided
+                    if revision_instructions:
+                        base_prompt += f"\n\nImportant revision instructions: {revision_instructions}"
+
+                    base_prompt += """
+
+Include:
+1. A clear title summarizing the limit order
+2. A detailed description of what will happen when executed
+3. Expected outcome when price target is met
+
+IMPORTANT: Your response MUST be valid JSON in the following format:
+{
+    "title": "Limit Order Summary",
+    "description": "Detailed description here...",
+    "expected_outcome": "Expected outcome description"
+}"""
+
+                    messages = [
+                        {
+                            "role": "system",
+                            "content": "You are a cryptocurrency expert. Generate clear, detailed descriptions for limit orders. Return ONLY valid JSON."
+                        },
+                        {
+                            "role": "user",
+                            "content": base_prompt
+                        }
+                    ]
+
+                    # Get LLM response
+                    response = await self.llm_service.get_response(
+                        prompt=messages,
+                        model_type=ModelType.GROQ_LLAMA_3_3_70B,
+                        override_config={
+                            "temperature": 0.15,
+                            "max_tokens": 800
+                        }
+                    )
+                    
+                    try:
+                        generated_content = json.loads(response)
+                    except json.JSONDecodeError:
+                        try:
+                            generated_content = parse_strict_json(response)
+                        except Exception:
+                            generated_content = {
+                                "title": f"Limit Order: {order['from_token']} to {order['to_token']} at ${order['target_price_usd']}",
+                                "description": f"This limit order will execute when {order['reference_token']} reaches ${order['target_price_usd']}.",
+                                "expected_outcome": f"Exchange {order['from_amount']} {order['from_token']} for {order['to_token']}."
+                            }
+                    
+                    # First store content without parameters
+                    await self.db.store_tool_item_content(
+                        item_id=str(item['_id']),
+                        content={
+                            "title": generated_content.get("title"),
+                            "description": generated_content.get("description"),
+                            "expected_outcome": generated_content.get("expected_outcome"),
+                            "operation_type": "limit_order",
+                            "operation_details": {
+                                "from_token": order["from_token"],
+                                "from_amount": str(order["from_amount"]),
+                                "to_token": order["to_token"],
+                                "target_price_usd": float(order["target_price_usd"]),
+                                "reference_token": order["reference_token"],
+                                "to_chain": order.get("to_chain", "ethereum")
+                            }
+                        },
+                        operation_details=order,
+                        source='generate_content',
+                        tool_operation_id=tool_operation_id
+                    )
+
+                    # Then update the item with monitoring params separately
+                    await self.db.tool_items.find_one_and_update(
+                        {"_id": item["_id"]},
+                        {"$set": {
+                            "parameters": {"custom_params": monitoring_params},
+                            "metadata": {
+                                "content_updated_at": datetime.now(UTC).isoformat(),
+                                "regeneration_info": {
+                                    "is_regenerated": True,
+                                    "revision_instructions": revision_instructions,
+                                    "regenerated_at": datetime.now(UTC).isoformat(),
+                                    "original_order": dict(order),
+                                    "original_schedule_id": operation.get('metadata', {}).get('schedule_id')
+                                }
+                            }
+                        }},
+                        return_document=True
+                    )
+
+                    saved_items.append(item)
+                    logger.info(f"Updated content and parameters for regenerated item {item['_id']}")
+
+                # Update operation with regenerated items
+                await self.tool_state_manager.update_operation(
+                    session_id=self.deps.session_id,
+                    tool_operation_id=tool_operation_id,
+                    content_updates={
+                        "items": saved_items
+                    },
+                    metadata={
+                        "regeneration_info": {
+                            "is_regenerated": True,
+                            "regenerated_at": datetime.now(UTC).isoformat(),
+                            "regenerated_items": [str(item["_id"]) for item in saved_items],
+                            "original_schedule_id": operation.get('metadata', {}).get('schedule_id')
+                        }
                     }
-                    monitoring_params_list = [new_monitoring_params]
-                    logger.info(f"Using analyzed parameters from orchestrator: {analyzed_params}")
-                    logger.info(f"Updated monitoring params: {new_monitoring_params}")
-                
-                logger.info(f"Processing {len(orders)} orders for regeneration")
-                logger.info(f"Orders for regeneration: {orders}")
-                logger.info(f"Monitoring params for regeneration: {monitoring_params_list}")
+                )
+
+                return {
+                    "items": saved_items,
+                    "schedule_id": operation.get('metadata', {}).get('schedule_id'),
+                    "tool_operation_id": tool_operation_id,
+                    "regeneration_needed": False
+                }
             
             # Track all generated items
             saved_items = []
@@ -527,10 +675,17 @@ IMPORTANT: Your response MUST be valid JSON in the following format:
                             "to_chain": order.get("to_chain", "ethereum")
                         }
                     },
+                    "parameters": {
+                        "custom_params": monitoring_params_list[min(i, len(monitoring_params_list)-1)]  # Use appropriate monitoring params, with fallback
+                    },
                     "metadata": {
                         "generated_at": datetime.now(UTC).isoformat(),
                         "scheduling_type": "monitored",
-                        "monitoring_params": monitoring_params_list[i],
+                        "monitoring_started_at": datetime.now(UTC).isoformat(),
+                        "monitoring_expiration": datetime.fromtimestamp(
+                            monitoring_params_list[min(i, len(monitoring_params_list)-1)]["expiration_timestamp"],
+                            UTC
+                        ).isoformat(),
                         "order_index": i + 1,
                         "total_orders": len(orders),
                         "state_history": [{
@@ -558,14 +713,15 @@ IMPORTANT: Your response MUST be valid JSON in the following format:
                 
                 logger.info(f"Created limit order item {i+1}/{len(orders)} with ID {item_id}")
                 logger.info(f"Item content: {tool_item['content']}")
-                logger.info(f"Item monitoring params: {tool_item['metadata']['monitoring_params']}")
+                logger.info(f"Item monitoring params: {tool_item['parameters']['custom_params']}")
 
             # Update operation with all pending items
             await self.tool_state_manager.update_operation(
                 session_id=self.deps.session_id,
                 tool_operation_id=tool_operation_id,
                 content_updates={
-                    "pending_items": current_pending_items
+                    "pending_items": current_pending_items,
+                    "items": saved_items  # Add this to ensure all items are tracked
                 },
                 metadata={
                     "item_states": {
@@ -585,15 +741,6 @@ IMPORTANT: Your response MUST be valid JSON in the following format:
                     } if is_regenerating else None
                 }
             )
-
-            if is_regenerating:
-                return {
-                    "items": saved_items,
-                    "schedule_id": schedule_id,
-                    "tool_operation_id": tool_operation_id,
-                    "regeneration_needed": True,
-                    "regenerate_count": len(saved_items)
-                }
 
             return {
                 "items": saved_items,
